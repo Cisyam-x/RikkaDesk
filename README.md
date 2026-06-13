@@ -1,3 +1,29 @@
+RikkaDesk is an unofficial desktop derivative / experiment based on RikkaHub.
+
+# RikkaDesk
+
+RikkaDesk is a non-official desktop-oriented derivative of [RikkaHub](https://github.com/rikkahub/rikkahub). It currently focuses on making the existing RikkaHub `web-ui` usable as the foundation for a local Windows desktop app.
+
+This repository is in an early staged migration:
+
+- Phase 0 is complete: the upstream architecture, `web-ui`, Web Interface, and license were reviewed without code changes.
+- Phase 1 is complete: the `web-ui` can run locally in a browser at `http://localhost:5173/`.
+- Phase 2A will add a Tauri desktop shell that loads the local `web-ui`.
+
+Current limitations:
+
+- RikkaDesk does not yet include a complete Windows local backend.
+- The frontend can run, but chat and runtime features still depend on compatible `/api/*` backend endpoints.
+- `/api/*` compatibility is planned for a later backend phase.
+
+Security and compliance:
+
+- Do not write API keys, tokens, passwords, private user data, or conversation data into source files.
+- This project is derived from RikkaHub. Keep the upstream license notice in mind and review [NOTICE.md](NOTICE.md) plus [LICENSE](LICENSE) before using, modifying, or distributing this project.
+- Commercial use or avoiding AGPL obligations may require upstream authorization according to the original RikkaHub license terms.
+
+---
+
 <div align="center">
   <img src="docs/icon.png" alt="App Icon" width="100" />
   <h1>RikkaHub</h1>
