@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     convert::Infallible,
     net::SocketAddr,
+    path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -24,12 +25,17 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::{
+    fs,
     net::TcpListener,
     sync::{broadcast, RwLock},
 };
 use tower_http::cors::{Any, CorsLayer};
 
 const PREFERRED_ADDR: &str = "127.0.0.1:8080";
+const PERSIST_DIR_NAME: &str = "mock-api";
+const STATE_FILE_NAME: &str = "state.v1.json";
+const STATE_TMP_FILE_NAME: &str = "state.v1.json.tmp";
+const STATE_SCHEMA_VERSION: u32 = 1;
 const MOCK_ASSISTANT_ID: &str = "mock-assistant";
 const MOCK_MODEL_ID: &str = "mock-chat";
 const MOCK_PROVIDER_ID: &str = "mock-provider";
@@ -45,6 +51,57 @@ impl MockApiHandle {
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
+}
+
+type PersistenceResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+#[derive(Clone)]
+struct MockPersistence {
+    state_dir: PathBuf,
+    state_path: PathBuf,
+}
+
+impl MockPersistence {
+    fn new(app_data_dir: PathBuf) -> Self {
+        let state_dir = app_data_dir.join(PERSIST_DIR_NAME);
+        let state_path = state_dir.join(STATE_FILE_NAME);
+
+        Self {
+            state_dir,
+            state_path,
+        }
+    }
+
+    fn state_path(&self) -> &std::path::Path {
+        &self.state_path
+    }
+
+    async fn save(&self, persisted: &PersistedMockState) -> PersistenceResult<()> {
+        fs::create_dir_all(&self.state_dir).await?;
+
+        let tmp_path = self.state_dir.join(STATE_TMP_FILE_NAME);
+        let data = serde_json::to_vec_pretty(persisted)?;
+        fs::write(&tmp_path, data).await?;
+
+        match fs::remove_file(&self.state_path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(Box::new(error)),
+        }
+
+        fs::rename(&tmp_path, &self.state_path).await?;
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedMockState {
+    schema_version: u32,
+    saved_at: u64,
+    id_seq: u64,
+    settings: Value,
+    conversations: HashMap<String, ConversationDto>,
 }
 
 #[derive(Clone, Serialize)]
@@ -161,6 +218,7 @@ struct AiIconQuery {
 }
 
 struct MockApiState {
+    persistence: MockPersistence,
     settings: RwLock<Value>,
     conversations: RwLock<HashMap<String, ConversationDto>>,
     conversation_txs: RwLock<HashMap<String, broadcast::Sender<SsePayload>>>,
@@ -171,22 +229,23 @@ struct MockApiState {
 }
 
 impl MockApiState {
-    fn new() -> Self {
-        let now = now_millis();
-        let welcome = welcome_conversation(now);
-        let mut conversations = HashMap::new();
-        conversations.insert(welcome.id.clone(), welcome);
+    fn new(persistence: MockPersistence, persisted: PersistedMockState) -> Self {
+        let initial_id_seq = persisted
+            .id_seq
+            .max(max_persisted_id_seq(&persisted.conversations))
+            .max(1);
         let (settings_tx, _) = broadcast::channel(64);
         let (list_tx, _) = broadcast::channel(64);
 
         Self {
-            settings: RwLock::new(default_settings()),
-            conversations: RwLock::new(conversations),
+            persistence,
+            settings: RwLock::new(persisted.settings),
+            conversations: RwLock::new(persisted.conversations),
             conversation_txs: RwLock::new(HashMap::new()),
             settings_tx,
             list_tx,
             seq: AtomicU64::new(1),
-            id_seq: AtomicU64::new(1),
+            id_seq: AtomicU64::new(initial_id_seq),
         }
     }
 
@@ -200,8 +259,14 @@ impl MockApiState {
     }
 }
 
-pub async fn start() -> Result<MockApiHandle, Box<dyn std::error::Error>> {
-    let state = Arc::new(MockApiState::new());
+pub async fn start(app_data_dir: PathBuf) -> Result<MockApiHandle, Box<dyn std::error::Error>> {
+    let persistence = MockPersistence::new(app_data_dir);
+    eprintln!(
+        "RikkaDesk mock API state file: {}",
+        persistence.state_path().display()
+    );
+    let persisted = load_persisted_state(&persistence).await;
+    let state = Arc::new(MockApiState::new(persistence, persisted));
     let router = Router::new()
         .route("/api/settings/stream", get(settings_stream))
         .route("/api/conversations/paged", get(conversations_paged))
@@ -212,7 +277,10 @@ pub async fn start() -> Result<MockApiHandle, Box<dyn std::error::Error>> {
         .route("/api/conversations/{id}/messages", post(send_message))
         .route("/api/conversations/{id}/stop", post(stop_conversation))
         .route("/api/settings/assistant", post(update_assistant))
-        .route("/api/settings/assistant/model", post(update_assistant_model))
+        .route(
+            "/api/settings/assistant/model",
+            post(update_assistant_model),
+        )
         .fallback(not_implemented)
         .layer(
             CorsLayer::new()
@@ -238,6 +306,93 @@ pub async fn start() -> Result<MockApiHandle, Box<dyn std::error::Error>> {
     });
 
     Ok(MockApiHandle { base_url })
+}
+
+async fn load_persisted_state(persistence: &MockPersistence) -> PersistedMockState {
+    if !persistence.state_path().exists() {
+        let persisted = default_persisted_state();
+        if let Err(error) = persistence.save(&persisted).await {
+            eprintln!("RikkaDesk mock API failed to create default state: {error}");
+        }
+        return persisted;
+    }
+
+    let bytes = match fs::read(persistence.state_path()).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("RikkaDesk mock API failed to read state file: {error}");
+            let persisted = default_persisted_state();
+            if let Err(error) = persistence.save(&persisted).await {
+                eprintln!("RikkaDesk mock API failed to save fallback state: {error}");
+            }
+            return persisted;
+        }
+    };
+
+    match serde_json::from_slice::<PersistedMockState>(&bytes) {
+        Ok(persisted) if persisted.schema_version == STATE_SCHEMA_VERSION => persisted,
+        Ok(persisted) => {
+            reset_persisted_state(
+                persistence,
+                format!("unsupported schemaVersion {}", persisted.schema_version),
+            )
+            .await
+        }
+        Err(error) => reset_persisted_state(persistence, format!("invalid JSON: {error}")).await,
+    }
+}
+
+async fn reset_persisted_state(
+    persistence: &MockPersistence,
+    reason: String,
+) -> PersistedMockState {
+    eprintln!("RikkaDesk mock API state reset: {reason}");
+
+    if let Err(error) = backup_corrupt_state(persistence).await {
+        eprintln!("RikkaDesk mock API failed to back up corrupt state: {error}");
+    }
+
+    let persisted = default_persisted_state();
+    if let Err(error) = persistence.save(&persisted).await {
+        eprintln!("RikkaDesk mock API failed to save fallback state: {error}");
+    }
+
+    persisted
+}
+
+async fn backup_corrupt_state(persistence: &MockPersistence) -> PersistenceResult<()> {
+    if !persistence.state_path().exists() {
+        return Ok(());
+    }
+
+    fs::create_dir_all(&persistence.state_dir).await?;
+    let backup_path = persistence
+        .state_dir
+        .join(format!("state.v1.corrupt.{}.json", now_millis()));
+    fs::rename(persistence.state_path(), backup_path).await?;
+    Ok(())
+}
+
+async fn persist_mock_state(state: &Arc<MockApiState>) {
+    let settings = state.settings.read().await.clone();
+    let conversations = state.conversations.read().await.clone();
+    let id_seq = state
+        .id_seq
+        .load(Ordering::Relaxed)
+        .max(max_persisted_id_seq(&conversations))
+        .max(1);
+
+    let persisted = PersistedMockState {
+        schema_version: STATE_SCHEMA_VERSION,
+        saved_at: now_millis(),
+        id_seq,
+        settings,
+        conversations,
+    };
+
+    if let Err(error) = state.persistence.save(&persisted).await {
+        eprintln!("RikkaDesk mock API failed to save state: {error}");
+    }
 }
 
 async fn settings_stream(State(state): State<Arc<MockApiState>>) -> impl IntoResponse {
@@ -435,6 +590,7 @@ async fn send_message(
         conversation.clone()
     };
 
+    persist_mock_state(&state).await;
     broadcast_conversation_snapshot(&state, &updated).await;
     broadcast_list_invalidate(&state).await;
 
@@ -455,6 +611,7 @@ async fn stop_conversation(
     };
 
     if let Some(conversation) = maybe_updated {
+        persist_mock_state(&state).await;
         broadcast_conversation_snapshot(&state, &conversation).await;
         broadcast_list_invalidate(&state).await;
     }
@@ -471,6 +628,7 @@ async fn update_assistant(
         settings["assistantId"] = json!(payload.assistant_id);
     }
 
+    persist_mock_state(&state).await;
     broadcast_settings_update(&state).await;
     broadcast_list_invalidate(&state).await;
 
@@ -485,10 +643,7 @@ async fn update_assistant_model(
         let mut settings = state.settings.write().await;
         settings["chatModelId"] = json!(payload.model_id.clone());
 
-        if let Some(assistants) = settings
-            .get_mut("assistants")
-            .and_then(Value::as_array_mut)
-        {
+        if let Some(assistants) = settings.get_mut("assistants").and_then(Value::as_array_mut) {
             for assistant in assistants {
                 let is_target = assistant
                     .get("id")
@@ -502,6 +657,7 @@ async fn update_assistant_model(
         }
     }
 
+    persist_mock_state(&state).await;
     broadcast_settings_update(&state).await;
 
     Json(json!({ "status": "ok" }))
@@ -531,10 +687,7 @@ async fn get_or_create_conversation(state: &Arc<MockApiState>, id: &str) -> Conv
         .clone()
 }
 
-async fn conversation_sender(
-    state: &Arc<MockApiState>,
-    id: &str,
-) -> broadcast::Sender<SsePayload> {
+async fn conversation_sender(state: &Arc<MockApiState>, id: &str) -> broadcast::Sender<SsePayload> {
     if let Some(sender) = state.conversation_txs.read().await.get(id).cloned() {
         return sender;
     }
@@ -635,6 +788,49 @@ async fn current_model_id(state: &Arc<MockApiState>, assistant_id: &str) -> Stri
         .and_then(Value::as_str)
         .unwrap_or(MOCK_MODEL_ID)
         .to_string()
+}
+
+fn default_persisted_state() -> PersistedMockState {
+    let now = now_millis();
+    let welcome = welcome_conversation(now);
+    let mut conversations = HashMap::new();
+    conversations.insert(welcome.id.clone(), welcome);
+
+    PersistedMockState {
+        schema_version: STATE_SCHEMA_VERSION,
+        saved_at: now,
+        id_seq: max_persisted_id_seq(&conversations).max(1),
+        settings: default_settings(),
+        conversations,
+    }
+}
+
+fn max_persisted_id_seq(conversations: &HashMap<String, ConversationDto>) -> u64 {
+    let mut max_id = 1;
+
+    for conversation in conversations.values() {
+        if let Some(id) = numeric_suffix(&conversation.id) {
+            max_id = max_id.max(id);
+        }
+
+        for node in &conversation.messages {
+            if let Some(id) = numeric_suffix(&node.id) {
+                max_id = max_id.max(id);
+            }
+
+            for message in &node.messages {
+                if let Some(id) = numeric_suffix(&message.id) {
+                    max_id = max_id.max(id);
+                }
+            }
+        }
+    }
+
+    max_id
+}
+
+fn numeric_suffix(value: &str) -> Option<u64> {
+    value.rsplit_once('-')?.1.parse().ok()
 }
 
 fn default_settings() -> Value {
