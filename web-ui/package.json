@@ -8,7 +8,7 @@
     "dev": "react-router dev",
     "start": "react-router-serve ./build/server/index.js",
     "tauri": "tauri",
-    "desktop:dev": "tauri dev",
+    "desktop:dev": "powershell -NoProfile -ExecutionPolicy Bypass -Command \"$env:CARGO_TARGET_DIR = Join-Path $env:TEMP 'rikkadesk-tauri-target'; tauri dev\"",
     "desktop:build": "tauri build",
     "typecheck": "react-router typegen && tsc",
     "lint": "oxlint app --fix",
@@ -55,6 +55,7 @@
   "devDependencies": {
     "@react-router/dev": "7.13.0",
     "@tailwindcss/vite": "^4.1.13",
+    "@tauri-apps/api": "^2.9.0",
     "@tauri-apps/cli": "^2.11.2",
     "@types/node": "^24.10.13",
     "@types/react": "^19.2.7",

@@ -1,6 +1,7 @@
 import * as React from "react";
 
 import { cn } from "~/lib/utils";
+import { resolveApiUrl } from "~/services/api";
 
 export interface AIIconProps {
   name: string;
@@ -28,15 +29,28 @@ export function AIIcon({
 }: AIIconProps) {
   const normalizedName = name.trim() || "auto";
   const fallbackText = toFallbackText(normalizedName);
-  const src = React.useMemo(
+  const iconPath = React.useMemo(
     () => `/api/ai-icon?name=${encodeURIComponent(normalizedName)}`,
     [normalizedName],
   );
+  const [src, setSrc] = React.useState(iconPath);
   const [loadFailed, setLoadFailed] = React.useState(false);
 
   React.useEffect(() => {
+    let active = true;
+    setSrc(iconPath);
     setLoadFailed(false);
-  }, [src]);
+
+    void resolveApiUrl(iconPath).then((resolvedUrl) => {
+      if (active) {
+        setSrc(resolvedUrl);
+      }
+    });
+
+    return () => {
+      active = false;
+    };
+  }, [iconPath]);
 
   return (
     <span

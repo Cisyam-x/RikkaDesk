@@ -29,9 +29,65 @@ const WEB_AUTH_STORAGE_KEY = "rikkahub:web-auth";
 const WEB_AUTH_REQUIRED_EVENT = "rikkahub:web-auth-required";
 const WEB_AUTH_EXPIRY_SKEW_MILLIS = 10_000;
 const WEB_AUTH_QUERY_KEY = "access_token";
+const DEFAULT_API_PREFIX = "/api";
+const DESKTOP_API_BASE_COMMAND = "get_api_base_url";
+
+type TauriRuntimeWindow = Window &
+  typeof globalThis & {
+    __TAURI_INTERNALS__?: unknown;
+    __TAURI__?: unknown;
+  };
+
+let desktopApiBaseUrlPromise: Promise<string | null> | null = null;
 
 function isBrowser(): boolean {
   return typeof window !== "undefined";
+}
+
+function isTauriRuntime(): boolean {
+  if (!isBrowser()) return false;
+  const runtimeWindow = window as TauriRuntimeWindow;
+  return "__TAURI_INTERNALS__" in runtimeWindow || "__TAURI__" in runtimeWindow;
+}
+
+function normalizeApiPath(url: string): string {
+  const trimmed = url.replace(/^\/+/, "");
+  return trimmed.startsWith("api/") ? trimmed.slice(4) : trimmed;
+}
+
+function joinApiUrl(prefix: string, url: string): string {
+  const normalizedPath = normalizeApiPath(url);
+  return `${prefix.replace(/\/$/, "")}/${normalizedPath}`;
+}
+
+async function readDesktopApiBaseUrl(): Promise<string | null> {
+  if (!isTauriRuntime()) return null;
+
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    const baseUrl = await invoke<string>(DESKTOP_API_BASE_COMMAND);
+    return baseUrl.replace(/\/$/, "");
+  } catch {
+    return null;
+  }
+}
+
+async function resolveApiPrefixUrl(): Promise<string> {
+  if (!isTauriRuntime()) {
+    return DEFAULT_API_PREFIX;
+  }
+
+  desktopApiBaseUrlPromise ??= readDesktopApiBaseUrl();
+  const desktopApiBaseUrl = await desktopApiBaseUrlPromise;
+  return desktopApiBaseUrl ? `${desktopApiBaseUrl}/api` : DEFAULT_API_PREFIX;
+}
+
+export async function resolveApiUrl(url: string): Promise<string> {
+  if (/^https?:\/\//i.test(url)) {
+    return url;
+  }
+
+  return joinApiUrl(await resolveApiPrefixUrl(), url);
 }
 
 function readStoredWebAuth(): WebAuthTokenResponse | null {
@@ -70,7 +126,6 @@ function dispatchWebAuthRequired(detail: WebAuthRequiredEventDetail) {
 }
 
 const kyInstance = ky.create({
-  prefixUrl: "/api",
   timeout: 30000,
   hooks: {
     beforeRequest: [
@@ -149,42 +204,42 @@ export function appendWebAuthQuery(url: string): string {
 const api = {
   async get<T>(url: string, options?: Options): Promise<T> {
     try {
-      return await kyInstance.get(url, options).json<T>();
+      return await kyInstance.get(await resolveApiUrl(url), options).json<T>();
     } catch (error) {
       return handleError(error);
     }
   },
   async post<T>(url: string, data?: unknown, options?: Options): Promise<T> {
     try {
-      return await kyInstance.post(url, { ...options, json: data }).json<T>();
+      return await kyInstance.post(await resolveApiUrl(url), { ...options, json: data }).json<T>();
     } catch (error) {
       return handleError(error);
     }
   },
   async postMultipart<T>(url: string, formData: FormData, options?: Options): Promise<T> {
     try {
-      return await kyInstance.post(url, { ...options, body: formData }).json<T>();
+      return await kyInstance.post(await resolveApiUrl(url), { ...options, body: formData }).json<T>();
     } catch (error) {
       return handleError(error);
     }
   },
   async put<T>(url: string, data?: unknown, options?: Options): Promise<T> {
     try {
-      return await kyInstance.put(url, { ...options, json: data }).json<T>();
+      return await kyInstance.put(await resolveApiUrl(url), { ...options, json: data }).json<T>();
     } catch (error) {
       return handleError(error);
     }
   },
   async patch<T>(url: string, data?: unknown, options?: Options): Promise<T> {
     try {
-      return await kyInstance.patch(url, { ...options, json: data }).json<T>();
+      return await kyInstance.patch(await resolveApiUrl(url), { ...options, json: data }).json<T>();
     } catch (error) {
       return handleError(error);
     }
   },
   async delete<T>(url: string, options?: Options): Promise<T> {
     try {
-      return await kyInstance.delete(url, options).json<T>();
+      return await kyInstance.delete(await resolveApiUrl(url), options).json<T>();
     } catch (error) {
       return handleError(error);
     }
@@ -221,7 +276,7 @@ async function sse<T>(
   let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
 
   try {
-    const response = await kyInstance.get(url, {
+    const response = await kyInstance.get(await resolveApiUrl(url), {
       ...options,
       headers: {
         ...options?.headers,
