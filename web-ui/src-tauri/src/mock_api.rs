@@ -1,8 +1,10 @@
 use std::{
     collections::HashMap,
     convert::Infallible,
+    fs as std_fs, io,
     net::SocketAddr,
     path::PathBuf,
+    ptr,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -16,7 +18,7 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
-        IntoResponse,
+        IntoResponse, Response,
     },
     routing::{get, post},
     Json, Router,
@@ -30,12 +32,24 @@ use tokio::{
     sync::{broadcast, RwLock},
 };
 use tower_http::cors::{Any, CorsLayer};
+#[cfg(windows)]
+use windows_sys::Win32::{
+    Foundation::{GetLastError, LocalFree},
+    Security::Cryptography::{
+        CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+    },
+};
 
 const PREFERRED_ADDR: &str = "127.0.0.1:8080";
 const PERSIST_DIR_NAME: &str = "mock-api";
 const STATE_FILE_NAME: &str = "state.v1.json";
 const STATE_TMP_FILE_NAME: &str = "state.v1.json.tmp";
-const STATE_SCHEMA_VERSION: u32 = 1;
+const STATE_SCHEMA_VERSION: u32 = 2;
+const LEGACY_STATE_SCHEMA_VERSION: u32 = 1;
+const SECRETS_DIR_NAME: &str = "secrets";
+#[cfg(not(windows))]
+const SECRET_SERVICE_NAME: &str = "RikkaDesk";
+const OPENAI_COMPATIBLE_PROVIDER_TYPE: &str = "openai-compatible";
 const MOCK_ASSISTANT_ID: &str = "mock-assistant";
 const MOCK_MODEL_ID: &str = "mock-chat";
 const MOCK_PROVIDER_ID: &str = "mock-provider";
@@ -54,6 +68,207 @@ impl MockApiHandle {
 }
 
 type PersistenceResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+type SecretStoreResult<T> = Result<T, String>;
+
+trait SecretStore: Send + Sync {
+    fn set_secret(&self, secret_ref: &str, value: &str) -> SecretStoreResult<()>;
+    fn get_secret(&self, secret_ref: &str) -> SecretStoreResult<Option<String>>;
+    fn delete_secret(&self, secret_ref: &str) -> SecretStoreResult<()>;
+
+    fn has_secret(&self, secret_ref: &str) -> SecretStoreResult<bool> {
+        self.get_secret(secret_ref).map(|value| value.is_some())
+    }
+}
+
+#[cfg(not(windows))]
+struct KeyringSecretStore {
+    service: &'static str,
+}
+
+#[cfg(not(windows))]
+impl KeyringSecretStore {
+    fn new() -> Self {
+        Self {
+            service: SECRET_SERVICE_NAME,
+        }
+    }
+
+    fn entry(&self, secret_ref: &str) -> SecretStoreResult<keyring::Entry> {
+        keyring::Entry::new(self.service, &secret_storage_key_for_ref(secret_ref))
+            .map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(not(windows))]
+impl SecretStore for KeyringSecretStore {
+    fn set_secret(&self, secret_ref: &str, value: &str) -> SecretStoreResult<()> {
+        self.entry(secret_ref)?
+            .set_password(value)
+            .map_err(|error| error.to_string())
+    }
+
+    fn get_secret(&self, secret_ref: &str) -> SecretStoreResult<Option<String>> {
+        match self.entry(secret_ref)?.get_password() {
+            Ok(value) => Ok(Some(value)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn delete_secret(&self, secret_ref: &str) -> SecretStoreResult<()> {
+        match self.entry(secret_ref)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+}
+
+#[cfg(windows)]
+struct WindowsDpapiSecretStore {
+    secrets_dir: PathBuf,
+}
+
+#[cfg(windows)]
+impl WindowsDpapiSecretStore {
+    fn new(secrets_dir: PathBuf) -> Self {
+        Self { secrets_dir }
+    }
+
+    fn secret_path(&self, secret_ref: &str) -> PathBuf {
+        self.secrets_dir
+            .join(format!("{}.bin", secret_storage_key_for_ref(secret_ref)))
+    }
+}
+
+#[cfg(windows)]
+impl SecretStore for WindowsDpapiSecretStore {
+    fn set_secret(&self, secret_ref: &str, value: &str) -> SecretStoreResult<()> {
+        std_fs::create_dir_all(&self.secrets_dir).map_err(secret_io_error)?;
+
+        let path = self.secret_path(secret_ref);
+        let tmp_path = path.with_extension("bin.tmp");
+        let protected = dpapi_protect(value.as_bytes())?;
+        std_fs::write(&tmp_path, protected).map_err(secret_io_error)?;
+        std_fs::rename(&tmp_path, &path).map_err(secret_io_error)?;
+        Ok(())
+    }
+
+    fn get_secret(&self, secret_ref: &str) -> SecretStoreResult<Option<String>> {
+        let path = self.secret_path(secret_ref);
+        let protected = match std_fs::read(path) {
+            Ok(protected) => protected,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(secret_io_error(error)),
+        };
+
+        let plaintext = dpapi_unprotect(&protected)?;
+        String::from_utf8(plaintext)
+            .map(Some)
+            .map_err(|_| "Secret store value is not valid UTF-8".to_string())
+    }
+
+    fn delete_secret(&self, secret_ref: &str) -> SecretStoreResult<()> {
+        match std_fs::remove_file(self.secret_path(secret_ref)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(secret_io_error(error)),
+        }
+    }
+}
+
+fn create_secret_store(app_data_dir: &std::path::Path) -> Arc<dyn SecretStore> {
+    #[cfg(windows)]
+    {
+        Arc::new(WindowsDpapiSecretStore::new(
+            app_data_dir.join(PERSIST_DIR_NAME).join(SECRETS_DIR_NAME),
+        ))
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = app_data_dir;
+        Arc::new(KeyringSecretStore::new())
+    }
+}
+
+#[cfg(windows)]
+fn dpapi_protect(data: &[u8]) -> SecretStoreResult<Vec<u8>> {
+    let cb_data = u32::try_from(data.len()).map_err(|_| "Secret is too large".to_string())?;
+    let in_blob = CRYPT_INTEGER_BLOB {
+        cbData: cb_data,
+        pbData: data.as_ptr() as *mut u8,
+    };
+    let mut out_blob = CRYPT_INTEGER_BLOB::default();
+
+    let result = unsafe {
+        CryptProtectData(
+            &in_blob,
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut out_blob,
+        )
+    };
+
+    if result == 0 {
+        return Err(format!("Windows DPAPI protect failed: {}", unsafe {
+            GetLastError()
+        }));
+    }
+
+    dpapi_take_blob(out_blob)
+}
+
+#[cfg(windows)]
+fn dpapi_unprotect(data: &[u8]) -> SecretStoreResult<Vec<u8>> {
+    let cb_data =
+        u32::try_from(data.len()).map_err(|_| "Protected secret is too large".to_string())?;
+    let in_blob = CRYPT_INTEGER_BLOB {
+        cbData: cb_data,
+        pbData: data.as_ptr() as *mut u8,
+    };
+    let mut out_blob = CRYPT_INTEGER_BLOB::default();
+
+    let result = unsafe {
+        CryptUnprotectData(
+            &in_blob,
+            ptr::null_mut(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut out_blob,
+        )
+    };
+
+    if result == 0 {
+        return Err(format!("Windows DPAPI unprotect failed: {}", unsafe {
+            GetLastError()
+        }));
+    }
+
+    dpapi_take_blob(out_blob)
+}
+
+#[cfg(windows)]
+fn dpapi_take_blob(blob: CRYPT_INTEGER_BLOB) -> SecretStoreResult<Vec<u8>> {
+    if blob.pbData.is_null() {
+        return Ok(Vec::new());
+    }
+
+    let value = unsafe { std::slice::from_raw_parts(blob.pbData, blob.cbData as usize).to_vec() };
+    unsafe {
+        LocalFree(blob.pbData.cast());
+    }
+    Ok(value)
+}
+
+#[cfg(windows)]
+fn secret_io_error(error: io::Error) -> String {
+    error.to_string()
+}
 
 #[derive(Clone)]
 struct MockPersistence {
@@ -102,6 +317,100 @@ struct PersistedMockState {
     id_seq: u64,
     settings: Value,
     conversations: HashMap<String, ConversationDto>,
+    #[serde(default)]
+    providers: Vec<DesktopProviderConfig>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopProviderConfig {
+    id: String,
+    #[serde(rename = "type")]
+    provider_type: String,
+    enabled: bool,
+    name: String,
+    base_url: String,
+    model: DesktopProviderModelConfig,
+    secret_ref: String,
+}
+
+impl DesktopProviderConfig {
+    fn model_id_for_settings(&self) -> &str {
+        &self.model.id
+    }
+
+    fn to_settings_provider(&self) -> Value {
+        json!({
+            "id": self.id,
+            "type": self.provider_type,
+            "enabled": self.enabled,
+            "name": self.name,
+            "baseUrl": self.base_url,
+            "secretRef": self.secret_ref,
+            "models": [
+                {
+                    "id": self.model.id,
+                    "modelId": self.model.model_id,
+                    "displayName": self.model.display_name,
+                    "type": "CHAT",
+                    "inputModalities": ["TEXT"],
+                    "outputModalities": ["TEXT"],
+                    "abilities": []
+                }
+            ]
+        })
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopProviderModelConfig {
+    id: String,
+    model_id: String,
+    display_name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpsertDesktopProviderRequest {
+    id: Option<String>,
+    #[serde(rename = "type")]
+    provider_type: Option<String>,
+    enabled: Option<bool>,
+    name: Option<String>,
+    base_url: Option<String>,
+    model_id: Option<String>,
+    display_name: Option<String>,
+    api_key: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopProviderResponse {
+    id: String,
+    #[serde(rename = "type")]
+    provider_type: String,
+    enabled: bool,
+    name: String,
+    base_url: String,
+    model: DesktopProviderModelConfig,
+    secret_ref: String,
+    has_secret: bool,
+}
+
+impl DesktopProviderResponse {
+    fn from_config(config: &DesktopProviderConfig, has_secret: bool) -> Self {
+        Self {
+            id: config.id.clone(),
+            provider_type: config.provider_type.clone(),
+            enabled: config.enabled,
+            name: config.name.clone(),
+            base_url: config.base_url.clone(),
+            model: config.model.clone(),
+            secret_ref: config.secret_ref.clone(),
+            has_secret,
+        }
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -219,8 +528,10 @@ struct AiIconQuery {
 
 struct MockApiState {
     persistence: MockPersistence,
+    secret_store: Arc<dyn SecretStore>,
     settings: RwLock<Value>,
     conversations: RwLock<HashMap<String, ConversationDto>>,
+    providers: RwLock<Vec<DesktopProviderConfig>>,
     conversation_txs: RwLock<HashMap<String, broadcast::Sender<SsePayload>>>,
     settings_tx: broadcast::Sender<SsePayload>,
     list_tx: broadcast::Sender<SsePayload>,
@@ -229,7 +540,12 @@ struct MockApiState {
 }
 
 impl MockApiState {
-    fn new(persistence: MockPersistence, persisted: PersistedMockState) -> Self {
+    fn new(
+        persistence: MockPersistence,
+        secret_store: Arc<dyn SecretStore>,
+        mut persisted: PersistedMockState,
+    ) -> Self {
+        sync_settings_with_desktop_providers(&mut persisted.settings, &persisted.providers);
         let initial_id_seq = persisted
             .id_seq
             .max(max_persisted_id_seq(&persisted.conversations))
@@ -239,8 +555,10 @@ impl MockApiState {
 
         Self {
             persistence,
+            secret_store,
             settings: RwLock::new(persisted.settings),
             conversations: RwLock::new(persisted.conversations),
+            providers: RwLock::new(persisted.providers),
             conversation_txs: RwLock::new(HashMap::new()),
             settings_tx,
             list_tx,
@@ -260,18 +578,27 @@ impl MockApiState {
 }
 
 pub async fn start(app_data_dir: PathBuf) -> Result<MockApiHandle, Box<dyn std::error::Error>> {
+    let secret_store = create_secret_store(&app_data_dir);
     let persistence = MockPersistence::new(app_data_dir);
     eprintln!(
         "RikkaDesk mock API state file: {}",
         persistence.state_path().display()
     );
     let persisted = load_persisted_state(&persistence).await;
-    let state = Arc::new(MockApiState::new(persistence, persisted));
+    let state = Arc::new(MockApiState::new(persistence, secret_store, persisted));
     let router = Router::new()
         .route("/api/settings/stream", get(settings_stream))
         .route("/api/conversations/paged", get(conversations_paged))
         .route("/api/conversations/stream", get(conversations_stream))
         .route("/api/ai-icon", get(ai_icon))
+        .route(
+            "/api/desktop/providers",
+            get(desktop_providers).post(upsert_desktop_provider),
+        )
+        .route(
+            "/api/desktop/providers/{id}/secret",
+            post(update_desktop_provider_secret).delete(delete_desktop_provider_secret),
+        )
         .route("/api/conversations/{id}", get(conversation_detail))
         .route("/api/conversations/{id}/stream", get(conversation_stream))
         .route("/api/conversations/{id}/messages", post(send_message))
@@ -285,7 +612,7 @@ pub async fn start(app_data_dir: PathBuf) -> Result<MockApiHandle, Box<dyn std::
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
-                .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+                .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
                 .allow_headers([header::ACCEPT, header::AUTHORIZATION, header::CONTENT_TYPE]),
         )
         .with_state(state);
@@ -330,7 +657,18 @@ async fn load_persisted_state(persistence: &MockPersistence) -> PersistedMockSta
     };
 
     match serde_json::from_slice::<PersistedMockState>(&bytes) {
-        Ok(persisted) if persisted.schema_version == STATE_SCHEMA_VERSION => persisted,
+        Ok(mut persisted) if persisted.schema_version == STATE_SCHEMA_VERSION => {
+            sync_settings_with_desktop_providers(&mut persisted.settings, &persisted.providers);
+            persisted
+        }
+        Ok(persisted) if persisted.schema_version == LEGACY_STATE_SCHEMA_VERSION => {
+            let mut migrated = migrate_v1_to_v2(persisted);
+            sync_settings_with_desktop_providers(&mut migrated.settings, &migrated.providers);
+            if let Err(error) = persistence.save(&migrated).await {
+                eprintln!("RikkaDesk mock API failed to save migrated state: {error}");
+            }
+            migrated
+        }
         Ok(persisted) => {
             reset_persisted_state(
                 persistence,
@@ -376,6 +714,7 @@ async fn backup_corrupt_state(persistence: &MockPersistence) -> PersistenceResul
 async fn persist_mock_state(state: &Arc<MockApiState>) {
     let settings = state.settings.read().await.clone();
     let conversations = state.conversations.read().await.clone();
+    let providers = state.providers.read().await.clone();
     let id_seq = state
         .id_seq
         .load(Ordering::Relaxed)
@@ -388,11 +727,121 @@ async fn persist_mock_state(state: &Arc<MockApiState>) {
         id_seq,
         settings,
         conversations,
+        providers,
     };
 
     if let Err(error) = state.persistence.save(&persisted).await {
         eprintln!("RikkaDesk mock API failed to save state: {error}");
     }
+}
+
+async fn desktop_providers(State(state): State<Arc<MockApiState>>) -> impl IntoResponse {
+    match desktop_provider_responses(&state).await {
+        Ok(providers) => Json(providers).into_response(),
+        Err(error) => internal_error_response(error),
+    }
+}
+
+async fn upsert_desktop_provider(
+    State(state): State<Arc<MockApiState>>,
+    Json(payload): Json<UpsertDesktopProviderRequest>,
+) -> impl IntoResponse {
+    match build_desktop_provider(&state, payload).await {
+        Ok((provider, api_key)) => {
+            if let Some(api_key) = api_key {
+                if let Err(error) = state
+                    .secret_store
+                    .set_secret(&provider.secret_ref, &api_key)
+                {
+                    eprintln!("RikkaDesk provider secret save failed: {error}");
+                    return internal_error_response("Secret store is unavailable");
+                }
+            }
+
+            {
+                let mut providers = state.providers.write().await;
+                if let Some(existing) = providers.iter_mut().find(|item| item.id == provider.id) {
+                    *existing = provider.clone();
+                } else {
+                    providers.push(provider.clone());
+                }
+            }
+
+            {
+                let providers = state.providers.read().await;
+                let mut settings = state.settings.write().await;
+                sync_settings_with_desktop_providers(&mut settings, &providers);
+                set_current_model_in_settings(&mut settings, provider.model_id_for_settings());
+            }
+
+            persist_mock_state(&state).await;
+            broadcast_settings_update(&state).await;
+
+            let has_secret = match state.secret_store.has_secret(&provider.secret_ref) {
+                Ok(has_secret) => has_secret,
+                Err(error) => {
+                    eprintln!("RikkaDesk provider secret status failed: {error}");
+                    return internal_error_response("Secret store is unavailable");
+                }
+            };
+
+            Json(DesktopProviderResponse::from_config(&provider, has_secret)).into_response()
+        }
+        Err(response) => response,
+    }
+}
+
+async fn update_desktop_provider_secret(
+    State(state): State<Arc<MockApiState>>,
+    Path(id): Path<String>,
+    Json(payload): Json<UpsertDesktopProviderRequest>,
+) -> impl IntoResponse {
+    let Some(api_key) = payload.api_key.map(|value| value.trim().to_string()) else {
+        return bad_request_response("apiKey is required");
+    };
+    if api_key.is_empty() {
+        return bad_request_response("apiKey is required");
+    }
+
+    let provider = {
+        let providers = state.providers.read().await;
+        providers.iter().find(|item| item.id == id).cloned()
+    };
+
+    let Some(provider) = provider else {
+        return not_found_response("Provider not found");
+    };
+
+    if let Err(error) = state
+        .secret_store
+        .set_secret(&provider.secret_ref, &api_key)
+    {
+        eprintln!("RikkaDesk provider secret update failed: {error}");
+        return internal_error_response("Secret store is unavailable");
+    }
+
+    Json(json!({ "status": "ok", "hasSecret": true })).into_response()
+}
+
+async fn delete_desktop_provider_secret(
+    State(state): State<Arc<MockApiState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let provider = {
+        let providers = state.providers.read().await;
+        providers.iter().find(|item| item.id == id).cloned()
+    };
+
+    let Some(provider) = provider else {
+        return not_found_response("Provider not found");
+    };
+
+    if let Err(error) = state.secret_store.delete_secret(&provider.secret_ref) {
+        eprintln!("RikkaDesk provider secret delete failed: {error}");
+        return internal_error_response("Secret store is unavailable");
+    }
+
+    Json(json!({ "status": "ok", "hasSecret": false })).into_response()
 }
 
 async fn settings_stream(State(state): State<Arc<MockApiState>>) -> impl IntoResponse {
@@ -667,10 +1116,176 @@ async fn not_implemented() -> impl IntoResponse {
     (
         StatusCode::NOT_FOUND,
         Json(json!({
-            "error": "This endpoint is not implemented by the RikkaDesk Phase 2C mock API.",
+            "error": "This endpoint is not implemented by the RikkaDesk mock API.",
             "code": 404,
         })),
     )
+}
+
+async fn desktop_provider_responses(
+    state: &Arc<MockApiState>,
+) -> Result<Vec<DesktopProviderResponse>, String> {
+    let providers = state.providers.read().await;
+    providers
+        .iter()
+        .map(|provider| {
+            state
+                .secret_store
+                .has_secret(&provider.secret_ref)
+                .map(|has_secret| DesktopProviderResponse::from_config(provider, has_secret))
+        })
+        .collect()
+}
+
+async fn build_desktop_provider(
+    state: &Arc<MockApiState>,
+    payload: UpsertDesktopProviderRequest,
+) -> Result<(DesktopProviderConfig, Option<String>), Response> {
+    let requested_type = payload
+        .provider_type
+        .unwrap_or_else(|| OPENAI_COMPATIBLE_PROVIDER_TYPE.to_string());
+    let provider_type = requested_type.trim();
+    if provider_type != OPENAI_COMPATIBLE_PROVIDER_TYPE {
+        return Err(bad_request_response(
+            "Only openai-compatible providers are supported",
+        ));
+    }
+
+    let existing = if let Some(id) = payload
+        .id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        let providers = state.providers.read().await;
+        providers.iter().find(|item| item.id == id).cloned()
+    } else {
+        None
+    };
+
+    let id = payload
+        .id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| existing.as_ref().map(|provider| provider.id.clone()))
+        .unwrap_or_else(|| state.next_id("desktop-provider"));
+
+    if !is_safe_config_id(&id) {
+        return Err(bad_request_response(
+            "Provider id contains unsupported characters",
+        ));
+    }
+
+    let base_url = payload
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| existing.as_ref().map(|provider| provider.base_url.clone()))
+        .ok_or_else(|| bad_request_response("baseUrl is required"))?;
+
+    let model_id = payload
+        .model_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            existing
+                .as_ref()
+                .map(|provider| provider.model.model_id.clone())
+        })
+        .ok_or_else(|| bad_request_response("modelId is required"))?;
+
+    let display_name = payload
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            existing
+                .as_ref()
+                .map(|provider| provider.model.display_name.clone())
+        })
+        .unwrap_or_else(|| model_id.clone());
+
+    let model_record_id = existing
+        .as_ref()
+        .map(|provider| provider.model.id.clone())
+        .unwrap_or_else(|| state.next_id("desktop-model"));
+
+    let name = payload
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| existing.as_ref().map(|provider| provider.name.clone()))
+        .unwrap_or_else(|| "OpenAI Compatible".to_string());
+
+    let provider = DesktopProviderConfig {
+        secret_ref: existing
+            .as_ref()
+            .map(|provider| provider.secret_ref.clone())
+            .unwrap_or_else(|| secret_ref_for_provider(&id)),
+        id,
+        provider_type: OPENAI_COMPATIBLE_PROVIDER_TYPE.to_string(),
+        enabled: payload
+            .enabled
+            .or_else(|| existing.as_ref().map(|provider| provider.enabled))
+            .unwrap_or(true),
+        name,
+        base_url,
+        model: DesktopProviderModelConfig {
+            id: model_record_id,
+            model_id,
+            display_name,
+        },
+    };
+
+    let api_key = payload
+        .api_key
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    Ok((provider, api_key))
+}
+
+fn bad_request_response(message: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": message,
+            "code": 400,
+        })),
+    )
+        .into_response()
+}
+
+fn not_found_response(message: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({
+            "error": message,
+            "code": 404,
+        })),
+    )
+        .into_response()
+}
+
+fn internal_error_response(message: impl Into<String>) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "error": message.into(),
+            "code": 500,
+        })),
+    )
+        .into_response()
 }
 
 async fn get_or_create_conversation(state: &Arc<MockApiState>, id: &str) -> ConversationDto {
@@ -802,7 +1417,106 @@ fn default_persisted_state() -> PersistedMockState {
         id_seq: max_persisted_id_seq(&conversations).max(1),
         settings: default_settings(),
         conversations,
+        providers: Vec::new(),
     }
+}
+
+fn migrate_v1_to_v2(mut persisted: PersistedMockState) -> PersistedMockState {
+    persisted.schema_version = STATE_SCHEMA_VERSION;
+    persisted.saved_at = now_millis();
+    persisted.providers = Vec::new();
+    persisted
+}
+
+fn sync_settings_with_desktop_providers(settings: &mut Value, providers: &[DesktopProviderConfig]) {
+    let desktop_provider_ids: Vec<&str> = providers
+        .iter()
+        .map(|provider| provider.id.as_str())
+        .collect();
+    let existing_providers = settings
+        .get("providers")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut merged_providers: Vec<Value> = existing_providers
+        .into_iter()
+        .filter(|provider| {
+            provider
+                .get("id")
+                .and_then(Value::as_str)
+                .is_none_or(|id| !desktop_provider_ids.contains(&id))
+        })
+        .collect();
+
+    merged_providers.extend(
+        providers
+            .iter()
+            .map(DesktopProviderConfig::to_settings_provider),
+    );
+
+    settings["providers"] = Value::Array(merged_providers);
+}
+
+fn set_current_model_in_settings(settings: &mut Value, model_id: &str) {
+    settings["chatModelId"] = json!(model_id);
+
+    let current_assistant_id = settings
+        .get("assistantId")
+        .and_then(Value::as_str)
+        .unwrap_or(MOCK_ASSISTANT_ID)
+        .to_string();
+
+    if let Some(assistants) = settings.get_mut("assistants").and_then(Value::as_array_mut) {
+        for assistant in assistants {
+            let is_current = assistant
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id == current_assistant_id);
+            if is_current {
+                assistant["chatModelId"] = json!(model_id);
+            }
+        }
+    }
+
+    if let Some(favorite_models) = settings
+        .get_mut("favoriteModels")
+        .and_then(Value::as_array_mut)
+    {
+        let already_favorite = favorite_models
+            .iter()
+            .any(|item| item.as_str() == Some(model_id));
+        if !already_favorite {
+            favorite_models.push(json!(model_id));
+        }
+    } else {
+        settings["favoriteModels"] = json!([model_id]);
+    }
+}
+
+fn secret_ref_for_provider(provider_id: &str) -> String {
+    format!("rikkadesk:provider:{provider_id}:api-key")
+}
+
+fn secret_storage_key_for_ref(secret_ref: &str) -> String {
+    let mut account = String::with_capacity(secret_ref.len());
+    for byte in secret_ref.bytes() {
+        match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' => {
+                account.push(byte as char);
+            }
+            _ => account.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    account
+}
+
+fn is_safe_config_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':'))
 }
 
 fn max_persisted_id_seq(conversations: &HashMap<String, ConversationDto>) -> u64 {
