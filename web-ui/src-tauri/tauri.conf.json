@@ -1,0 +1,39 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "RikkaDesk",
+  "version": "0.1.0",
+  "identifier": "com.cisyamx.rikkadesk",
+  "build": {
+    "beforeDevCommand": "pnpm run dev",
+    "devUrl": "http://localhost:5173",
+    "beforeBuildCommand": "pnpm run build:web",
+    "frontendDist": "../build/client"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "RikkaDesk",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 600,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
+    ],
+    "shortDescription": "RikkaDesk desktop shell",
+    "longDescription": "An unofficial desktop derivative / experiment based on RikkaHub."
+  }
+}

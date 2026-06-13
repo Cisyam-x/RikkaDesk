@@ -6,7 +6,13 @@ import svgr from "vite-plugin-svgr";
 
 export default defineConfig({
   plugins: [tailwindcss(), reactRouter(), tsconfigPaths(), svgr()],
+  clearScreen: false,
   server: {
+    port: 5173,
+    strictPort: true,
+    watch: {
+      ignored: ["**/src-tauri/**"],
+    },
     proxy: {
       "/api": {
         target: "http://localhost:8080",

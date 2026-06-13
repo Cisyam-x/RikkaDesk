@@ -4,8 +4,12 @@
   "type": "module",
   "scripts": {
     "build": "react-router build && tsx copy.ts",
+    "build:web": "react-router build",
     "dev": "react-router dev",
     "start": "react-router-serve ./build/server/index.js",
+    "tauri": "tauri",
+    "desktop:dev": "tauri dev",
+    "desktop:build": "tauri build",
     "typecheck": "react-router typegen && tsc",
     "lint": "oxlint app --fix",
     "fmt": "oxfmt app",
@@ -51,6 +55,7 @@
   "devDependencies": {
     "@react-router/dev": "7.13.0",
     "@tailwindcss/vite": "^4.1.13",
+    "@tauri-apps/cli": "^2.11.2",
     "@types/node": "^24.10.13",
     "@types/react": "^19.2.7",
     "@types/react-dom": "^19.2.3",
