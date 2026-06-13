@@ -12,7 +12,11 @@ RikkaDesk is not an official RikkaHub project and is not endorsed by the upstrea
 
 The current project goal is to explore a local Web UI plus Tauri desktop shell for Windows.
 
-At this stage, RikkaDesk does not include a complete Windows local backend. The existing `web-ui` can run locally, but chat and related runtime features still depend on compatible `/api/*` endpoints. A compatible local backend for `/api/*` must be designed and implemented in a later phase.
+At this stage, RikkaDesk includes a Tauri desktop shell and a minimal in-memory Mock API backend for development verification. The Mock API is intended only to make the desktop prototype reproducible and testable while the real Windows local backend is still being designed.
+
+The Mock API does not call real model providers, does not persist data, and does not implement API key management. It handles only the startup and basic chat endpoints needed by the current `web-ui` prototype. A complete compatible local backend for `/api/*` still needs to be designed and implemented in a later phase.
+
+File upload, attachments, search, MCP, tool calls, conversation forks, and other enhanced features are not included in the current Mock API.
 
 ## Security
 

@@ -4,17 +4,75 @@ RikkaDesk is an unofficial desktop derivative / experiment based on RikkaHub.
 
 RikkaDesk is a non-official desktop-oriented derivative of [RikkaHub](https://github.com/rikkahub/rikkahub). It currently focuses on making the existing RikkaHub `web-ui` usable as the foundation for a local Windows desktop app.
 
-This repository is in an early staged migration:
+This repository is in an early staged migration. The current prototype is a local Tauri desktop shell with an in-memory Mock API backend for development verification only.
 
 - Phase 0 is complete: the upstream architecture, `web-ui`, Web Interface, and license were reviewed without code changes.
 - Phase 1 is complete: the `web-ui` can run locally in a browser at `http://localhost:5173/`.
-- Phase 2A will add a Tauri desktop shell that loads the local `web-ui`.
+- Phase 2A is complete: Tauri v2 wraps the existing `web-ui` as a Windows desktop shell.
+- Phase 2B is complete: the `/api/*` contract used by startup and chat flows was inventoried.
+- Phase 2C is complete: a minimal Tauri Rust Mock API handles the P0/P1 startup and basic chat endpoints.
 
 Current limitations:
 
-- RikkaDesk does not yet include a complete Windows local backend.
-- The frontend can run, but chat and runtime features still depend on compatible `/api/*` backend endpoints.
-- `/api/*` compatibility is planned for a later backend phase.
+- The Mock API is not a real model backend and does not call OpenAI, Gemini, Anthropic, DeepSeek, or any other provider.
+- API keys, provider credentials, persistent settings, SQLite storage, and conversation persistence are not implemented.
+- File uploads, attachments, search, MCP, tools, branching, and other P2/P3 endpoints are intentionally deferred.
+- Messages are stored only in memory for the lifetime of the desktop process.
+
+What works in the current prototype:
+
+- The Windows desktop window can load the production `web-ui` build.
+- The Mock API starts inside the Tauri process and listens on `127.0.0.1`.
+- The UI can load settings, show a mock conversation, send a message, and receive the mock reply defined in `web-ui/src-tauri/src/mock_api.rs`.
+- If `127.0.0.1:8080` is already in use, the Mock API falls back to a random local loopback port and the frontend reads it through the Tauri command `get_api_base_url`.
+
+## RikkaDesk Development
+
+Install dependencies:
+
+```powershell
+cd web-ui
+pnpm install
+```
+
+Run the browser-only `web-ui` development server:
+
+```powershell
+cd web-ui
+pnpm run dev
+```
+
+Run the RikkaDesk desktop prototype:
+
+```powershell
+cd web-ui
+pnpm run desktop:dev
+```
+
+Build Windows desktop installers:
+
+```powershell
+cd web-ui
+pnpm run desktop:build
+```
+
+Build outputs:
+
+- `web-ui/src-tauri/target/release/rikkadesk.exe`
+- `web-ui/src-tauri/target/release/bundle/msi/RikkaDesk_0.1.0_x64_en-US.msi`
+- `web-ui/src-tauri/target/release/bundle/nsis/RikkaDesk_0.1.0_x64-setup.exe`
+
+Useful validation commands:
+
+```powershell
+cd web-ui
+pnpm run typecheck
+cargo check --manifest-path src-tauri/Cargo.toml
+pnpm run desktop:dev
+pnpm run desktop:build
+```
+
+More details are in [docs/rikkadesk-dev.md](docs/rikkadesk-dev.md).
 
 Security and compliance:
 
