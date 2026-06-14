@@ -1531,7 +1531,12 @@ async fn handle_openai_stream_line(
 }
 
 fn openai_chat_completions_url(base_url: &str) -> String {
-    format!("{}/chat/completions", base_url.trim_end_matches('/'))
+    let base_url = base_url.trim_end_matches('/');
+    if base_url.ends_with("/chat/completions") {
+        base_url.to_string()
+    } else {
+        format!("{base_url}/chat/completions")
+    }
 }
 
 fn safe_reqwest_error(error: reqwest::Error) -> String {
