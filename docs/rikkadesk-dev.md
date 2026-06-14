@@ -18,7 +18,8 @@ RikkaDesk is an unofficial desktop derivative / experiment based on RikkaHub. Th
 - Phase 3F complete: real provider smoke-test guidance was documented.
 - Phase 4A complete: minimal Provider Settings UI was added.
 - Phase 4B complete: Provider Settings UI smoke-test guidance was documented.
-- Phase 5A current: prepare the first local beta package checklist without publishing a public release.
+- Phase 5A complete: prepared the first local beta package checklist without publishing a public release.
+- Phase 5B current: prepare changelog, release draft, version strategy, and merge guidance without publishing a release.
 
 ## Current Architecture
 

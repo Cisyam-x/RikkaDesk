@@ -4,7 +4,7 @@ RikkaDesk is an unofficial desktop derivative / experiment based on RikkaHub.
 
 RikkaDesk is a non-official desktop-oriented derivative of [RikkaHub](https://github.com/rikkahub/rikkahub). It currently focuses on making the existing RikkaHub `web-ui` usable as the foundation for a local Windows desktop app.
 
-This repository is in an early staged migration. The current prototype is a local Tauri desktop shell with a Rust desktop API, JSON persistence, Provider Settings, and an OpenAI-compatible text chat path.
+This repository is in an early staged migration. The current prototype is experimental and is being prepared as a local/private beta, not a public production release. It includes a local Tauri desktop shell with a Rust desktop API, JSON persistence, Provider Settings, and an OpenAI-compatible text chat path.
 
 - Phase 0 is complete: the upstream architecture, `web-ui`, Web Interface, and license were reviewed without code changes.
 - Phase 1 is complete: the `web-ui` can run locally in a browser at `http://localhost:5173/`.
@@ -81,6 +81,8 @@ pnpm run desktop:build
 More details are in [docs/rikkadesk-dev.md](docs/rikkadesk-dev.md).
 
 Beta packaging notes are in [docs/rikkadesk-beta-package-checklist.md](docs/rikkadesk-beta-package-checklist.md).
+
+Beta release draft notes are in [docs/rikkadesk-release-draft.md](docs/rikkadesk-release-draft.md), and desktop changes are summarized in [CHANGELOG.md](CHANGELOG.md).
 
 Security and compliance:
 
