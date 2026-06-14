@@ -9,7 +9,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use async_stream::stream;
@@ -50,6 +50,7 @@ const SECRETS_DIR_NAME: &str = "secrets";
 #[cfg(not(windows))]
 const SECRET_SERVICE_NAME: &str = "RikkaDesk";
 const OPENAI_COMPATIBLE_PROVIDER_TYPE: &str = "openai-compatible";
+const OPENAI_CHAT_TIMEOUT_SECS: u64 = 60;
 const MOCK_ASSISTANT_ID: &str = "mock-assistant";
 const MOCK_MODEL_ID: &str = "mock-chat";
 const MOCK_PROVIDER_ID: &str = "mock-provider";
@@ -413,6 +414,40 @@ impl DesktopProviderResponse {
     }
 }
 
+struct OpenAiChatConfig {
+    base_url: String,
+    model_id: String,
+    api_key: String,
+}
+
+#[derive(Serialize)]
+struct OpenAiChatCompletionRequest {
+    model: String,
+    messages: Vec<OpenAiChatMessage>,
+    stream: bool,
+}
+
+#[derive(Clone, Serialize)]
+struct OpenAiChatMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct OpenAiChatCompletionResponse {
+    choices: Vec<OpenAiChatChoice>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiChatChoice {
+    message: OpenAiChatChoiceMessage,
+}
+
+#[derive(Deserialize)]
+struct OpenAiChatChoiceMessage {
+    content: Option<String>,
+}
+
 #[derive(Clone, Serialize)]
 struct SsePayload {
     event: String,
@@ -529,6 +564,7 @@ struct AiIconQuery {
 struct MockApiState {
     persistence: MockPersistence,
     secret_store: Arc<dyn SecretStore>,
+    http_client: reqwest::Client,
     settings: RwLock<Value>,
     conversations: RwLock<HashMap<String, ConversationDto>>,
     providers: RwLock<Vec<DesktopProviderConfig>>,
@@ -556,6 +592,10 @@ impl MockApiState {
         Self {
             persistence,
             secret_store,
+            http_client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(OPENAI_CHAT_TIMEOUT_SECS))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             settings: RwLock::new(persisted.settings),
             conversations: RwLock::new(persisted.conversations),
             providers: RwLock::new(persisted.providers),
@@ -984,7 +1024,7 @@ async fn send_message(
     let created_at = now_iso();
     let user_text = first_text_part(&payload.parts);
 
-    let updated = {
+    let updated_after_user_message = {
         let mut conversations = state.conversations.write().await;
         let conversation = conversations
             .entry(id.clone())
@@ -1014,6 +1054,29 @@ async fn send_message(
             select_index: 0,
         });
 
+        conversation.update_at = now_millis();
+        conversation.is_generating = true;
+        conversation.clone()
+    };
+
+    persist_mock_state(&state).await;
+    broadcast_conversation_snapshot(&state, &updated_after_user_message).await;
+    broadcast_list_invalidate(&state).await;
+
+    let reply_text = chat_reply_for_message(
+        &state,
+        &updated_after_user_message,
+        &model_id,
+        user_text.as_deref(),
+    )
+    .await;
+
+    let updated = {
+        let mut conversations = state.conversations.write().await;
+        let conversation = conversations
+            .entry(id.clone())
+            .or_insert_with(|| empty_conversation(id.clone(), assistant_id.clone(), now));
+
         let reply_time = now_iso();
         conversation.messages.push(MessageNodeDto {
             id: state.next_id("node"),
@@ -1022,7 +1085,7 @@ async fn send_message(
                 role: "ASSISTANT".to_string(),
                 parts: vec![json!({
                     "type": "text",
-                    "text": MOCK_REPLY_TEXT,
+                    "text": reply_text,
                 })],
                 annotations: None,
                 created_at: reply_time.clone(),
@@ -1135,6 +1198,204 @@ async fn desktop_provider_responses(
                 .map(|has_secret| DesktopProviderResponse::from_config(provider, has_secret))
         })
         .collect()
+}
+
+async fn chat_reply_for_message(
+    state: &Arc<MockApiState>,
+    conversation: &ConversationDto,
+    model_id: &str,
+    user_text: Option<&str>,
+) -> String {
+    if user_text.is_none() {
+        return "Phase 3D currently supports text-only chat.".to_string();
+    }
+
+    let config = match resolve_openai_chat_config(state, model_id).await {
+        Ok(Some(config)) => config,
+        Ok(None) => return MOCK_REPLY_TEXT.to_string(),
+        Err(error) => return format!("Real provider request failed: {error}"),
+    };
+
+    let messages = openai_messages_from_conversation(conversation);
+    if messages.is_empty() {
+        return "Phase 3D currently supports text-only chat.".to_string();
+    }
+
+    match call_openai_compatible_chat(&state.http_client, &config, messages).await {
+        Ok(reply) => reply,
+        Err(error) => format!("Real provider request failed: {error}"),
+    }
+}
+
+async fn resolve_openai_chat_config(
+    state: &Arc<MockApiState>,
+    selected_model_id: &str,
+) -> Result<Option<OpenAiChatConfig>, String> {
+    let provider = {
+        let providers = state.providers.read().await;
+        providers
+            .iter()
+            .find(|provider| {
+                provider.enabled
+                    && provider.provider_type == OPENAI_COMPATIBLE_PROVIDER_TYPE
+                    && (provider.model.id == selected_model_id
+                        || provider.model.model_id == selected_model_id)
+            })
+            .cloned()
+    };
+
+    let Some(provider) = provider else {
+        return Ok(None);
+    };
+
+    let base_url = provider.base_url.trim();
+    let model_id = provider.model.model_id.trim();
+    if base_url.is_empty() || model_id.is_empty() {
+        return Ok(None);
+    }
+
+    let Some(api_key) = state.secret_store.get_secret(&provider.secret_ref)? else {
+        return Ok(None);
+    };
+    let api_key = api_key.trim().to_string();
+    if api_key.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(OpenAiChatConfig {
+        base_url: base_url.to_string(),
+        model_id: model_id.to_string(),
+        api_key,
+    }))
+}
+
+async fn call_openai_compatible_chat(
+    client: &reqwest::Client,
+    config: &OpenAiChatConfig,
+    messages: Vec<OpenAiChatMessage>,
+) -> Result<String, String> {
+    let request = OpenAiChatCompletionRequest {
+        model: config.model_id.clone(),
+        messages,
+        stream: false,
+    };
+
+    let response = client
+        .post(openai_chat_completions_url(&config.base_url))
+        .bearer_auth(&config.api_key)
+        .json(&request)
+        .send()
+        .await
+        .map_err(safe_reqwest_error)?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!(
+            "{} {}",
+            status.as_u16(),
+            status.canonical_reason().unwrap_or("HTTP error")
+        ));
+    }
+
+    let response = response
+        .json::<OpenAiChatCompletionResponse>()
+        .await
+        .map_err(|_| "API returned an unexpected response".to_string())?;
+
+    response
+        .choices
+        .into_iter()
+        .find_map(|choice| choice.message.content)
+        .map(|content| content.trim().to_string())
+        .filter(|content| !content.is_empty())
+        .ok_or_else(|| "API returned an empty assistant message".to_string())
+}
+
+fn openai_chat_completions_url(base_url: &str) -> String {
+    format!("{}/chat/completions", base_url.trim_end_matches('/'))
+}
+
+fn safe_reqwest_error(error: reqwest::Error) -> String {
+    if error.is_timeout() {
+        "network timeout".to_string()
+    } else if error.is_connect() {
+        "network connection failed".to_string()
+    } else if error.is_decode() {
+        "response decode failed".to_string()
+    } else if error.is_builder() {
+        "request build failed".to_string()
+    } else {
+        "request failed".to_string()
+    }
+}
+
+fn openai_messages_from_conversation(conversation: &ConversationDto) -> Vec<OpenAiChatMessage> {
+    let mut messages = Vec::new();
+
+    if let Some(system_prompt) = conversation
+        .custom_system_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|prompt| !prompt.is_empty())
+    {
+        messages.push(OpenAiChatMessage {
+            role: "system".to_string(),
+            content: system_prompt.to_string(),
+        });
+    }
+
+    for node in &conversation.messages {
+        let message = node
+            .messages
+            .get(node.select_index)
+            .or_else(|| node.messages.first());
+        let Some(message) = message else {
+            continue;
+        };
+        let role = match message.role.as_str() {
+            "USER" => "user",
+            "ASSISTANT" => "assistant",
+            "SYSTEM" => "system",
+            _ => continue,
+        };
+        let Some(content) = text_from_parts(&message.parts) else {
+            continue;
+        };
+
+        messages.push(OpenAiChatMessage {
+            role: role.to_string(),
+            content,
+        });
+    }
+
+    trim_openai_message_history(messages)
+}
+
+fn trim_openai_message_history(messages: Vec<OpenAiChatMessage>) -> Vec<OpenAiChatMessage> {
+    const MAX_MESSAGES: usize = 32;
+    if messages.len() <= MAX_MESSAGES {
+        return messages;
+    }
+
+    let mut trimmed = Vec::with_capacity(MAX_MESSAGES);
+    let has_system = messages
+        .first()
+        .is_some_and(|message| message.role == "system");
+    if has_system {
+        trimmed.push(messages[0].clone());
+    }
+
+    let keep_tail = MAX_MESSAGES - trimmed.len();
+    trimmed.extend(
+        messages
+            .into_iter()
+            .rev()
+            .take(keep_tail)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev(),
+    );
+    trimmed
 }
 
 async fn build_desktop_provider(
@@ -1684,6 +1945,19 @@ fn first_text_part(parts: &[Value]) -> Option<String> {
         .map(str::trim)
         .filter(|text| !text.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn text_from_parts(parts: &[Value]) -> Option<String> {
+    let text = parts
+        .iter()
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    (!text.is_empty()).then_some(text)
 }
 
 fn title_from_text(text: Option<&str>) -> Option<String> {
