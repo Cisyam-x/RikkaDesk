@@ -5,6 +5,7 @@ import type { TFunction } from "i18next";
 import { toast } from "sonner";
 import {
   Check,
+  KeyRound,
   Laptop,
   Languages,
   Moon,
@@ -66,6 +67,7 @@ import {
 } from "~/components/theme-provider";
 import { ConversationSearchButton } from "~/components/conversation-search-button";
 import { CustomThemeDialog } from "~/components/custom-theme-dialog";
+import { ProviderSettingsDialog } from "~/components/provider-settings-dialog";
 import { getAssistantDisplayName } from "~/lib/display";
 import { clearWebAuthToken } from "~/services/api";
 import type { AssistantAvatar, AssistantProfile, AssistantTag, ConversationListDto } from "~/types";
@@ -544,6 +546,7 @@ export const ConversationSidebar = React.memo(({
 
   const [pickerOpen, setPickerOpen] = React.useState(false);
   const [customThemeOpen, setCustomThemeOpen] = React.useState(false);
+  const [providerSettingsOpen, setProviderSettingsOpen] = React.useState(false);
   const [selectedTagIds, setSelectedTagIds] = React.useState<string[]>([]);
   const [switchingAssistantId, setSwitchingAssistantId] = React.useState<string | null>(null);
   const [switchError, setSwitchError] = React.useState<string | null>(null);
@@ -869,6 +872,11 @@ export const ConversationSidebar = React.memo(({
           onSave={handleCustomThemeSave}
         />
 
+        <ProviderSettingsDialog
+          open={providerSettingsOpen}
+          onOpenChange={setProviderSettingsOpen}
+        />
+
         <div className="flex items-center gap-2">
           {webAuthEnabled && (
             <Button
@@ -885,6 +893,18 @@ export const ConversationSidebar = React.memo(({
           )}
 
           <LanguageSwitcher />
+
+          <Button
+            variant="outline"
+            size="icon-sm"
+            className="text-foreground"
+            type="button"
+            onClick={() => setProviderSettingsOpen(true)}
+            aria-label="Provider Settings"
+            title="Provider Settings"
+          >
+            <KeyRound className="size-4" />
+          </Button>
 
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
