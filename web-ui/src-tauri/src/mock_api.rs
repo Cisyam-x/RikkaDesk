@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     convert::Infallible,
     fs as std_fs, io,
     net::SocketAddr,
@@ -434,17 +434,17 @@ struct OpenAiChatMessage {
 }
 
 #[derive(Deserialize)]
-struct OpenAiChatCompletionResponse {
-    choices: Vec<OpenAiChatChoice>,
+struct OpenAiChatStreamResponse {
+    choices: Vec<OpenAiChatStreamChoice>,
 }
 
 #[derive(Deserialize)]
-struct OpenAiChatChoice {
-    message: OpenAiChatChoiceMessage,
+struct OpenAiChatStreamChoice {
+    delta: OpenAiChatStreamDelta,
 }
 
 #[derive(Deserialize)]
-struct OpenAiChatChoiceMessage {
+struct OpenAiChatStreamDelta {
     content: Option<String>,
 }
 
@@ -568,6 +568,7 @@ struct MockApiState {
     settings: RwLock<Value>,
     conversations: RwLock<HashMap<String, ConversationDto>>,
     providers: RwLock<Vec<DesktopProviderConfig>>,
+    generating_flags: RwLock<HashSet<String>>,
     conversation_txs: RwLock<HashMap<String, broadcast::Sender<SsePayload>>>,
     settings_tx: broadcast::Sender<SsePayload>,
     list_tx: broadcast::Sender<SsePayload>,
@@ -599,6 +600,7 @@ impl MockApiState {
             settings: RwLock::new(persisted.settings),
             conversations: RwLock::new(persisted.conversations),
             providers: RwLock::new(persisted.providers),
+            generating_flags: RwLock::new(HashSet::new()),
             conversation_txs: RwLock::new(HashMap::new()),
             settings_tx,
             list_tx,
@@ -1063,48 +1065,63 @@ async fn send_message(
     broadcast_conversation_snapshot(&state, &updated_after_user_message).await;
     broadcast_list_invalidate(&state).await;
 
-    let reply_text = chat_reply_for_message(
-        &state,
-        &updated_after_user_message,
-        &model_id,
-        user_text.as_deref(),
-    )
-    .await;
-
-    let updated = {
-        let mut conversations = state.conversations.write().await;
-        let conversation = conversations
-            .entry(id.clone())
-            .or_insert_with(|| empty_conversation(id.clone(), assistant_id.clone(), now));
-
-        let reply_time = now_iso();
-        conversation.messages.push(MessageNodeDto {
-            id: state.next_id("node"),
-            messages: vec![MessageDto {
-                id: state.next_id("msg"),
-                role: "ASSISTANT".to_string(),
-                parts: vec![json!({
-                    "type": "text",
-                    "text": reply_text,
-                })],
-                annotations: None,
-                created_at: reply_time.clone(),
-                finished_at: Some(reply_time),
-                model_id: Some(model_id),
-                usage: None,
-                translation: None,
-            }],
-            select_index: 0,
-        });
-
-        conversation.update_at = now_millis();
-        conversation.is_generating = false;
-        conversation.clone()
+    let real_chat_config = if user_text.is_some() {
+        match resolve_openai_chat_config(&state, &model_id).await {
+            Ok(config) => config,
+            Err(error) => {
+                append_assistant_reply(
+                    &state,
+                    &id,
+                    &assistant_id,
+                    &model_id,
+                    format!("Real provider request failed: {error}"),
+                    now,
+                )
+                .await;
+                return Json(json!({ "status": "accepted" }));
+            }
+        }
+    } else {
+        None
     };
 
-    persist_mock_state(&state).await;
-    broadcast_conversation_snapshot(&state, &updated).await;
-    broadcast_list_invalidate(&state).await;
+    let Some(config) = real_chat_config else {
+        let reply_text = if user_text.is_none() {
+            "Phase 3E currently supports text-only chat.".to_string()
+        } else {
+            MOCK_REPLY_TEXT.to_string()
+        };
+        append_assistant_reply(&state, &id, &assistant_id, &model_id, reply_text, now).await;
+        return Json(json!({ "status": "accepted" }));
+    };
+
+    let messages = openai_messages_from_conversation(&updated_after_user_message);
+    if messages.is_empty() {
+        append_assistant_reply(
+            &state,
+            &id,
+            &assistant_id,
+            &model_id,
+            "Phase 3E currently supports text-only chat.".to_string(),
+            now,
+        )
+        .await;
+        return Json(json!({ "status": "accepted" }));
+    }
+
+    let assistant_message_id =
+        append_empty_streaming_assistant_reply(&state, &id, &assistant_id, &model_id, now).await;
+    start_generation(&state, &id).await;
+
+    let stream_result =
+        stream_openai_compatible_chat(&state, &id, &assistant_message_id, &config, messages).await;
+
+    if let Err(error) = stream_result {
+        let error_text = format!("Real provider request failed: {error}");
+        append_text_to_assistant_message(&state, &id, &assistant_message_id, &error_text).await;
+    }
+
+    finish_streaming_assistant_reply(&state, &id, &assistant_message_id).await;
 
     Json(json!({ "status": "accepted" }))
 }
@@ -1113,6 +1130,8 @@ async fn stop_conversation(
     State(state): State<Arc<MockApiState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    stop_generation(&state, &id).await;
+
     let maybe_updated = {
         let mut conversations = state.conversations.write().await;
         conversations.get_mut(&id).map(|conversation| {
@@ -1200,31 +1219,172 @@ async fn desktop_provider_responses(
         .collect()
 }
 
-async fn chat_reply_for_message(
+async fn append_assistant_reply(
     state: &Arc<MockApiState>,
-    conversation: &ConversationDto,
+    conversation_id: &str,
+    assistant_id: &str,
     model_id: &str,
-    user_text: Option<&str>,
-) -> String {
-    if user_text.is_none() {
-        return "Phase 3D currently supports text-only chat.".to_string();
-    }
+    reply_text: String,
+    now: u64,
+) {
+    let updated = {
+        let mut conversations = state.conversations.write().await;
+        let conversation = conversations
+            .entry(conversation_id.to_string())
+            .or_insert_with(|| {
+                empty_conversation(conversation_id.to_string(), assistant_id.to_string(), now)
+            });
 
-    let config = match resolve_openai_chat_config(state, model_id).await {
-        Ok(Some(config)) => config,
-        Ok(None) => return MOCK_REPLY_TEXT.to_string(),
-        Err(error) => return format!("Real provider request failed: {error}"),
+        let reply_time = now_iso();
+        conversation.messages.push(MessageNodeDto {
+            id: state.next_id("node"),
+            messages: vec![MessageDto {
+                id: state.next_id("msg"),
+                role: "ASSISTANT".to_string(),
+                parts: vec![json!({
+                    "type": "text",
+                    "text": reply_text,
+                })],
+                annotations: None,
+                created_at: reply_time.clone(),
+                finished_at: Some(reply_time),
+                model_id: Some(model_id.to_string()),
+                usage: None,
+                translation: None,
+            }],
+            select_index: 0,
+        });
+
+        conversation.update_at = now_millis();
+        conversation.is_generating = false;
+        conversation.clone()
     };
 
-    let messages = openai_messages_from_conversation(conversation);
-    if messages.is_empty() {
-        return "Phase 3D currently supports text-only chat.".to_string();
+    persist_mock_state(state).await;
+    broadcast_conversation_snapshot(state, &updated).await;
+    broadcast_list_invalidate(state).await;
+}
+
+async fn append_empty_streaming_assistant_reply(
+    state: &Arc<MockApiState>,
+    conversation_id: &str,
+    assistant_id: &str,
+    model_id: &str,
+    now: u64,
+) -> String {
+    let message_id = state.next_id("msg");
+    let updated = {
+        let mut conversations = state.conversations.write().await;
+        let conversation = conversations
+            .entry(conversation_id.to_string())
+            .or_insert_with(|| {
+                empty_conversation(conversation_id.to_string(), assistant_id.to_string(), now)
+            });
+
+        let reply_time = now_iso();
+        conversation.messages.push(MessageNodeDto {
+            id: state.next_id("node"),
+            messages: vec![MessageDto {
+                id: message_id.clone(),
+                role: "ASSISTANT".to_string(),
+                parts: vec![json!({
+                    "type": "text",
+                    "text": "",
+                })],
+                annotations: None,
+                created_at: reply_time,
+                finished_at: None,
+                model_id: Some(model_id.to_string()),
+                usage: None,
+                translation: None,
+            }],
+            select_index: 0,
+        });
+
+        conversation.update_at = now_millis();
+        conversation.is_generating = true;
+        conversation.clone()
+    };
+
+    persist_mock_state(state).await;
+    broadcast_conversation_snapshot(state, &updated).await;
+    broadcast_list_invalidate(state).await;
+    message_id
+}
+
+async fn append_text_to_assistant_message(
+    state: &Arc<MockApiState>,
+    conversation_id: &str,
+    assistant_message_id: &str,
+    text: &str,
+) {
+    if text.is_empty() {
+        return;
     }
 
-    match call_openai_compatible_chat(&state.http_client, &config, messages).await {
-        Ok(reply) => reply,
-        Err(error) => format!("Real provider request failed: {error}"),
-    }
+    let updated = {
+        let mut conversations = state.conversations.write().await;
+        let Some(conversation) = conversations.get_mut(conversation_id) else {
+            return;
+        };
+        let Some(message) = find_message_mut(conversation, assistant_message_id) else {
+            return;
+        };
+
+        append_text_part(&mut message.parts, text);
+        conversation.update_at = now_millis();
+        conversation.clone()
+    };
+
+    broadcast_conversation_snapshot(state, &updated).await;
+}
+
+async fn finish_streaming_assistant_reply(
+    state: &Arc<MockApiState>,
+    conversation_id: &str,
+    assistant_message_id: &str,
+) {
+    stop_generation(state, conversation_id).await;
+
+    let updated = {
+        let mut conversations = state.conversations.write().await;
+        let Some(conversation) = conversations.get_mut(conversation_id) else {
+            return;
+        };
+        if let Some(message) = find_message_mut(conversation, assistant_message_id) {
+            if text_from_parts(&message.parts).is_none() {
+                append_text_part(&mut message.parts, "Generation stopped.");
+            }
+            message.finished_at = Some(now_iso());
+        }
+        conversation.update_at = now_millis();
+        conversation.is_generating = false;
+        conversation.clone()
+    };
+
+    persist_mock_state(state).await;
+    broadcast_conversation_snapshot(state, &updated).await;
+    broadcast_list_invalidate(state).await;
+}
+
+async fn start_generation(state: &Arc<MockApiState>, conversation_id: &str) {
+    state
+        .generating_flags
+        .write()
+        .await
+        .insert(conversation_id.to_string());
+}
+
+async fn stop_generation(state: &Arc<MockApiState>, conversation_id: &str) {
+    state.generating_flags.write().await.remove(conversation_id);
+}
+
+async fn is_generation_active(state: &Arc<MockApiState>, conversation_id: &str) -> bool {
+    state
+        .generating_flags
+        .read()
+        .await
+        .contains(conversation_id)
 }
 
 async fn resolve_openai_chat_config(
@@ -1269,18 +1429,21 @@ async fn resolve_openai_chat_config(
     }))
 }
 
-async fn call_openai_compatible_chat(
-    client: &reqwest::Client,
+async fn stream_openai_compatible_chat(
+    state: &Arc<MockApiState>,
+    conversation_id: &str,
+    assistant_message_id: &str,
     config: &OpenAiChatConfig,
     messages: Vec<OpenAiChatMessage>,
-) -> Result<String, String> {
+) -> Result<(), String> {
     let request = OpenAiChatCompletionRequest {
         model: config.model_id.clone(),
         messages,
-        stream: false,
+        stream: true,
     };
 
-    let response = client
+    let mut response = state
+        .http_client
         .post(openai_chat_completions_url(&config.base_url))
         .bearer_auth(&config.api_key)
         .json(&request)
@@ -1297,18 +1460,74 @@ async fn call_openai_compatible_chat(
         ));
     }
 
-    let response = response
-        .json::<OpenAiChatCompletionResponse>()
-        .await
-        .map_err(|_| "API returned an unexpected response".to_string())?;
+    let mut buffer = String::new();
+    while let Some(chunk) = response.chunk().await.map_err(safe_reqwest_error)? {
+        if !is_generation_active(state, conversation_id).await {
+            return Ok(());
+        }
 
-    response
-        .choices
-        .into_iter()
-        .find_map(|choice| choice.message.content)
-        .map(|content| content.trim().to_string())
-        .filter(|content| !content.is_empty())
-        .ok_or_else(|| "API returned an empty assistant message".to_string())
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(line_end) = buffer.find('\n') {
+            let line = buffer[..line_end].trim_end_matches('\r').to_string();
+            buffer.drain(..=line_end);
+            if handle_openai_stream_line(state, conversation_id, assistant_message_id, &line)
+                .await?
+            {
+                return Ok(());
+            }
+            if !is_generation_active(state, conversation_id).await {
+                return Ok(());
+            }
+        }
+    }
+
+    if !buffer.trim().is_empty()
+        && handle_openai_stream_line(state, conversation_id, assistant_message_id, &buffer).await?
+    {
+        return Ok(());
+    }
+
+    if !is_generation_active(state, conversation_id).await {
+        Ok(())
+    } else {
+        Err("stream ended before DONE".to_string())
+    }
+}
+
+async fn handle_openai_stream_line(
+    state: &Arc<MockApiState>,
+    conversation_id: &str,
+    assistant_message_id: &str,
+    line: &str,
+) -> Result<bool, String> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with(':') {
+        return Ok(false);
+    }
+
+    let Some(data) = line.strip_prefix("data:") else {
+        return Ok(false);
+    };
+    let data = data.trim();
+    if data == "[DONE]" {
+        return Ok(true);
+    }
+
+    let chunk = serde_json::from_str::<OpenAiChatStreamResponse>(data)
+        .map_err(|_| "stream returned invalid JSON".to_string())?;
+    for choice in chunk.choices {
+        if let Some(content) = choice.delta.content {
+            append_text_to_assistant_message(
+                state,
+                conversation_id,
+                assistant_message_id,
+                &content,
+            )
+            .await;
+        }
+    }
+
+    Ok(false)
 }
 
 fn openai_chat_completions_url(base_url: &str) -> String {
@@ -1958,6 +2177,39 @@ fn text_from_parts(parts: &[Value]) -> Option<String> {
         .join("\n");
 
     (!text.is_empty()).then_some(text)
+}
+
+fn find_message_mut<'a>(
+    conversation: &'a mut ConversationDto,
+    message_id: &str,
+) -> Option<&'a mut MessageDto> {
+    for node in &mut conversation.messages {
+        for message in &mut node.messages {
+            if message.id == message_id {
+                return Some(message);
+            }
+        }
+    }
+    None
+}
+
+fn append_text_part(parts: &mut Vec<Value>, text: &str) {
+    if let Some(part) = parts
+        .iter_mut()
+        .find(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+    {
+        let existing = part
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        part["text"] = json!(format!("{existing}{text}"));
+    } else {
+        parts.push(json!({
+            "type": "text",
+            "text": text,
+        }));
+    }
 }
 
 fn title_from_text(text: Option<&str>) -> Option<String> {
