@@ -1,6 +1,6 @@
 # RikkaDesk Development Notes
 
-RikkaDesk is an unofficial desktop derivative / experiment based on RikkaHub. These notes describe the current mock desktop prototype and how to reproduce it locally.
+RikkaDesk is an unofficial desktop derivative / experiment based on RikkaHub. These notes describe the current local desktop prototype and how to reproduce it locally.
 
 ## Phase Status
 
@@ -9,7 +9,16 @@ RikkaDesk is an unofficial desktop derivative / experiment based on RikkaHub. Th
 - Phase 2A complete: Tauri v2 wraps `web-ui` as a Windows desktop shell named RikkaDesk.
 - Phase 2B complete: startup and chat-related `/api/*` endpoints were inventoried.
 - Phase 2C complete: a Tauri Rust in-memory Mock API handles P0/P1 startup and basic chat endpoints.
-- Phase 2D current: document and stabilize the mock prototype without adding real model, storage, or P2/P3 features.
+- Phase 2D complete: the mock prototype was documented and stabilized.
+- Phase 3A complete: JSON persistence keeps settings, conversations, messages, and idSeq across restarts.
+- Phase 3B complete: model config and secret storage design was documented.
+- Phase 3C complete: provider config and `secretRef` persistence were added without storing API keys in JSON.
+- Phase 3D complete: non-streaming OpenAI-compatible text chat was added.
+- Phase 3E complete: streaming OpenAI-compatible text chat was added.
+- Phase 3F complete: real provider smoke-test guidance was documented.
+- Phase 4A complete: minimal Provider Settings UI was added.
+- Phase 4B complete: Provider Settings UI smoke-test guidance was documented.
+- Phase 5A current: prepare the first local beta package checklist without publishing a public release.
 
 ## Current Architecture
 
@@ -17,15 +26,15 @@ The current desktop prototype has three parts:
 
 - `web-ui`: the existing React Router frontend.
 - `web-ui/src-tauri`: the Tauri v2 desktop shell.
-- `web-ui/src-tauri/src/mock_api.rs`: an in-process Rust Mock API implemented with axum and tokio.
+- `web-ui/src-tauri/src/mock_api.rs`: an in-process Rust local API implemented with axum and tokio.
 
 In development mode, Vite serves the frontend on `http://localhost:5173/` and keeps the existing `/api` proxy to `http://localhost:8080`.
 
-In desktop mode, Tauri starts the Mock API before the window is shown. The frontend asks Tauri for the API base URL through the command `get_api_base_url`, then sends API requests to that local address.
+In desktop mode, Tauri starts the local API before the window is shown. The frontend asks Tauri for the API base URL through the command `get_api_base_url`, then sends API requests to that local address.
 
 ## Mock API Binding
 
-The Mock API tries to listen on:
+The local API tries to listen on:
 
 ```text
 127.0.0.1:8080
@@ -55,7 +64,7 @@ Tauri desktop mode uses:
 get_api_base_url
 ```
 
-That command returns the actual Mock API origin, for example:
+That command returns the actual local API origin, for example:
 
 ```text
 http://127.0.0.1:8080
@@ -63,7 +72,7 @@ http://127.0.0.1:8080
 
 `AIIcon` uses the same resolver so icon requests work in both browser development and packaged desktop mode.
 
-## Implemented Mock Endpoints
+## Implemented Endpoints
 
 P0 startup endpoints:
 
@@ -81,14 +90,34 @@ P1 basic chat endpoints:
 - `POST /api/settings/assistant`
 - `POST /api/settings/assistant/model`
 
-The mock conversation state lives only in memory. Sending a message appends a user message and an immediate mock assistant reply. SSE streams send `update`, `invalidate`, and `snapshot` events matching the frontend listeners.
+Desktop provider endpoints:
+
+- `GET /api/desktop/providers`
+- `POST /api/desktop/providers`
+- `POST /api/desktop/providers/{id}/secret`
+- `DELETE /api/desktop/providers/{id}/secret`
+
+The local state is persisted under the Tauri app data directory. Sending a message appends a user message, then either streams an OpenAI-compatible text response or falls back to a safe mock response. SSE streams send `update`, `invalidate`, and `snapshot` events matching the frontend listeners.
+
+## Persistence And Secrets
+
+On Windows, local beta data lives under:
+
+```text
+%APPDATA%\com.cisyamx.rikkadesk\mock-api
+```
+
+Important files:
+
+- `state.v1.json`: non-sensitive settings, conversations, messages, provider config, `secretRef`, and schema metadata.
+- `secrets/*.bin`: encrypted local secret blobs used by the desktop secret mechanism on Windows.
+
+`state.v1.json` must not contain API keys, access tokens, refresh tokens, `Authorization` header values, `x-api-key` values, or service account private keys.
 
 ## Not Implemented
 
 The current prototype intentionally does not implement:
 
-- Real model provider calls.
-- API key, token, or password storage.
 - SQLite or other persistence.
 - File upload, attachment serving, or file deletion.
 - Search and search index APIs.
@@ -96,6 +125,8 @@ The current prototype intentionally does not implement:
 - Tool approval execution.
 - Conversation fork, branch selection, message edit/delete/regenerate, and title generation.
 - Favorite models and other deeper settings mutations beyond basic assistant/model selection.
+- Gemini, Claude, Anthropic, Vertex, or provider-specific protocols.
+- Multimodal provider requests, tool calls, or upstream feature parity.
 
 Unimplemented routes return a JSON 404 response from the Mock API fallback.
 
@@ -148,18 +179,18 @@ Build outputs:
 - `pnpm run typecheck` passes.
 - `cargo check --manifest-path src-tauri/Cargo.toml` passes.
 - `pnpm run desktop:dev` opens a RikkaDesk window.
-- The Mock API logs its loopback address.
-- The sidebar shows the mock welcome conversation.
-- Sending a message produces the mock assistant reply.
+- The local API logs its loopback address.
+- The sidebar shows persisted conversations.
+- Provider Settings opens from the sidebar.
+- Saving a provider shows `hasSecret` without showing the API key.
+- Sending a text message produces either a streaming OpenAI-compatible response or the mock fallback.
 - `pnpm run desktop:build` produces MSI and NSIS installers.
 
 ## Next Phase Suggestions
 
 Recommended next steps:
 
-- Keep the Mock API as a protocol safety net while designing the real local backend.
-- Decide whether the real backend should remain Rust/Tauri-native or move to a sidecar service.
-- Add a small local configuration design before any API key support.
-- Add persistence only after the DTO and storage boundaries are settled.
-- Keep P2/P3 features deferred until basic conversation lifecycle behavior is stable.
-
+- Keep the mock fallback as a protocol safety net while hardening the real provider path.
+- Verify unsigned Windows installer behavior with local beta testers.
+- Decide whether the first public prerelease should use `0.1.0` or `0.1.0-beta.1`.
+- Keep P2/P3 features deferred until provider settings, persistence, and streaming behavior are stable.

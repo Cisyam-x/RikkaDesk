@@ -4,27 +4,33 @@ RikkaDesk is an unofficial desktop derivative / experiment based on RikkaHub.
 
 RikkaDesk is a non-official desktop-oriented derivative of [RikkaHub](https://github.com/rikkahub/rikkahub). It currently focuses on making the existing RikkaHub `web-ui` usable as the foundation for a local Windows desktop app.
 
-This repository is in an early staged migration. The current prototype is a local Tauri desktop shell with an in-memory Mock API backend for development verification only.
+This repository is in an early staged migration. The current prototype is a local Tauri desktop shell with a Rust desktop API, JSON persistence, Provider Settings, and an OpenAI-compatible text chat path.
 
 - Phase 0 is complete: the upstream architecture, `web-ui`, Web Interface, and license were reviewed without code changes.
 - Phase 1 is complete: the `web-ui` can run locally in a browser at `http://localhost:5173/`.
 - Phase 2A is complete: Tauri v2 wraps the existing `web-ui` as a Windows desktop shell.
 - Phase 2B is complete: the `/api/*` contract used by startup and chat flows was inventoried.
 - Phase 2C is complete: a minimal Tauri Rust Mock API handles the P0/P1 startup and basic chat endpoints.
+- Phase 3A is complete: local JSON persistence keeps settings, conversations, messages, and idSeq across restarts.
+- Phase 3B/3C are complete: provider config uses `secretRef`; API keys must not be stored in JSON.
+- Phase 3D/3E are complete: one OpenAI-compatible provider path can return real text chat responses with streaming.
+- Phase 4A/4B are complete: Provider Settings UI and smoke-test docs are available for local validation.
 
 Current limitations:
 
-- The Mock API is not a real model backend and does not call OpenAI, Gemini, Anthropic, DeepSeek, or any other provider.
-- API keys, provider credentials, persistent settings, SQLite storage, and conversation persistence are not implemented.
+- RikkaDesk currently supports only the OpenAI-compatible text chat path for real provider testing.
+- API keys must never be written to source files, README files, logs, tests, or `state.v1.json`.
+- On Windows, provider secrets are referenced from JSON by `secretRef` and stored as encrypted local secret blobs under app data.
 - File uploads, attachments, search, MCP, tools, branching, and other P2/P3 endpoints are intentionally deferred.
-- Messages are stored only in memory for the lifetime of the desktop process.
+- SQLite, sync, advanced migration tooling, multimodal input, and full upstream feature parity are not implemented.
 
 What works in the current prototype:
 
 - The Windows desktop window can load the production `web-ui` build.
-- The Mock API starts inside the Tauri process and listens on `127.0.0.1`.
-- The UI can load settings, show a mock conversation, send a message, and receive the mock reply defined in `web-ui/src-tauri/src/mock_api.rs`.
-- If `127.0.0.1:8080` is already in use, the Mock API falls back to a random local loopback port and the frontend reads it through the Tauri command `get_api_base_url`.
+- The local Rust API starts inside the Tauri process and listens on `127.0.0.1`.
+- The UI can load settings, show persisted conversations, send messages, and receive either mock fallback replies or OpenAI-compatible streaming text responses.
+- Provider Settings can save non-sensitive provider config and store API keys through the desktop secret mechanism without returning the key to the frontend.
+- If `127.0.0.1:8080` is already in use, the local API falls back to a random loopback port and the frontend reads it through the Tauri command `get_api_base_url`.
 
 ## RikkaDesk Development
 
@@ -74,9 +80,12 @@ pnpm run desktop:build
 
 More details are in [docs/rikkadesk-dev.md](docs/rikkadesk-dev.md).
 
+Beta packaging notes are in [docs/rikkadesk-beta-package-checklist.md](docs/rikkadesk-beta-package-checklist.md).
+
 Security and compliance:
 
 - Do not write API keys, tokens, passwords, private user data, or conversation data into source files.
+- Do not put API keys in `state.v1.json`; JSON state should contain only `secretRef` for provider secrets.
 - This project is derived from RikkaHub. Keep the upstream license notice in mind and review [NOTICE.md](NOTICE.md) plus [LICENSE](LICENSE) before using, modifying, or distributing this project.
 - Commercial use or avoiding AGPL obligations may require upstream authorization according to the original RikkaHub license terms.
 
