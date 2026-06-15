@@ -27,7 +27,7 @@ import { useCurrentModel } from "~/hooks/use-current-model";
 import { getAssistantDisplayName, getModelDisplayName } from "~/lib/display";
 import { convertConversationToMarkdown, downloadMarkdown } from "~/lib/export-markdown";
 import { cn } from "~/lib/utils";
-import api, { sse } from "~/services/api";
+import api, { isDesktopRuntime, sse } from "~/services/api";
 import { useChatInputStore, useAppStore } from "~/stores";
 import { WorkbenchHost } from "~/components/workbench/workbench-host";
 import {
@@ -578,10 +578,10 @@ const ConversationTimeline = React.memo(({
   contentClassName?: string;
   onEdit: (message: MessageDto) => void | Promise<void>;
   onDelete: (messageId: string) => Promise<void>;
-  onFork: (messageId: string) => Promise<void>;
+  onFork?: (messageId: string) => Promise<void>;
   onRegenerate: (messageId: string) => Promise<void>;
-  onSelectBranch: (nodeId: string, selectIndex: number) => Promise<void>;
-  onToolApproval: (toolCallId: string, approved: boolean, reason: string, answer?: string) => Promise<void>;
+  onSelectBranch?: (nodeId: string, selectIndex: number) => Promise<void>;
+  onToolApproval?: (toolCallId: string, approved: boolean, reason: string, answer?: string) => Promise<void>;
 }) => {
   const { t } = useTranslation("page");
   const canQuickJump =
@@ -713,6 +713,7 @@ function ConversationsPageInner() {
   const { id: routeId } = useParams();
   const isHomeRoute = !routeId;
   const isMobile = useIsMobile();
+  const desktopRuntime = isDesktopRuntime();
   const { panel, closePanel } = useWorkbench();
 
   const { settings, assistants, currentAssistantId, currentAssistant } = useCurrentAssistant();
@@ -1017,10 +1018,10 @@ function ConversationsPageInner() {
             conversationAssistantId={detail?.assistantId ?? null}
             onEdit={handleStartEdit}
             onDelete={handleDeleteMessage}
-            onFork={handleForkMessage}
+            onFork={desktopRuntime ? undefined : handleForkMessage}
             onRegenerate={handleRegenerate}
-            onSelectBranch={handleSelectBranch}
-            onToolApproval={handleToolApproval}
+            onSelectBranch={desktopRuntime ? undefined : handleSelectBranch}
+            onToolApproval={desktopRuntime ? undefined : handleToolApproval}
           />
         </div>
       )}
@@ -1087,8 +1088,8 @@ function ConversationsPageInner() {
         onSelect={handleSelect}
         onAssistantChange={handleAssistantChange}
         onPin={handleTogglePinConversation}
-        onRegenerateTitle={handleRegenerateConversationTitle}
-        onMoveToAssistant={handleMoveConversation}
+        onRegenerateTitle={desktopRuntime ? undefined : handleRegenerateConversationTitle}
+        onMoveToAssistant={desktopRuntime ? undefined : handleMoveConversation}
         onUpdateTitle={handleUpdateConversationTitle}
         onDelete={handleDeleteConversation}
         onCreateConversation={handleCreateConversation}
