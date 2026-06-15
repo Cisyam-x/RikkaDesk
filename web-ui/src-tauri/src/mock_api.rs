@@ -2350,20 +2350,6 @@ fn set_current_model_in_settings(settings: &mut Value, model_id: &str) {
             }
         }
     }
-
-    if let Some(favorite_models) = settings
-        .get_mut("favoriteModels")
-        .and_then(Value::as_array_mut)
-    {
-        let already_favorite = favorite_models
-            .iter()
-            .any(|item| item.as_str() == Some(model_id));
-        if !already_favorite {
-            favorite_models.push(json!(model_id));
-        }
-    } else {
-        settings["favoriteModels"] = json!([model_id]);
-    }
 }
 
 fn remove_model_from_favorites(settings: &mut Value, model_id: &str) {

@@ -423,11 +423,12 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
                 />
               </label>
 
-              <DialogFooter className="gap-2 sm:justify-between">
-                <div className="flex flex-col gap-2 sm:flex-row">
+              <DialogFooter className="mt-5 flex flex-col gap-3 border-t pt-4 sm:flex-row sm:items-center sm:justify-between">
+                <div className="flex flex-col gap-2.5 sm:flex-row sm:flex-wrap">
                   <Button
                     type="button"
                     variant="outline"
+                    className="whitespace-nowrap"
                     onClick={() => void handleClearSecret()}
                     disabled={busy || !form.hasSecret || !isExistingProvider}
                   >
@@ -441,6 +442,7 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
                   <Button
                     type="button"
                     variant="destructive"
+                    className="whitespace-nowrap"
                     onClick={() => setDeleteConfirmOpen(true)}
                     disabled={busy || !isExistingProvider}
                   >
@@ -449,7 +451,12 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
                   </Button>
                 </div>
 
-                <Button type="button" onClick={() => void handleSave()} disabled={busy}>
+                <Button
+                  type="button"
+                  className="sm:ml-auto"
+                  onClick={() => void handleSave()}
+                  disabled={busy}
+                >
                   {saving ? <Loader2 className="size-4 animate-spin" /> : null}
                   {t("provider_settings.save")}
                 </Button>
