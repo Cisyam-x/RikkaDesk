@@ -1,6 +1,7 @@
 import * as React from "react";
 import type { TFunction } from "i18next";
 import { useTranslation } from "react-i18next";
+import { toast } from "sonner";
 
 import {
   ArrowDown,
@@ -29,7 +30,6 @@ import type {
 } from "~/types";
 
 import { copyTextToClipboard } from "~/lib/clipboard";
-import { convertMessageToMarkdown, downloadMarkdown } from "~/lib/export-markdown";
 import { cn } from "~/lib/utils";
 import { Button } from "~/components/ui/button";
 import {
@@ -262,6 +262,7 @@ const ChatMessageActionsRow = React.memo(({
   const [deleting, setDeleting] = React.useState(false);
   const [forking, setForking] = React.useState(false);
   const [regenerateConfirmOpen, setRegenerateConfirmOpen] = React.useState(false);
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = React.useState(false);
 
   const handleCopy = React.useCallback(async () => {
     const text = buildCopyText(message.parts, t);
@@ -315,8 +316,11 @@ const ChatMessageActionsRow = React.memo(({
   const handleDelete = React.useCallback(async () => {
     if (!onDelete) return;
 
-    const confirmed = window.confirm(t("chat_message.delete_confirm"));
-    if (!confirmed) return;
+    setDeleteConfirmOpen(true);
+  }, [onDelete]);
+
+  const runDelete = React.useCallback(async () => {
+    if (!onDelete) return;
 
     setDeleting(true);
     try {
@@ -324,7 +328,15 @@ const ChatMessageActionsRow = React.memo(({
     } finally {
       setDeleting(false);
     }
-  }, [message.id, onDelete, t]);
+  }, [message.id, onDelete]);
+
+  const handleUnsupportedMarkdownExport = React.useCallback(() => {
+    toast.info(
+      t("chat_message.markdown_export_unsupported", {
+        defaultValue: "RikkaDesk beta currently does not support Markdown export.",
+      }),
+    );
+  }, [t]);
 
   const handleFork = React.useCallback(async () => {
     if (!onFork) return;
@@ -448,8 +460,7 @@ const ChatMessageActionsRow = React.memo(({
         <DropdownMenuContent align={alignRight ? "end" : "start"}>
           <DropdownMenuItem
             onSelect={() => {
-              const content = convertMessageToMarkdown(message, false);
-              downloadMarkdown(content, `message-${message.id}.md`);
+              handleUnsupportedMarkdownExport();
             }}
           >
             <FileDown className="size-3.5" />
@@ -457,8 +468,7 @@ const ChatMessageActionsRow = React.memo(({
           </DropdownMenuItem>
           <DropdownMenuItem
             onSelect={() => {
-              const content = convertMessageToMarkdown(message, true);
-              downloadMarkdown(content, `message-${message.id}.md`);
+              handleUnsupportedMarkdownExport();
             }}
           >
             <FileDown className="size-3.5" />
@@ -524,6 +534,46 @@ const ChatMessageActionsRow = React.memo(({
             >
               {t("chat_message.regenerate_confirm_submit", {
                 defaultValue: "重新生成",
+              })}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={deleteConfirmOpen} onOpenChange={setDeleteConfirmOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>
+              {t("chat_message.delete_confirm_title", {
+                defaultValue: "删除消息",
+              })}
+            </DialogTitle>
+            <DialogDescription>
+              {t("chat_message.delete_confirm_description", {
+                defaultValue: "确定要删除这条消息吗？此操作不会删除其他消息。",
+              })}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setDeleteConfirmOpen(false)}
+            >
+              {t("chat_message.delete_confirm_cancel", {
+                defaultValue: "取消",
+              })}
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              onClick={() => {
+                setDeleteConfirmOpen(false);
+                void runDelete();
+              }}
+            >
+              {t("chat_message.delete_confirm_submit", {
+                defaultValue: "删除",
               })}
             </Button>
           </DialogFooter>
