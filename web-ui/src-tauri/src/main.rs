@@ -12,7 +12,8 @@ fn get_api_base_url(mock_api: tauri::State<'_, mock_api::MockApiHandle>) -> Stri
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
-            let mock_api = tauri::async_runtime::block_on(mock_api::start())?;
+            let app_data_dir = app.path().app_data_dir()?;
+            let mock_api = tauri::async_runtime::block_on(mock_api::start(app_data_dir))?;
             app.manage(mock_api);
             Ok(())
         })

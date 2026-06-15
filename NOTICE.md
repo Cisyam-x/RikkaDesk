@@ -10,17 +10,19 @@ RikkaDesk is not an official RikkaHub project and is not endorsed by the upstrea
 
 ## Current Scope
 
-The current project goal is to explore a local Web UI plus Tauri desktop shell for Windows.
+The current project goal is to explore a local Web UI plus Tauri desktop app for Windows.
 
-At this stage, RikkaDesk includes a Tauri desktop shell and a minimal in-memory Mock API backend for development verification. The Mock API is intended only to make the desktop prototype reproducible and testable while the real Windows local backend is still being designed.
+At this stage, RikkaDesk includes a Tauri desktop shell, a local Rust API, JSON persistence, Provider Settings, encrypted local secret storage on Windows, and a minimal OpenAI-compatible text chat path for local testing.
 
-The Mock API does not call real model providers, does not persist data, and does not implement API key management. It handles only the startup and basic chat endpoints needed by the current `web-ui` prototype. A complete compatible local backend for `/api/*` still needs to be designed and implemented in a later phase.
+The local API still keeps a mock fallback path so the desktop prototype remains reproducible when no real provider is configured. It is not a full replacement for every upstream `/api/*` route.
 
-File upload, attachments, search, MCP, tool calls, conversation forks, and other enhanced features are not included in the current Mock API.
+File upload, attachments, search, MCP, tool calls, conversation forks, multimodal provider calls, and other enhanced features are not included in the current desktop beta scope.
 
 ## Security
 
-Do not commit API keys, tokens, passwords, private configuration, conversation exports containing private data, or user data to this repository. Runtime secrets should be provided through local configuration or another user-controlled secret mechanism, not hard-coded source files.
+Do not commit API keys, tokens, passwords, private configuration, conversation exports containing private data, or user data to this repository. Runtime secrets must not be hard-coded in source files, documentation, tests, logs, or `state.v1.json`.
+
+RikkaDesk JSON state should store only non-sensitive provider configuration and `secretRef`. The actual secret value should remain in the local desktop secret mechanism and must not be returned to the frontend or written to project files.
 
 ## License And Compliance
 

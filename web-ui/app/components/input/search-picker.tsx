@@ -10,7 +10,7 @@ import { useCurrentModel } from "~/hooks/use-current-model";
 import { usePickerPopover } from "~/hooks/use-picker-popover";
 import { extractErrorMessage } from "~/lib/error";
 import { cn } from "~/lib/utils";
-import api from "~/services/api";
+import api, { isDesktopRuntime } from "~/services/api";
 import type { BuiltInTool, ProviderModel, SearchServiceOption } from "~/types";
 import { AIIcon } from "~/components/ui/ai-icon";
 import { Button } from "~/components/ui/button";
@@ -107,13 +107,19 @@ export function SearchPickerButton({ disabled = false, className }: SearchPicker
   const { settings, currentAssistant } = useCurrentAssistant();
   const { currentModel } = useCurrentModel();
 
+  const desktopSearchUnsupported = isDesktopRuntime();
+  const betaUnsupportedMessage = t("search.rikkadesk_unsupported", {
+    defaultValue: "RikkaDesk beta currently does not support web search.",
+  });
   const canUse = Boolean(settings && currentAssistant && !disabled);
   const { error, setError, popoverProps } = usePickerPopover(canUse);
 
   const builtInSearchEnabled = hasBuiltInSearch(currentModel?.tools);
   const searchEnabled = settings?.enableWebSearch ?? false;
+  const displayedBuiltInSearchEnabled = !desktopSearchUnsupported && builtInSearchEnabled;
+  const displayedSearchEnabled = !desktopSearchUnsupported && searchEnabled;
   const currentService = settings?.searchServices?.[settings.searchServiceSelected] ?? null;
-  const checked = searchEnabled || builtInSearchEnabled;
+  const checked = displayedSearchEnabled || displayedBuiltInSearchEnabled;
 
   React.useEffect(() => {
     if (!canUse) {
@@ -156,6 +162,7 @@ export function SearchPickerButton({ disabled = false, className }: SearchPicker
     toggleSearchEnabledMutation.isPending ||
     toggleBuiltInSearchMutation.isPending ||
     selectServiceMutation.isPending;
+  const controlsDisabled = disabled || loading || desktopSearchUnsupported;
 
   return (
     <Popover {...popoverProps}>
@@ -165,22 +172,24 @@ export function SearchPickerButton({ disabled = false, className }: SearchPicker
           variant="ghost"
           size="sm"
           disabled={!canUse || loading}
+          title={desktopSearchUnsupported ? betaUnsupportedMessage : undefined}
           className={cn(
             "h-8 rounded-full px-2 text-muted-foreground hover:text-foreground",
             checked && "text-primary hover:bg-primary/10",
+            desktopSearchUnsupported && "opacity-60",
             className,
           )}
         >
           {toggleSearchEnabledMutation.isPending || toggleBuiltInSearchMutation.isPending ? (
             <LoaderCircle className="size-4 animate-spin" />
-          ) : searchEnabled && currentService ? (
+          ) : displayedSearchEnabled && currentService ? (
             <AIIcon
               name={getServiceLabel(currentService, t)}
               size={16}
               className="bg-transparent"
               imageClassName="h-full w-full"
             />
-          ) : builtInSearchEnabled ? (
+          ) : displayedBuiltInSearchEnabled ? (
             <Search className="size-4" />
           ) : (
             <Earth className="size-4" />
@@ -199,6 +208,11 @@ export function SearchPickerButton({ disabled = false, className }: SearchPicker
 
         <div className="space-y-4 px-4 py-4">
           <PickerErrorAlert error={error} />
+          {desktopSearchUnsupported ? (
+            <div className="rounded-md border border-dashed px-3 py-3 text-sm text-muted-foreground">
+              {betaUnsupportedMessage}
+            </div>
+          ) : null}
 
           {isGeminiModel(currentModel) ? (
             <div className="flex items-center gap-3 rounded-lg border px-3 py-3">
@@ -210,8 +224,8 @@ export function SearchPickerButton({ disabled = false, className }: SearchPicker
                 <div className="text-muted-foreground text-xs">{t("search.builtin_desc")}</div>
               </div>
               <Switch
-                checked={builtInSearchEnabled}
-                disabled={disabled || loading}
+                checked={displayedBuiltInSearchEnabled}
+                disabled={controlsDisabled}
                 onCheckedChange={(nextChecked) => {
                   if (!canUse || !currentModel) return;
                   toggleBuiltInSearchMutation.mutate({ modelId: currentModel.id, enabled: nextChecked });
@@ -220,7 +234,7 @@ export function SearchPickerButton({ disabled = false, className }: SearchPicker
             </div>
           ) : null}
 
-          {!builtInSearchEnabled ? (
+          {!displayedBuiltInSearchEnabled ? (
             <>
               <div className="flex items-center gap-3 rounded-lg border px-3 py-3">
                 <div className="flex size-8 shrink-0 items-center justify-center rounded-full bg-muted">
@@ -229,12 +243,12 @@ export function SearchPickerButton({ disabled = false, className }: SearchPicker
                 <div className="min-w-0 flex-1">
                   <div className="text-sm font-medium">{t("search.web_title")}</div>
                   <div className="text-muted-foreground text-xs">
-                    {searchEnabled ? t("search.status_enabled") : t("search.status_disabled")}
+                    {displayedSearchEnabled ? t("search.status_enabled") : t("search.status_disabled")}
                   </div>
                 </div>
                 <Switch
-                  checked={searchEnabled}
-                  disabled={disabled || loading}
+                  checked={displayedSearchEnabled}
+                  disabled={controlsDisabled}
                   onCheckedChange={(nextChecked) => {
                     if (!canUse) return;
                     toggleSearchEnabledMutation.mutate({ enabled: nextChecked });
@@ -259,9 +273,14 @@ export function SearchPickerButton({ disabled = false, className }: SearchPicker
                             "hover:bg-muted flex w-full items-center gap-3 rounded-lg border px-3 py-2 text-left transition",
                             selected && "border-primary bg-primary/5",
                           )}
-                          disabled={disabled || loading}
+                          disabled={controlsDisabled}
                           onClick={() => {
-                            if (!canUse || !settings || index === settings.searchServiceSelected)
+                            if (
+                              !canUse ||
+                              desktopSearchUnsupported ||
+                              !settings ||
+                              index === settings.searchServiceSelected
+                            )
                               return;
                             selectServiceMutation.mutate({ index });
                           }}
