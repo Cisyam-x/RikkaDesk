@@ -478,33 +478,53 @@ function useDraftInputController({
 
     const parts = getSubmitParts(draftKey);
     if (parts.length === 0) return;
+    const currentDraft = useChatInputStore.getState().drafts[draftKey];
+    const draftText = currentDraft?.text ?? "";
+    const draftParts = currentDraft?.parts ?? [];
+    const restoreDraft = () => {
+      if (draftText) {
+        setDraftText(draftKey, draftText);
+      }
+      if (draftParts.length > 0) {
+        addDraftParts(draftKey, draftParts);
+      }
+    };
 
     if (activeId) {
-      await api.post<{ status: string }>(`conversations/${activeId}/messages`, { parts });
       clearDraft(draftKey);
+      try {
+        await api.post<{ status: string }>(`conversations/${activeId}/messages`, { parts });
+      } catch (error) {
+        restoreDraft();
+        throw error;
+      }
       return;
     }
 
     const conversationId = uuidv4();
+    const promptInjectionIds = getPromptInjectionIds(draftKey);
+    clearDraft(draftKey);
     setHomeDraftId(createHomeDraftId());
     setActiveId(conversationId);
     navigate(`/c/${conversationId}`);
-
-    const promptInjectionIds = getPromptInjectionIds(draftKey);
-
-    await api.post<{ status: string }>(`conversations/${conversationId}/messages`, {
-      parts,
-      ...(useConversationPromptInjection
-        ? {
-            modeInjectionIds: promptInjectionIds.modeInjectionIds,
-            lorebookIds: promptInjectionIds.lorebookIds,
-          }
-        : {}),
-    });
-    clearDraft(draftKey);
-    refreshList();
+    try {
+      await api.post<{ status: string }>(`conversations/${conversationId}/messages`, {
+        parts,
+        ...(useConversationPromptInjection
+          ? {
+              modeInjectionIds: promptInjectionIds.modeInjectionIds,
+              lorebookIds: promptInjectionIds.lorebookIds,
+            }
+          : {}),
+      });
+      refreshList();
+    } catch (error) {
+      restoreDraft();
+      throw error;
+    }
   }, [
     activeId,
+    addDraftParts,
     clearDraft,
     draftKey,
     getPromptInjectionIds,
@@ -512,6 +532,7 @@ function useDraftInputController({
     navigate,
     refreshList,
     setActiveId,
+    setDraftText,
     setHomeDraftId,
     useConversationPromptInjection,
   ]);
