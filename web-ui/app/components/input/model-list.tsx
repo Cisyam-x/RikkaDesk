@@ -8,6 +8,7 @@ import { useCurrentAssistant } from "~/hooks/use-current-assistant";
 import { getModelDisplayName } from "~/lib/display";
 import { cn } from "~/lib/utils";
 import api from "~/services/api";
+import { useSettingsStore } from "~/stores";
 import type { ModelAbility, ProviderModel } from "~/types";
 import { AIIcon } from "~/components/ui/ai-icon";
 import { Badge } from "~/components/ui/badge";
@@ -129,19 +130,22 @@ function ModelOptionRow({
 
       {updating ? (
         <LoaderCircle className="text-muted-foreground size-3.5 animate-spin" />
-      ) : selected ? (
-        <Check className="text-primary size-3.5" />
       ) : (
-        <button
-          type="button"
-          className={favorite ? "text-primary" : "text-muted-foreground hover:text-primary"}
-          onClick={(event) => {
-            event.stopPropagation();
-            void onToggleFavorite(model);
-          }}
-        >
-          <Heart className={cn("size-3.5", favorite && "fill-current")} />
-        </button>
+        <div className="flex shrink-0 items-center gap-1.5">
+          {selected ? <Check className="text-primary size-3.5" /> : null}
+          <button
+            type="button"
+            className={favorite ? "text-primary" : "text-muted-foreground hover:text-primary"}
+            aria-label={favorite ? t("model_list.remove_from_favorites") : t("model_list.add_to_favorites")}
+            title={favorite ? t("model_list.remove_from_favorites") : t("model_list.add_to_favorites")}
+            onClick={(event) => {
+              event.stopPropagation();
+              void onToggleFavorite(model);
+            }}
+          >
+            <Heart className={cn("size-3.5", favorite && "fill-current")} />
+          </button>
+        </div>
       )}
     </div>
   );
@@ -150,6 +154,7 @@ function ModelOptionRow({
 export function ModelList({ disabled = false, className, onChanged }: ModelListProps) {
   const { t } = useTranslation("input");
   const { settings, currentAssistant } = useCurrentAssistant();
+  const setSettings = useSettingsStore((state) => state.setSettings);
 
   const [open, setOpen] = React.useState(false);
   const [searchKeywords, setSearchKeywords] = React.useState("");
@@ -321,6 +326,10 @@ export function ModelList({ disabled = false, className, onChanged }: ModelListP
         await api.post<{ status: string }>("settings/favorite-models", {
           modelIds: newFavoriteModels,
         });
+        setSettings({
+          ...settings,
+          favoriteModels: newFavoriteModels,
+        });
       } catch (changeError) {
         const message =
           changeError instanceof Error
@@ -331,7 +340,7 @@ export function ModelList({ disabled = false, className, onChanged }: ModelListP
         setUpdatingModelId(null);
       }
     },
-    [disabled, favoriteModelIds, settings, t],
+    [disabled, favoriteModelIds, setSettings, settings, t],
   );
 
   return (

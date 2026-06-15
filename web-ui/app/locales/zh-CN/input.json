@@ -68,7 +68,9 @@
     "description": "切换当前助手使用的聊天模型",
     "search_placeholder": "搜索模型",
     "empty": "没有可用模型",
-    "favorites": "收藏"
+    "favorites": "收藏",
+    "add_to_favorites": "添加到收藏",
+    "remove_from_favorites": "取消收藏"
   },
   "search": {
     "default_service_label": "搜索",
@@ -84,7 +86,8 @@
     "status_disabled": "已关闭",
     "unknown": "未知",
     "empty": "暂无可用搜索服务",
-    "builtin_notice": "当前已启用模型内置搜索，应用搜索服务设置暂不生效。"
+    "builtin_notice": "当前已启用模型内置搜索，应用搜索服务设置暂不生效。",
+    "rikkadesk_unsupported": "RikkaDesk beta 当前暂不支持联网搜索。"
   },
   "chat": {
     "attachment_image": "图片",

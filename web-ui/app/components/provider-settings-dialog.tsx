@@ -1,6 +1,7 @@
 import * as React from "react";
 
 import { CheckCircle2, KeyRound, Loader2, Plus, Trash2 } from "lucide-react";
+import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
 import { Badge } from "~/components/ui/badge";
@@ -81,11 +82,11 @@ function formFromProvider(provider: DesktopProviderResponse): ProviderFormState 
   };
 }
 
-function safeErrorMessage(error: unknown): string {
+function safeErrorMessage(error: unknown, fallback: string): string {
   if (error instanceof ApiError || error instanceof Error) {
     return error.message;
   }
-  return "Provider settings request failed.";
+  return fallback;
 }
 
 function providerModelLabel(provider: DesktopProviderResponse): string {
@@ -94,6 +95,7 @@ function providerModelLabel(provider: DesktopProviderResponse): string {
 }
 
 export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsDialogProps) {
+  const { t } = useTranslation();
   const [providers, setProviders] = React.useState<DesktopProviderResponse[]>([]);
   const [selectedProviderId, setSelectedProviderId] = React.useState<string | null>(null);
   const [form, setForm] = React.useState<ProviderFormState>(() => emptyForm());
@@ -135,11 +137,11 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
         setForm(emptyForm());
       }
     } catch (loadError) {
-      setError(safeErrorMessage(loadError));
+      setError(safeErrorMessage(loadError, t("provider_settings.request_failed")));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [t]);
 
   React.useEffect(() => {
     if (!open) return;
@@ -171,11 +173,11 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
     const apiKey = form.apiKey.trim();
 
     if (!baseUrl) {
-      setError("Base URL is required.");
+      setError(t("provider_settings.base_url_required"));
       return;
     }
     if (!modelId) {
-      setError("Model ID is required.");
+      setError(t("provider_settings.model_id_required"));
       return;
     }
 
@@ -200,13 +202,13 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
       }
 
       await loadProviders(provider.id);
-      toast.success("Provider settings saved.");
+      toast.success(t("provider_settings.saved"));
     } catch (saveError) {
-      setError(safeErrorMessage(saveError));
+      setError(safeErrorMessage(saveError, t("provider_settings.request_failed")));
     } finally {
       setSaving(false);
     }
-  }, [form, loadProviders]);
+  }, [form, loadProviders, t]);
 
   const handleClearSecret = React.useCallback(async () => {
     if (!form.id.trim() || clearingSecret || !isExistingProvider) return;
@@ -218,13 +220,13 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
         `desktop/providers/${form.id}/secret`,
       );
       await loadProviders(form.id);
-      toast.success("API key cleared.");
+      toast.success(t("provider_settings.api_key_cleared"));
     } catch (clearError) {
-      setError(safeErrorMessage(clearError));
+      setError(safeErrorMessage(clearError, t("provider_settings.request_failed")));
     } finally {
       setClearingSecret(false);
     }
-  }, [clearingSecret, form.id, isExistingProvider, loadProviders]);
+  }, [clearingSecret, form.id, isExistingProvider, loadProviders, t]);
 
   const handleDeleteProvider = React.useCallback(async () => {
     if (!isExistingProvider || deleting) return;
@@ -234,14 +236,14 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
     try {
       await api.delete<{ status: string }>(`desktop/providers/${form.id}`);
       setDeleteConfirmOpen(false);
-      toast.success("Provider deleted.");
+      toast.success(t("provider_settings.deleted"));
       await loadProviders(null);
     } catch (deleteError) {
-      setError(safeErrorMessage(deleteError));
+      setError(safeErrorMessage(deleteError, t("provider_settings.request_failed")));
     } finally {
       setDeleting(false);
     }
-  }, [deleting, form.id, isExistingProvider, loadProviders]);
+  }, [deleting, form.id, isExistingProvider, loadProviders, t]);
 
   return (
     <>
@@ -250,10 +252,10 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <KeyRound className="size-5" />
-              Provider Settings
+              {t("provider_settings.title")}
             </DialogTitle>
             <DialogDescription>
-              Manage local OpenAI-compatible providers for RikkaDesk.
+              {t("provider_settings.description")}
             </DialogDescription>
           </DialogHeader>
 
@@ -261,9 +263,9 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
             <div className="flex min-h-0 flex-col rounded-md border">
               <div className="flex items-center justify-between gap-2 border-b px-3 py-2">
                 <div>
-                  <div className="text-sm font-medium">Providers</div>
+                  <div className="text-sm font-medium">{t("provider_settings.providers")}</div>
                   <div className="text-xs text-muted-foreground">
-                    {providers.length} configured
+                    {t("provider_settings.configured_count", { count: providers.length })}
                   </div>
                 </div>
                 <Button
@@ -274,7 +276,7 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
                   disabled={busy}
                 >
                   <Plus className="size-4" />
-                  Add Provider
+                  {t("provider_settings.add_provider")}
                 </Button>
               </div>
 
@@ -283,11 +285,11 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
                   {loading ? (
                     <div className="flex items-center justify-center gap-2 rounded-md border border-dashed px-3 py-8 text-sm text-muted-foreground">
                       <Loader2 className="size-4 animate-spin" />
-                      Loading providers
+                      {t("provider_settings.loading_providers")}
                     </div>
                   ) : providers.length === 0 ? (
                     <div className="rounded-md border border-dashed px-3 py-8 text-center text-sm text-muted-foreground">
-                      No providers yet.
+                      {t("provider_settings.no_providers")}
                     </div>
                   ) : (
                     providers.map((provider) => {
@@ -314,7 +316,9 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
                               variant={provider.hasSecret ? "secondary" : "outline"}
                               className="shrink-0"
                             >
-                              {provider.hasSecret ? "hasSecret" : "no key"}
+                              {provider.hasSecret
+                                ? t("provider_settings.has_secret_short")
+                                : t("provider_settings.no_key")}
                             </Badge>
                           </div>
                           <div className="mt-2 truncate text-xs text-muted-foreground">
@@ -336,15 +340,19 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
               <div className="flex flex-wrap items-start justify-between gap-3">
                 <div>
                   <div className="text-sm font-medium">
-                    {isExistingProvider ? "Edit Provider" : "New Provider"}
+                    {isExistingProvider
+                      ? t("provider_settings.edit_provider")
+                      : t("provider_settings.new_provider")}
                   </div>
                   <div className="mt-1 max-w-xl text-xs text-muted-foreground">
-                    API keys are written only to the desktop secret store and are never shown again.
+                    {t("provider_settings.secret_storage_note")}
                   </div>
                 </div>
                 <Badge variant={form.hasSecret ? "secondary" : "outline"} className="gap-1">
                   {form.hasSecret ? <CheckCircle2 className="size-3" /> : null}
-                  {form.hasSecret ? "hasSecret: true" : "hasSecret: false"}
+                  {form.hasSecret
+                    ? t("provider_settings.has_secret_true")
+                    : t("provider_settings.has_secret_false")}
                 </Badge>
               </div>
 
@@ -356,7 +364,7 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
 
               <div className="grid gap-4 sm:grid-cols-2">
                 <label className="space-y-1.5 text-sm font-medium">
-                  <span>Provider Name</span>
+                  <span>{t("provider_settings.provider_name")}</span>
                   <Input
                     value={form.name}
                     onChange={(event) => updateForm("name", event.target.value)}
@@ -366,7 +374,7 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
                 </label>
 
                 <label className="space-y-1.5 text-sm font-medium">
-                  <span>Display Name</span>
+                  <span>{t("provider_settings.display_name")}</span>
                   <Input
                     value={form.displayName}
                     onChange={(event) => updateForm("displayName", event.target.value)}
@@ -377,7 +385,7 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
               </div>
 
               <label className="space-y-1.5 text-sm font-medium">
-                <span>Base URL</span>
+                <span>{t("provider_settings.base_url")}</span>
                 <Input
                   value={form.baseUrl}
                   onChange={(event) => updateForm("baseUrl", event.target.value)}
@@ -389,7 +397,7 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
               </label>
 
               <label className="space-y-1.5 text-sm font-medium">
-                <span>Model ID</span>
+                <span>{t("provider_settings.model_id")}</span>
                 <Input
                   value={form.modelId}
                   onChange={(event) => updateForm("modelId", event.target.value)}
@@ -401,12 +409,14 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
               </label>
 
               <label className="space-y-1.5 text-sm font-medium">
-                <span>API Key</span>
+                <span>{t("provider_settings.api_key")}</span>
                 <Input
                   value={form.apiKey}
                   onChange={(event) => updateForm("apiKey", event.target.value)}
                   type="password"
-                  placeholder={form.hasSecret ? "Leave blank to keep saved key" : "Optional"}
+                  placeholder={form.hasSecret
+                    ? t("provider_settings.api_key_keep_placeholder")
+                    : t("provider_settings.api_key_optional_placeholder")}
                   autoComplete="off"
                   spellCheck={false}
                   disabled={busy}
@@ -426,7 +436,7 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
                     ) : (
                       <Trash2 className="size-4" />
                     )}
-                    Clear API Key
+                    {t("provider_settings.clear_api_key")}
                   </Button>
                   <Button
                     type="button"
@@ -435,13 +445,13 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
                     disabled={busy || !isExistingProvider}
                   >
                     <Trash2 className="size-4" />
-                    Delete Provider
+                    {t("provider_settings.delete_provider")}
                   </Button>
                 </div>
 
                 <Button type="button" onClick={() => void handleSave()} disabled={busy}>
                   {saving ? <Loader2 className="size-4 animate-spin" /> : null}
-                  Save
+                  {t("provider_settings.save")}
                 </Button>
               </DialogFooter>
             </div>
@@ -452,9 +462,9 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
       <Dialog open={deleteConfirmOpen} onOpenChange={setDeleteConfirmOpen}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
-            <DialogTitle>删除 Provider</DialogTitle>
+            <DialogTitle>{t("provider_settings.delete_provider_title")}</DialogTitle>
             <DialogDescription>
-              确定要删除这个 Provider 吗？对应的本地密钥也会一并删除。
+              {t("provider_settings.delete_provider_description")}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter className="gap-2">
@@ -464,7 +474,7 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
               onClick={() => setDeleteConfirmOpen(false)}
               disabled={deleting}
             >
-              取消
+              {t("provider_settings.cancel")}
             </Button>
             <Button
               type="button"
@@ -473,7 +483,7 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
               disabled={deleting}
             >
               {deleting ? <Loader2 className="size-4 animate-spin" /> : null}
-              删除
+              {t("provider_settings.delete")}
             </Button>
           </DialogFooter>
         </DialogContent>
