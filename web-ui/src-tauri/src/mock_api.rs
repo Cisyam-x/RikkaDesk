@@ -20,7 +20,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use chrono::Utc;
@@ -544,6 +544,11 @@ struct SendMessageRequest {
 }
 
 #[derive(Deserialize)]
+struct UpdateConversationTitleRequest {
+    title: String,
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UpdateAssistantRequest {
     assistant_id: String,
@@ -644,6 +649,12 @@ pub async fn start(app_data_dir: PathBuf) -> Result<MockApiHandle, Box<dyn std::
         .route("/api/conversations/{id}", get(conversation_detail))
         .route("/api/conversations/{id}/stream", get(conversation_stream))
         .route("/api/conversations/{id}/messages", post(send_message))
+        .route(
+            "/api/conversations/{id}/title",
+            post(update_conversation_title),
+        )
+        .route("/api/conversations/{id}/pin", post(toggle_conversation_pin))
+        .route("/api/conversations/{id}", delete(delete_conversation))
         .route("/api/conversations/{id}/stop", post(stop_conversation))
         .route("/api/settings/assistant", post(update_assistant))
         .route(
@@ -1148,6 +1159,77 @@ async fn stop_conversation(
     }
 
     Json(json!({ "status": "stopped" }))
+}
+
+async fn update_conversation_title(
+    State(state): State<Arc<MockApiState>>,
+    Path(id): Path<String>,
+    Json(payload): Json<UpdateConversationTitleRequest>,
+) -> impl IntoResponse {
+    let title = payload.title.trim();
+    if title.is_empty() {
+        return bad_request_response("Title cannot be empty");
+    }
+
+    let updated = {
+        let mut conversations = state.conversations.write().await;
+        let Some(conversation) = conversations.get_mut(&id) else {
+            return not_found_response("Conversation not found");
+        };
+
+        conversation.title = title.chars().take(120).collect();
+        conversation.update_at = now_millis();
+        conversation.clone()
+    };
+
+    persist_mock_state(&state).await;
+    broadcast_conversation_snapshot(&state, &updated).await;
+    broadcast_list_invalidate(&state).await;
+
+    Json(json!({ "status": "ok" })).into_response()
+}
+
+async fn toggle_conversation_pin(
+    State(state): State<Arc<MockApiState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let updated = {
+        let mut conversations = state.conversations.write().await;
+        let Some(conversation) = conversations.get_mut(&id) else {
+            return not_found_response("Conversation not found");
+        };
+
+        conversation.is_pinned = !conversation.is_pinned;
+        conversation.clone()
+    };
+
+    persist_mock_state(&state).await;
+    broadcast_conversation_snapshot(&state, &updated).await;
+    broadcast_list_invalidate(&state).await;
+
+    Json(json!({ "status": "ok", "isPinned": updated.is_pinned })).into_response()
+}
+
+async fn delete_conversation(
+    State(state): State<Arc<MockApiState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let removed = {
+        let mut conversations = state.conversations.write().await;
+        conversations.remove(&id)
+    };
+
+    if removed.is_none() {
+        return not_found_response("Conversation not found");
+    }
+
+    stop_generation(&state, &id).await;
+    state.conversation_txs.write().await.remove(&id);
+
+    persist_mock_state(&state).await;
+    broadcast_list_invalidate(&state).await;
+
+    Json(json!({ "status": "deleted" })).into_response()
 }
 
 async fn update_assistant(
