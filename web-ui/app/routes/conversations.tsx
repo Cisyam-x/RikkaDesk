@@ -27,7 +27,7 @@ import { useCurrentModel } from "~/hooks/use-current-model";
 import { getAssistantDisplayName, getModelDisplayName } from "~/lib/display";
 import { convertConversationToMarkdown, downloadMarkdown } from "~/lib/export-markdown";
 import { cn } from "~/lib/utils";
-import api, { sse } from "~/services/api";
+import api, { isDesktopRuntime, sse } from "~/services/api";
 import { useChatInputStore, useAppStore } from "~/stores";
 import { WorkbenchHost } from "~/components/workbench/workbench-host";
 import {
@@ -478,33 +478,53 @@ function useDraftInputController({
 
     const parts = getSubmitParts(draftKey);
     if (parts.length === 0) return;
+    const currentDraft = useChatInputStore.getState().drafts[draftKey];
+    const draftText = currentDraft?.text ?? "";
+    const draftParts = currentDraft?.parts ?? [];
+    const restoreDraft = () => {
+      if (draftText) {
+        setDraftText(draftKey, draftText);
+      }
+      if (draftParts.length > 0) {
+        addDraftParts(draftKey, draftParts);
+      }
+    };
 
     if (activeId) {
-      await api.post<{ status: string }>(`conversations/${activeId}/messages`, { parts });
       clearDraft(draftKey);
+      try {
+        await api.post<{ status: string }>(`conversations/${activeId}/messages`, { parts });
+      } catch (error) {
+        restoreDraft();
+        throw error;
+      }
       return;
     }
 
     const conversationId = uuidv4();
+    const promptInjectionIds = getPromptInjectionIds(draftKey);
+    clearDraft(draftKey);
     setHomeDraftId(createHomeDraftId());
     setActiveId(conversationId);
     navigate(`/c/${conversationId}`);
-
-    const promptInjectionIds = getPromptInjectionIds(draftKey);
-
-    await api.post<{ status: string }>(`conversations/${conversationId}/messages`, {
-      parts,
-      ...(useConversationPromptInjection
-        ? {
-            modeInjectionIds: promptInjectionIds.modeInjectionIds,
-            lorebookIds: promptInjectionIds.lorebookIds,
-          }
-        : {}),
-    });
-    clearDraft(draftKey);
-    refreshList();
+    try {
+      await api.post<{ status: string }>(`conversations/${conversationId}/messages`, {
+        parts,
+        ...(useConversationPromptInjection
+          ? {
+              modeInjectionIds: promptInjectionIds.modeInjectionIds,
+              lorebookIds: promptInjectionIds.lorebookIds,
+            }
+          : {}),
+      });
+      refreshList();
+    } catch (error) {
+      restoreDraft();
+      throw error;
+    }
   }, [
     activeId,
+    addDraftParts,
     clearDraft,
     draftKey,
     getPromptInjectionIds,
@@ -512,6 +532,7 @@ function useDraftInputController({
     navigate,
     refreshList,
     setActiveId,
+    setDraftText,
     setHomeDraftId,
     useConversationPromptInjection,
   ]);
@@ -578,10 +599,10 @@ const ConversationTimeline = React.memo(({
   contentClassName?: string;
   onEdit: (message: MessageDto) => void | Promise<void>;
   onDelete: (messageId: string) => Promise<void>;
-  onFork: (messageId: string) => Promise<void>;
+  onFork?: (messageId: string) => Promise<void>;
   onRegenerate: (messageId: string) => Promise<void>;
-  onSelectBranch: (nodeId: string, selectIndex: number) => Promise<void>;
-  onToolApproval: (toolCallId: string, approved: boolean, reason: string, answer?: string) => Promise<void>;
+  onSelectBranch?: (nodeId: string, selectIndex: number) => Promise<void>;
+  onToolApproval?: (toolCallId: string, approved: boolean, reason: string, answer?: string) => Promise<void>;
 }) => {
   const { t } = useTranslation("page");
   const canQuickJump =
@@ -713,6 +734,7 @@ function ConversationsPageInner() {
   const { id: routeId } = useParams();
   const isHomeRoute = !routeId;
   const isMobile = useIsMobile();
+  const desktopRuntime = isDesktopRuntime();
   const { panel, closePanel } = useWorkbench();
 
   const { settings, assistants, currentAssistantId, currentAssistant } = useCurrentAssistant();
@@ -1017,10 +1039,10 @@ function ConversationsPageInner() {
             conversationAssistantId={detail?.assistantId ?? null}
             onEdit={handleStartEdit}
             onDelete={handleDeleteMessage}
-            onFork={handleForkMessage}
+            onFork={desktopRuntime ? undefined : handleForkMessage}
             onRegenerate={handleRegenerate}
-            onSelectBranch={handleSelectBranch}
-            onToolApproval={handleToolApproval}
+            onSelectBranch={desktopRuntime ? undefined : handleSelectBranch}
+            onToolApproval={desktopRuntime ? undefined : handleToolApproval}
           />
         </div>
       )}
@@ -1087,8 +1109,8 @@ function ConversationsPageInner() {
         onSelect={handleSelect}
         onAssistantChange={handleAssistantChange}
         onPin={handleTogglePinConversation}
-        onRegenerateTitle={handleRegenerateConversationTitle}
-        onMoveToAssistant={handleMoveConversation}
+        onRegenerateTitle={desktopRuntime ? undefined : handleRegenerateConversationTitle}
+        onMoveToAssistant={desktopRuntime ? undefined : handleMoveConversation}
         onUpdateTitle={handleUpdateConversationTitle}
         onDelete={handleDeleteConversation}
         onCreateConversation={handleCreateConversation}

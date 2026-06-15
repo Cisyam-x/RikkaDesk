@@ -20,7 +20,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use chrono::Utc;
@@ -544,6 +544,22 @@ struct SendMessageRequest {
 }
 
 #[derive(Deserialize)]
+struct UpdateConversationTitleRequest {
+    title: String,
+}
+
+#[derive(Deserialize)]
+struct EditMessageRequest {
+    parts: Vec<Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RegenerateRequest {
+    message_id: Option<String>,
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UpdateAssistantRequest {
     assistant_id: String,
@@ -644,6 +660,24 @@ pub async fn start(app_data_dir: PathBuf) -> Result<MockApiHandle, Box<dyn std::
         .route("/api/conversations/{id}", get(conversation_detail))
         .route("/api/conversations/{id}/stream", get(conversation_stream))
         .route("/api/conversations/{id}/messages", post(send_message))
+        .route(
+            "/api/conversations/{id}/messages/{message_id}/edit",
+            post(edit_message),
+        )
+        .route(
+            "/api/conversations/{id}/messages/{message_id}",
+            delete(delete_message),
+        )
+        .route(
+            "/api/conversations/{id}/regenerate",
+            post(regenerate_message),
+        )
+        .route(
+            "/api/conversations/{id}/title",
+            post(update_conversation_title),
+        )
+        .route("/api/conversations/{id}/pin", post(toggle_conversation_pin))
+        .route("/api/conversations/{id}", delete(delete_conversation))
         .route("/api/conversations/{id}/stop", post(stop_conversation))
         .route("/api/settings/assistant", post(update_assistant))
         .route(
@@ -1148,6 +1182,282 @@ async fn stop_conversation(
     }
 
     Json(json!({ "status": "stopped" }))
+}
+
+async fn update_conversation_title(
+    State(state): State<Arc<MockApiState>>,
+    Path(id): Path<String>,
+    Json(payload): Json<UpdateConversationTitleRequest>,
+) -> impl IntoResponse {
+    let title = payload.title.trim();
+    if title.is_empty() {
+        return bad_request_response("Title cannot be empty");
+    }
+
+    let updated = {
+        let mut conversations = state.conversations.write().await;
+        let Some(conversation) = conversations.get_mut(&id) else {
+            return not_found_response("Conversation not found");
+        };
+
+        conversation.title = title.chars().take(120).collect();
+        conversation.update_at = now_millis();
+        conversation.clone()
+    };
+
+    persist_mock_state(&state).await;
+    broadcast_conversation_snapshot(&state, &updated).await;
+    broadcast_list_invalidate(&state).await;
+
+    Json(json!({ "status": "ok" })).into_response()
+}
+
+async fn toggle_conversation_pin(
+    State(state): State<Arc<MockApiState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let updated = {
+        let mut conversations = state.conversations.write().await;
+        let Some(conversation) = conversations.get_mut(&id) else {
+            return not_found_response("Conversation not found");
+        };
+
+        conversation.is_pinned = !conversation.is_pinned;
+        conversation.clone()
+    };
+
+    persist_mock_state(&state).await;
+    broadcast_conversation_snapshot(&state, &updated).await;
+    broadcast_list_invalidate(&state).await;
+
+    Json(json!({ "status": "ok", "isPinned": updated.is_pinned })).into_response()
+}
+
+async fn delete_conversation(
+    State(state): State<Arc<MockApiState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let removed = {
+        let mut conversations = state.conversations.write().await;
+        conversations.remove(&id)
+    };
+
+    if removed.is_none() {
+        return not_found_response("Conversation not found");
+    }
+
+    stop_generation(&state, &id).await;
+    state.conversation_txs.write().await.remove(&id);
+
+    persist_mock_state(&state).await;
+    broadcast_list_invalidate(&state).await;
+
+    Json(json!({ "status": "deleted" })).into_response()
+}
+
+async fn edit_message(
+    State(state): State<Arc<MockApiState>>,
+    Path((id, message_id)): Path<(String, String)>,
+    Json(payload): Json<EditMessageRequest>,
+) -> impl IntoResponse {
+    let Some(text) = first_text_part(&payload.parts) else {
+        return bad_request_response("Phase 6A currently supports text-only message editing.");
+    };
+
+    let updated = {
+        let mut conversations = state.conversations.write().await;
+        let Some(conversation) = conversations.get_mut(&id) else {
+            return not_found_response("Conversation not found");
+        };
+        let Some(message) = find_message_mut(conversation, &message_id) else {
+            return not_found_response("Message not found");
+        };
+
+        if message.role != "USER" && message.role != "ASSISTANT" {
+            return bad_request_response("Only user and assistant text messages can be edited.");
+        }
+
+        message.parts = vec![json!({
+            "type": "text",
+            "text": text,
+        })];
+        conversation.update_at = now_millis();
+        conversation.clone()
+    };
+
+    persist_mock_state(&state).await;
+    broadcast_conversation_snapshot(&state, &updated).await;
+    broadcast_list_invalidate(&state).await;
+
+    Json(json!({ "status": "ok" })).into_response()
+}
+
+async fn delete_message(
+    State(state): State<Arc<MockApiState>>,
+    Path((id, message_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let updated = {
+        let mut conversations = state.conversations.write().await;
+        let Some(conversation) = conversations.get_mut(&id) else {
+            return not_found_response("Conversation not found");
+        };
+
+        let mut removed = false;
+        for node in &mut conversation.messages {
+            let before = node.messages.len();
+            node.messages.retain(|message| message.id != message_id);
+            if node.messages.len() != before {
+                removed = true;
+                if !node.messages.is_empty() && node.select_index >= node.messages.len() {
+                    node.select_index = node.messages.len() - 1;
+                }
+            }
+        }
+
+        if !removed {
+            return not_found_response("Message not found");
+        }
+
+        conversation
+            .messages
+            .retain(|node| !node.messages.is_empty());
+        conversation.update_at = now_millis();
+        conversation.clone()
+    };
+
+    persist_mock_state(&state).await;
+    broadcast_conversation_snapshot(&state, &updated).await;
+    broadcast_list_invalidate(&state).await;
+
+    Json(json!({ "status": "deleted" })).into_response()
+}
+
+async fn regenerate_message(
+    State(state): State<Arc<MockApiState>>,
+    Path(id): Path<String>,
+    Json(payload): Json<RegenerateRequest>,
+) -> impl IntoResponse {
+    let now = now_millis();
+    let assistant_id = current_assistant_id(&state).await;
+    let model_id = current_model_id(&state, &assistant_id).await;
+
+    let prepared = {
+        let mut conversations = state.conversations.write().await;
+        let Some(conversation) = conversations.get_mut(&id) else {
+            return not_found_response("Conversation not found");
+        };
+
+        let Some(target_index) =
+            find_regeneratable_node_index(conversation, payload.message_id.as_deref())
+        else {
+            return bad_request_response(
+                "Phase 6A currently supports regenerating only the latest text turn.",
+            );
+        };
+
+        let Some(target_message) = selected_message(&conversation.messages[target_index]) else {
+            return bad_request_response(
+                "Phase 6A currently supports regenerating only the latest text turn.",
+            );
+        };
+
+        match target_message.role.as_str() {
+            "ASSISTANT" => {
+                conversation.messages.truncate(target_index);
+            }
+            "USER" => {
+                conversation.messages.truncate(target_index + 1);
+            }
+            _ => {
+                return bad_request_response(
+                    "Only user and assistant text messages can be regenerated.",
+                );
+            }
+        }
+
+        let Some(last_user_message) = conversation
+            .messages
+            .iter()
+            .rev()
+            .filter_map(selected_message)
+            .find(|message| message.role == "USER")
+        else {
+            return bad_request_response("No user text message is available to regenerate from.");
+        };
+
+        if text_from_parts(&last_user_message.parts).is_none() {
+            return bad_request_response(
+                "Phase 6A currently supports regenerating text-only chat.",
+            );
+        }
+
+        conversation.update_at = now_millis();
+        conversation.is_generating = true;
+        conversation.clone()
+    };
+
+    persist_mock_state(&state).await;
+    broadcast_conversation_snapshot(&state, &prepared).await;
+    broadcast_list_invalidate(&state).await;
+
+    let real_chat_config = match resolve_openai_chat_config(&state, &model_id).await {
+        Ok(config) => config,
+        Err(error) => {
+            append_assistant_reply(
+                &state,
+                &id,
+                &assistant_id,
+                &model_id,
+                format!("Real provider request failed: {error}"),
+                now,
+            )
+            .await;
+            return Json(json!({ "status": "accepted" })).into_response();
+        }
+    };
+
+    let Some(config) = real_chat_config else {
+        append_assistant_reply(
+            &state,
+            &id,
+            &assistant_id,
+            &model_id,
+            MOCK_REPLY_TEXT.to_string(),
+            now,
+        )
+        .await;
+        return Json(json!({ "status": "accepted" })).into_response();
+    };
+
+    let messages = openai_messages_from_conversation(&prepared);
+    if messages.is_empty() {
+        append_assistant_reply(
+            &state,
+            &id,
+            &assistant_id,
+            &model_id,
+            "Phase 6A currently supports regenerating text-only chat.".to_string(),
+            now,
+        )
+        .await;
+        return Json(json!({ "status": "accepted" })).into_response();
+    }
+
+    let assistant_message_id =
+        append_empty_streaming_assistant_reply(&state, &id, &assistant_id, &model_id, now).await;
+    start_generation(&state, &id).await;
+
+    let stream_result =
+        stream_openai_compatible_chat(&state, &id, &assistant_message_id, &config, messages).await;
+
+    if let Err(error) = stream_result {
+        let error_text = format!("Real provider request failed: {error}");
+        append_text_to_assistant_message(&state, &id, &assistant_message_id, &error_text).await;
+    }
+
+    finish_streaming_assistant_reply(&state, &id, &assistant_message_id).await;
+
+    Json(json!({ "status": "accepted" })).into_response()
 }
 
 async fn update_assistant(
@@ -2195,6 +2505,39 @@ fn find_message_mut<'a>(
             }
         }
     }
+    None
+}
+
+fn selected_message(node: &MessageNodeDto) -> Option<&MessageDto> {
+    node.messages
+        .get(node.select_index)
+        .or_else(|| node.messages.first())
+}
+
+fn find_regeneratable_node_index(
+    conversation: &ConversationDto,
+    requested_message_id: Option<&str>,
+) -> Option<usize> {
+    let last_index = conversation.messages.len().checked_sub(1)?;
+    let last_message = selected_message(&conversation.messages[last_index])?;
+    let target_message_id = requested_message_id.unwrap_or(&last_message.id);
+
+    let target_index = conversation.messages.iter().position(|node| {
+        selected_message(node).is_some_and(|message| message.id == target_message_id)
+    })?;
+
+    if target_index == last_index {
+        return Some(target_index);
+    }
+
+    let target_message = selected_message(&conversation.messages[target_index])?;
+    if target_index + 1 == last_index
+        && target_message.role == "USER"
+        && last_message.role == "ASSISTANT"
+    {
+        return Some(target_index);
+    }
+
     None
 }
 

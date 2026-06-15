@@ -30,10 +30,13 @@ import { Button } from "~/components/ui/button";
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
   DialogTrigger,
 } from "~/components/ui/dialog";
+import { Input } from "~/components/ui/input";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -229,6 +232,15 @@ const ConversationListRow = React.memo(({
   const { t } = useTranslation();
   const [menuOpen, setMenuOpen] = React.useState(false);
   const [pendingAction, setPendingAction] = React.useState<string | null>(null);
+  const [titleDialogOpen, setTitleDialogOpen] = React.useState(false);
+  const [deleteDialogOpen, setDeleteDialogOpen] = React.useState(false);
+  const [draftTitle, setDraftTitle] = React.useState(conversation.title);
+
+  React.useEffect(() => {
+    if (!titleDialogOpen) {
+      setDraftTitle(conversation.title);
+    }
+  }, [conversation.title, titleDialogOpen]);
 
   const moveTargets = React.useMemo(
     () => assistants.filter((assistant) => assistant.id !== conversation.assistantId),
@@ -365,29 +377,8 @@ const ConversationListRow = React.memo(({
                   disabled={pendingAction !== null}
                   onSelect={(event) => {
                     event.preventDefault();
-                    const nextTitle = window
-                      .prompt(t("conversation_sidebar.edit_title_prompt"), conversation.title)
-                      ?.trim();
-                    if (nextTitle == null) {
-                      return;
-                    }
-                    if (nextTitle.length === 0) {
-                      toast.error(t("conversation_sidebar.title_empty"));
-                      return;
-                    }
-                    if (nextTitle === conversation.title) {
-                      return;
-                    }
-                    void runAction(
-                      "update-title",
-                      async () => {
-                        await onUpdateTitle(conversation.id, nextTitle);
-                      },
-                      {
-                        success: t("conversation_sidebar.title_updated"),
-                        error: t("conversation_sidebar.title_update_failed"),
-                      },
-                    );
+                    setDraftTitle(conversation.title);
+                    setTitleDialogOpen(true);
                   }}
                 >
                   <Pencil className="size-4" />
@@ -445,19 +436,7 @@ const ConversationListRow = React.memo(({
                     disabled={pendingAction !== null}
                     onSelect={(event) => {
                       event.preventDefault();
-                      if (!window.confirm(t("conversation_sidebar.delete_confirm"))) {
-                        return;
-                      }
-                      void runAction(
-                        "delete",
-                        async () => {
-                          await onDelete(conversation.id);
-                        },
-                        {
-                          success: t("conversation_sidebar.delete_success"),
-                          error: t("conversation_sidebar.delete_failed"),
-                        },
-                      );
+                      setDeleteDialogOpen(true);
                     }}
                   >
                     <Trash2 className="size-4" />
@@ -469,6 +448,107 @@ const ConversationListRow = React.memo(({
           </>
         )}
       </DropdownMenu>
+
+      {onUpdateTitle && (
+        <Dialog open={titleDialogOpen} onOpenChange={setTitleDialogOpen}>
+          <DialogContent className="sm:max-w-md">
+            <DialogHeader>
+              <DialogTitle>{t("conversation_sidebar.edit_title")}</DialogTitle>
+              <DialogDescription>
+                {t("conversation_sidebar.edit_title_description", {
+                  defaultValue: "Update the title shown in the conversation list.",
+                })}
+              </DialogDescription>
+            </DialogHeader>
+            <form
+              className="space-y-4"
+              onSubmit={(event) => {
+                event.preventDefault();
+                const nextTitle = draftTitle.trim();
+                if (nextTitle.length === 0) {
+                  toast.error(t("conversation_sidebar.title_empty"));
+                  return;
+                }
+                if (nextTitle === conversation.title) {
+                  setTitleDialogOpen(false);
+                  return;
+                }
+                void runAction(
+                  "update-title",
+                  async () => {
+                    await onUpdateTitle(conversation.id, nextTitle);
+                  },
+                  {
+                    success: t("conversation_sidebar.title_updated"),
+                    error: t("conversation_sidebar.title_update_failed"),
+                  },
+                ).then(() => setTitleDialogOpen(false));
+              }}
+            >
+              <Input
+                autoFocus
+                value={draftTitle}
+                onChange={(event) => setDraftTitle(event.target.value)}
+              />
+              <DialogFooter className="gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => setTitleDialogOpen(false)}
+                >
+                  {t("conversation_sidebar.cancel", { defaultValue: "Cancel" })}
+                </Button>
+                <Button type="submit" disabled={pendingAction !== null}>
+                  {t("conversation_sidebar.save_title", { defaultValue: "Save" })}
+                </Button>
+              </DialogFooter>
+            </form>
+          </DialogContent>
+        </Dialog>
+      )}
+
+      {onDelete && (
+        <Dialog open={deleteDialogOpen} onOpenChange={setDeleteDialogOpen}>
+          <DialogContent className="sm:max-w-md">
+            <DialogHeader>
+              <DialogTitle>{t("conversation_sidebar.delete_conversation")}</DialogTitle>
+              <DialogDescription>
+                {t("conversation_sidebar.delete_confirm_description", {
+                  defaultValue: "Delete this conversation? This cannot be undone.",
+                })}
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter className="gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => setDeleteDialogOpen(false)}
+              >
+                {t("conversation_sidebar.cancel", { defaultValue: "Cancel" })}
+              </Button>
+              <Button
+                type="button"
+                variant="destructive"
+                disabled={pendingAction !== null}
+                onClick={() => {
+                  void runAction(
+                    "delete",
+                    async () => {
+                      await onDelete(conversation.id);
+                    },
+                    {
+                      success: t("conversation_sidebar.delete_success"),
+                      error: t("conversation_sidebar.delete_failed"),
+                    },
+                  ).then(() => setDeleteDialogOpen(false));
+                }}
+              >
+                {t("conversation_sidebar.delete_conversation")}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      )}
     </SidebarMenuItem>
   );
 });

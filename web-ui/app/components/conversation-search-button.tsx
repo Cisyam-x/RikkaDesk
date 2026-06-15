@@ -1,8 +1,9 @@
 import * as React from "react";
 
 import dayjs from "dayjs";
-import { Circle, Search } from "lucide-react";
+import { Search } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { toast } from "sonner";
 
 import { Button } from "~/components/ui/button";
 import {
@@ -12,7 +13,7 @@ import {
   DialogTrigger,
 } from "~/components/ui/dialog";
 import { ScrollArea } from "~/components/ui/scroll-area";
-import api from "~/services/api";
+import api, { isDesktopRuntime } from "~/services/api";
 import type { MessageSearchResultDto } from "~/types";
 
 export interface ConversationSearchButtonProps {
@@ -65,6 +66,10 @@ function formatRelativeTime(updateAt: number, t: (key: string) => string): strin
 
 export function ConversationSearchButton({ onSelect }: ConversationSearchButtonProps) {
   const { t } = useTranslation();
+  const desktopSearchUnsupported = isDesktopRuntime();
+  const betaUnsupportedMessage = t("conversation_search.rikkadesk_unsupported", {
+    defaultValue: "RikkaDesk beta currently does not support conversation search.",
+  });
   const [open, setOpen] = React.useState(false);
   const [query, setQuery] = React.useState("");
   const [searching, setSearching] = React.useState(false);
@@ -120,6 +125,22 @@ export function ConversationSearchButton({ onSelect }: ConversationSearchButtonP
       window.clearTimeout(timer);
     };
   }, [open, query, t]);
+
+  if (desktopSearchUnsupported) {
+    return (
+      <Button
+        variant="ghost"
+        size="sm"
+        className="w-full justify-start opacity-70"
+        type="button"
+        title={betaUnsupportedMessage}
+        onClick={() => toast.info(betaUnsupportedMessage)}
+      >
+        <Search className="size-4" />
+        {t("conversation_search.search_conversations")}
+      </Button>
+    );
+  }
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
