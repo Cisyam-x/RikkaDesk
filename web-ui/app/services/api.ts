@@ -50,6 +50,10 @@ function isTauriRuntime(): boolean {
   return "__TAURI_INTERNALS__" in runtimeWindow || "__TAURI__" in runtimeWindow;
 }
 
+export function isDesktopRuntime(): boolean {
+  return isTauriRuntime();
+}
+
 function normalizeApiPath(url: string): string {
   const trimmed = url.replace(/^\/+/, "");
   return trimmed.startsWith("api/") ? trimmed.slice(4) : trimmed;

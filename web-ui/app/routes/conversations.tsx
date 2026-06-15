@@ -420,6 +420,7 @@ function useDraftInputController({
   isHomeRoute,
   homeDraftId,
   setHomeDraftId,
+  setActiveId,
   useConversationPromptInjection,
   navigate,
   refreshList,
@@ -428,6 +429,7 @@ function useDraftInputController({
   isHomeRoute: boolean;
   homeDraftId: string;
   setHomeDraftId: React.Dispatch<React.SetStateAction<string>>;
+  setActiveId: React.Dispatch<React.SetStateAction<string | null>>;
   useConversationPromptInjection: boolean;
   navigate: ReturnType<typeof useNavigate>;
   refreshList: () => void;
@@ -485,6 +487,9 @@ function useDraftInputController({
 
     const conversationId = uuidv4();
     setHomeDraftId(createHomeDraftId());
+    setActiveId(conversationId);
+    navigate(`/c/${conversationId}`);
+
     const promptInjectionIds = getPromptInjectionIds(draftKey);
 
     await api.post<{ status: string }>(`conversations/${conversationId}/messages`, {
@@ -497,8 +502,6 @@ function useDraftInputController({
         : {}),
     });
     clearDraft(draftKey);
-
-    navigate(`/c/${conversationId}`);
     refreshList();
   }, [
     activeId,
@@ -508,6 +511,7 @@ function useDraftInputController({
     getSubmitParts,
     navigate,
     refreshList,
+    setActiveId,
     setHomeDraftId,
     useConversationPromptInjection,
   ]);
@@ -747,6 +751,7 @@ function ConversationsPageInner() {
     isHomeRoute,
     homeDraftId,
     setHomeDraftId,
+    setActiveId,
     useConversationPromptInjection: currentAssistant?.allowConversationPromptInjection === true,
     navigate,
     refreshList,
