@@ -68,7 +68,9 @@
     "description": "Switch the chat model used by this assistant",
     "search_placeholder": "Search models",
     "empty": "No models available",
-    "favorites": "Favorites"
+    "favorites": "Favorites",
+    "add_to_favorites": "Add to favorites",
+    "remove_from_favorites": "Remove from favorites"
   },
   "search": {
     "default_service_label": "Search",
@@ -84,7 +86,8 @@
     "status_disabled": "Disabled",
     "unknown": "Unknown",
     "empty": "No search services available",
-    "builtin_notice": "Built-in model search is enabled. App search service settings won't take effect."
+    "builtin_notice": "Built-in model search is enabled. App search service settings won't take effect.",
+    "rikkadesk_unsupported": "RikkaDesk beta currently does not support web search."
   },
   "chat": {
     "attachment_image": "Image",

@@ -50,6 +50,7 @@ const SECRETS_DIR_NAME: &str = "secrets";
 #[cfg(not(windows))]
 const SECRET_SERVICE_NAME: &str = "RikkaDesk";
 const OPENAI_COMPATIBLE_PROVIDER_TYPE: &str = "openai-compatible";
+const PROVIDER_SECRET_REF_PREFIX: &str = "rikkadesk:provider:";
 const OPENAI_CHAT_TIMEOUT_SECS: u64 = 60;
 const MOCK_ASSISTANT_ID: &str = "mock-assistant";
 const MOCK_MODEL_ID: &str = "mock-chat";
@@ -573,6 +574,12 @@ struct UpdateAssistantModelRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateFavoriteModelsRequest {
+    model_ids: Vec<String>,
+}
+
+#[derive(Deserialize)]
 struct AiIconQuery {
     name: Option<String>,
 }
@@ -654,6 +661,10 @@ pub async fn start(app_data_dir: PathBuf) -> Result<MockApiHandle, Box<dyn std::
             get(desktop_providers).post(upsert_desktop_provider),
         )
         .route(
+            "/api/desktop/providers/{id}",
+            delete(delete_desktop_provider),
+        )
+        .route(
             "/api/desktop/providers/{id}/secret",
             post(update_desktop_provider_secret).delete(delete_desktop_provider_secret),
         )
@@ -683,6 +694,10 @@ pub async fn start(app_data_dir: PathBuf) -> Result<MockApiHandle, Box<dyn std::
         .route(
             "/api/settings/assistant/model",
             post(update_assistant_model),
+        )
+        .route(
+            "/api/settings/favorite-models",
+            post(update_favorite_models),
         )
         .fallback(not_implemented)
         .layer(
@@ -918,6 +933,44 @@ async fn delete_desktop_provider_secret(
     }
 
     Json(json!({ "status": "ok", "hasSecret": false })).into_response()
+}
+
+async fn delete_desktop_provider(
+    State(state): State<Arc<MockApiState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let provider = {
+        let providers = state.providers.read().await;
+        providers.iter().find(|item| item.id == id).cloned()
+    };
+
+    let Some(provider) = provider else {
+        return not_found_response("Provider not found");
+    };
+
+    if let Err(error) = state.secret_store.delete_secret(&provider.secret_ref) {
+        eprintln!("RikkaDesk provider secret delete failed: {error}");
+        return internal_error_response("Secret store is unavailable");
+    }
+
+    {
+        let mut providers = state.providers.write().await;
+        providers.retain(|item| item.id != provider.id);
+    }
+
+    {
+        let providers = state.providers.read().await;
+        let mut settings = state.settings.write().await;
+        sync_settings_with_desktop_providers(&mut settings, &providers);
+        remove_model_from_favorites(&mut settings, &provider.model.id);
+        ensure_current_model_exists(&mut settings);
+    }
+
+    persist_mock_state(&state).await;
+    broadcast_settings_update(&state).await;
+    broadcast_list_invalidate(&state).await;
+
+    Json(json!({ "status": "ok" })).into_response()
 }
 
 async fn settings_stream(State(state): State<Arc<MockApiState>>) -> impl IntoResponse {
@@ -1496,6 +1549,30 @@ async fn update_assistant_model(
                 }
             }
         }
+    }
+
+    persist_mock_state(&state).await;
+    broadcast_settings_update(&state).await;
+
+    Json(json!({ "status": "ok" }))
+}
+
+async fn update_favorite_models(
+    State(state): State<Arc<MockApiState>>,
+    Json(payload): Json<UpdateFavoriteModelsRequest>,
+) -> impl IntoResponse {
+    let mut seen = HashSet::new();
+    let model_ids: Vec<String> = payload
+        .model_ids
+        .into_iter()
+        .map(|model_id| model_id.trim().to_string())
+        .filter(|model_id| !model_id.is_empty())
+        .filter(|model_id| seen.insert(model_id.clone()))
+        .collect();
+
+    {
+        let mut settings = state.settings.write().await;
+        settings["favoriteModels"] = json!(model_ids);
     }
 
     persist_mock_state(&state).await;
@@ -2224,10 +2301,6 @@ fn migrate_v1_to_v2(mut persisted: PersistedMockState) -> PersistedMockState {
 }
 
 fn sync_settings_with_desktop_providers(settings: &mut Value, providers: &[DesktopProviderConfig]) {
-    let desktop_provider_ids: Vec<&str> = providers
-        .iter()
-        .map(|provider| provider.id.as_str())
-        .collect();
     let existing_providers = settings
         .get("providers")
         .and_then(Value::as_array)
@@ -2237,10 +2310,14 @@ fn sync_settings_with_desktop_providers(settings: &mut Value, providers: &[Deskt
     let mut merged_providers: Vec<Value> = existing_providers
         .into_iter()
         .filter(|provider| {
-            provider
+            !provider
+                .get("secretRef")
+                .and_then(Value::as_str)
+                .is_some_and(|secret_ref| secret_ref.starts_with(PROVIDER_SECRET_REF_PREFIX))
+                && provider
                 .get("id")
                 .and_then(Value::as_str)
-                .is_none_or(|id| !desktop_provider_ids.contains(&id))
+                .is_none_or(|id| !providers.iter().any(|provider| provider.id == id))
         })
         .collect();
 
@@ -2273,24 +2350,112 @@ fn set_current_model_in_settings(settings: &mut Value, model_id: &str) {
             }
         }
     }
+}
 
-    if let Some(favorite_models) = settings
+fn remove_model_from_favorites(settings: &mut Value, model_id: &str) {
+    let Some(favorite_models) = settings
         .get_mut("favoriteModels")
         .and_then(Value::as_array_mut)
-    {
-        let already_favorite = favorite_models
-            .iter()
-            .any(|item| item.as_str() == Some(model_id));
-        if !already_favorite {
-            favorite_models.push(json!(model_id));
+    else {
+        return;
+    };
+
+    favorite_models.retain(|item| item.as_str() != Some(model_id));
+}
+
+fn ensure_current_model_exists(settings: &mut Value) {
+    let current_model_id = settings
+        .get("chatModelId")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let current_model_exists = current_model_id
+        .as_deref()
+        .is_some_and(|model_id| settings_contains_model(settings, model_id));
+
+    if !current_model_exists {
+        if let Some(model_id) = first_settings_model_id(settings) {
+            set_current_model_in_settings(settings, &model_id);
         }
-    } else {
-        settings["favoriteModels"] = json!([model_id]);
+        return;
+    }
+
+    let current_assistant_id = settings
+        .get("assistantId")
+        .and_then(Value::as_str)
+        .unwrap_or(MOCK_ASSISTANT_ID)
+        .to_string();
+    let assistant_model_id = settings
+        .get("assistants")
+        .and_then(Value::as_array)
+        .and_then(|assistants| {
+            assistants.iter().find_map(|assistant| {
+                let is_current = assistant
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| id == current_assistant_id);
+                is_current.then(|| assistant.get("chatModelId").and_then(Value::as_str))?
+            })
+        });
+    let assistant_model_exists = assistant_model_id
+        .is_some_and(|model_id| settings_contains_model(settings, model_id));
+
+    if !assistant_model_exists {
+        if let Some(model_id) = current_model_id {
+            set_current_model_in_settings(settings, &model_id);
+        }
     }
 }
 
+fn settings_contains_model(settings: &Value, model_id: &str) -> bool {
+    settings
+        .get("providers")
+        .and_then(Value::as_array)
+        .is_some_and(|providers| {
+            providers.iter().any(|provider| {
+                provider
+                    .get("models")
+                    .and_then(Value::as_array)
+                    .is_some_and(|models| {
+                        models.iter().any(|model| {
+                            model
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .is_some_and(|id| id == model_id)
+                        })
+                    })
+            })
+        })
+}
+
+fn first_settings_model_id(settings: &Value) -> Option<String> {
+    settings
+        .get("providers")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter(|provider| {
+            provider
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+        })
+        .find_map(|provider| {
+            provider
+                .get("models")
+                .and_then(Value::as_array)?
+                .iter()
+                .find_map(|model| {
+                    let is_chat = model
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .is_none_or(|model_type| model_type == "CHAT");
+                    is_chat
+                        .then(|| model.get("id").and_then(Value::as_str).map(ToOwned::to_owned))?
+                })
+        })
+}
+
 fn secret_ref_for_provider(provider_id: &str) -> String {
-    format!("rikkadesk:provider:{provider_id}:api-key")
+    format!("{PROVIDER_SECRET_REF_PREFIX}{provider_id}:api-key")
 }
 
 fn secret_storage_key_for_ref(secret_ref: &str) -> String {

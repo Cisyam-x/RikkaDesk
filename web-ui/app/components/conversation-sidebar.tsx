@@ -980,8 +980,8 @@ export const ConversationSidebar = React.memo(({
             className="text-foreground"
             type="button"
             onClick={() => setProviderSettingsOpen(true)}
-            aria-label="Provider Settings"
-            title="Provider Settings"
+            aria-label={t("provider_settings.title")}
+            title={t("provider_settings.title")}
           >
             <KeyRound className="size-4" />
           </Button>
