@@ -426,6 +426,8 @@ struct OpenAiChatCompletionRequest {
     model: String,
     messages: Vec<OpenAiChatMessage>,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
 }
 
 #[derive(Clone, Serialize)]
@@ -663,6 +665,10 @@ pub async fn start(app_data_dir: PathBuf) -> Result<MockApiHandle, Box<dyn std::
         .route(
             "/api/desktop/providers/{id}",
             delete(delete_desktop_provider),
+        )
+        .route(
+            "/api/desktop/providers/{id}/test",
+            post(test_desktop_provider_connection),
         )
         .route(
             "/api/desktop/providers/{id}/secret",
@@ -971,6 +977,24 @@ async fn delete_desktop_provider(
     broadcast_list_invalidate(&state).await;
 
     Json(json!({ "status": "ok" })).into_response()
+}
+
+async fn test_desktop_provider_connection(
+    State(state): State<Arc<MockApiState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match resolve_openai_chat_config_for_provider(&state, &id).await {
+        Ok(Some(config)) => match test_openai_compatible_chat_connection(&state, &config).await {
+            Ok(()) => Json(json!({ "ok": true })).into_response(),
+            Err(error) => Json(json!({ "ok": false, "error": error })).into_response(),
+        },
+        Ok(None) => Json(json!({
+            "ok": false,
+            "error": "Provider is missing Base URL, Model ID, or API Key."
+        }))
+        .into_response(),
+        Err(error) => Json(json!({ "ok": false, "error": error })).into_response(),
+    }
 }
 
 async fn settings_stream(State(state): State<Arc<MockApiState>>) -> impl IntoResponse {
@@ -1816,6 +1840,83 @@ async fn resolve_openai_chat_config(
     }))
 }
 
+async fn resolve_openai_chat_config_for_provider(
+    state: &Arc<MockApiState>,
+    provider_id: &str,
+) -> Result<Option<OpenAiChatConfig>, String> {
+    let provider = {
+        let providers = state.providers.read().await;
+        providers
+            .iter()
+            .find(|provider| provider.id == provider_id)
+            .cloned()
+    };
+
+    let Some(provider) = provider else {
+        return Err("Provider not found.".to_string());
+    };
+
+    if !provider.enabled || provider.provider_type != OPENAI_COMPATIBLE_PROVIDER_TYPE {
+        return Err("Only openai-compatible providers can be tested.".to_string());
+    }
+
+    let base_url = provider.base_url.trim();
+    let model_id = provider.model.model_id.trim();
+    if base_url.is_empty() || model_id.is_empty() {
+        return Ok(None);
+    }
+
+    let Some(api_key) = state.secret_store.get_secret(&provider.secret_ref)? else {
+        return Ok(None);
+    };
+    let api_key = api_key.trim().to_string();
+    if api_key.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(OpenAiChatConfig {
+        base_url: base_url.to_string(),
+        model_id: model_id.to_string(),
+        api_key,
+    }))
+}
+
+async fn test_openai_compatible_chat_connection(
+    state: &Arc<MockApiState>,
+    config: &OpenAiChatConfig,
+) -> Result<(), String> {
+    let request = OpenAiChatCompletionRequest {
+        model: config.model_id.clone(),
+        messages: vec![OpenAiChatMessage {
+            role: "user".to_string(),
+            content: "ping".to_string(),
+        }],
+        stream: false,
+        max_tokens: Some(1),
+    };
+
+    let response = state
+        .http_client
+        .post(openai_chat_completions_url(&config.base_url))
+        .bearer_auth(&config.api_key)
+        .json(&request)
+        .send()
+        .await
+        .map_err(safe_reqwest_error)?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(safe_http_status_error(status));
+    }
+
+    response
+        .json::<Value>()
+        .await
+        .map_err(|_| "provider response was not valid JSON".to_string())?;
+
+    Ok(())
+}
+
 async fn stream_openai_compatible_chat(
     state: &Arc<MockApiState>,
     conversation_id: &str,
@@ -1827,6 +1928,7 @@ async fn stream_openai_compatible_chat(
         model: config.model_id.clone(),
         messages,
         stream: true,
+        max_tokens: None,
     };
 
     let mut response = state
@@ -1937,6 +2039,21 @@ fn safe_reqwest_error(error: reqwest::Error) -> String {
         "request build failed".to_string()
     } else {
         "request failed".to_string()
+    }
+}
+
+fn safe_http_status_error(status: reqwest::StatusCode) -> String {
+    match status.as_u16() {
+        401 | 403 => "authentication failed".to_string(),
+        404 => "provider endpoint or model was not found".to_string(),
+        408 => "provider request timeout".to_string(),
+        429 => "provider rate limited the request".to_string(),
+        500..=599 => "provider service error".to_string(),
+        code => format!(
+            "{} {}",
+            code,
+            status.canonical_reason().unwrap_or("HTTP error")
+        ),
     }
 }
 

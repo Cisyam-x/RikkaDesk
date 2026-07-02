@@ -40,6 +40,11 @@ interface DesktopProviderResponse {
   hasSecret: boolean;
 }
 
+interface DesktopProviderTestResponse {
+  ok: boolean;
+  error?: string;
+}
+
 interface ProviderFormState {
   id: string;
   name: string;
@@ -104,6 +109,7 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
   const [loading, setLoading] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
   const [settingCurrentModel, setSettingCurrentModel] = React.useState(false);
+  const [testingConnection, setTestingConnection] = React.useState(false);
   const [deleting, setDeleting] = React.useState(false);
   const [clearingSecret, setClearingSecret] = React.useState(false);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = React.useState(false);
@@ -119,7 +125,10 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
   );
   const currentModelId = currentAssistant?.chatModelId ?? settings?.chatModelId ?? null;
   const isCurrentModel = selectedProvider?.model.id === currentModelId;
-  const busy = loading || saving || settingCurrentModel || deleting || clearingSecret;
+  const canTestConnection = Boolean(
+    selectedProvider && form.baseUrl.trim() && form.modelId.trim() && form.hasSecret,
+  );
+  const busy = loading || saving || settingCurrentModel || testingConnection || deleting || clearingSecret;
 
   const selectProvider = React.useCallback((provider: DesktopProviderResponse) => {
     setSelectedProviderId(provider.id);
@@ -260,6 +269,28 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
       setSettingCurrentModel(false);
     }
   }, [currentAssistant?.id, currentAssistantId, selectedProvider, settingCurrentModel, t]);
+
+  const handleTestConnection = React.useCallback(async () => {
+    if (!selectedProvider || testingConnection || !canTestConnection) return;
+
+    setTestingConnection(true);
+    setError(null);
+    try {
+      const result = await api.post<DesktopProviderTestResponse>(
+        `desktop/providers/${selectedProvider.id}/test`,
+        {},
+      );
+      if (result.ok) {
+        toast.success(t("provider_settings.test_connection_success"));
+      } else {
+        toast.error(t("provider_settings.test_connection_failed"));
+      }
+    } catch {
+      toast.error(t("provider_settings.test_connection_failed"));
+    } finally {
+      setTestingConnection(false);
+    }
+  }, [canTestConnection, selectedProvider, t, testingConnection]);
 
   const handleDeleteProvider = React.useCallback(async () => {
     if (!isExistingProvider || deleting) return;
@@ -469,6 +500,16 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
                     {isCurrentModel
                       ? t("provider_settings.current_model")
                       : t("provider_settings.set_current_model")}
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="whitespace-nowrap"
+                    onClick={() => void handleTestConnection()}
+                    disabled={busy || !canTestConnection}
+                  >
+                    {testingConnection ? <Loader2 className="size-4 animate-spin" /> : null}
+                    {t("provider_settings.test_connection")}
                   </Button>
                   <Button
                     type="button"
