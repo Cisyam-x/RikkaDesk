@@ -14,6 +14,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "~/components/ui/dialog";
+import { useCurrentAssistant } from "~/hooks/use-current-assistant";
 import { Input } from "~/components/ui/input";
 import { ScrollArea } from "~/components/ui/scroll-area";
 import api, { ApiError } from "~/services/api";
@@ -96,11 +97,13 @@ function providerModelLabel(provider: DesktopProviderResponse): string {
 
 export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsDialogProps) {
   const { t } = useTranslation();
+  const { settings, currentAssistant, currentAssistantId } = useCurrentAssistant();
   const [providers, setProviders] = React.useState<DesktopProviderResponse[]>([]);
   const [selectedProviderId, setSelectedProviderId] = React.useState<string | null>(null);
   const [form, setForm] = React.useState<ProviderFormState>(() => emptyForm());
   const [loading, setLoading] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
+  const [settingCurrentModel, setSettingCurrentModel] = React.useState(false);
   const [deleting, setDeleting] = React.useState(false);
   const [clearingSecret, setClearingSecret] = React.useState(false);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = React.useState(false);
@@ -110,7 +113,13 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
     () => providers.some((provider) => provider.id === form.id),
     [form.id, providers],
   );
-  const busy = loading || saving || deleting || clearingSecret;
+  const selectedProvider = React.useMemo(
+    () => providers.find((provider) => provider.id === form.id) ?? null,
+    [form.id, providers],
+  );
+  const currentModelId = currentAssistant?.chatModelId ?? settings?.chatModelId ?? null;
+  const isCurrentModel = selectedProvider?.model.id === currentModelId;
+  const busy = loading || saving || settingCurrentModel || deleting || clearingSecret;
 
   const selectProvider = React.useCallback((provider: DesktopProviderResponse) => {
     setSelectedProviderId(provider.id);
@@ -227,6 +236,30 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
       setClearingSecret(false);
     }
   }, [clearingSecret, form.id, isExistingProvider, loadProviders, t]);
+
+  const handleSetCurrentModel = React.useCallback(async () => {
+    if (!selectedProvider || settingCurrentModel) return;
+
+    const assistantId = currentAssistant?.id ?? currentAssistantId;
+    if (!assistantId) {
+      setError(t("provider_settings.current_model_failed"));
+      return;
+    }
+
+    setSettingCurrentModel(true);
+    setError(null);
+    try {
+      await api.post<{ status: string }>("settings/assistant/model", {
+        assistantId,
+        modelId: selectedProvider.model.id,
+      });
+      toast.success(t("provider_settings.current_model_updated"));
+    } catch (setModelError) {
+      setError(safeErrorMessage(setModelError, t("provider_settings.current_model_failed")));
+    } finally {
+      setSettingCurrentModel(false);
+    }
+  }, [currentAssistant?.id, currentAssistantId, selectedProvider, settingCurrentModel, t]);
 
   const handleDeleteProvider = React.useCallback(async () => {
     if (!isExistingProvider || deleting) return;
@@ -425,6 +458,18 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
 
               <DialogFooter className="mt-5 flex flex-col gap-3 border-t pt-4 sm:flex-row sm:items-center sm:justify-between">
                 <div className="flex flex-col gap-2.5 sm:flex-row sm:flex-wrap">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="whitespace-nowrap"
+                    onClick={() => void handleSetCurrentModel()}
+                    disabled={busy || !selectedProvider || isCurrentModel}
+                  >
+                    {settingCurrentModel ? <Loader2 className="size-4 animate-spin" /> : null}
+                    {isCurrentModel
+                      ? t("provider_settings.current_model")
+                      : t("provider_settings.set_current_model")}
+                  </Button>
                   <Button
                     type="button"
                     variant="outline"
