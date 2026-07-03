@@ -19,7 +19,11 @@ RikkaDesk is an unofficial desktop derivative / experiment based on RikkaHub. Th
 - Phase 4A complete: minimal Provider Settings UI was added.
 - Phase 4B complete: Provider Settings UI smoke-test guidance was documented.
 - Phase 5A complete: prepared the first local beta package checklist without publishing a public release.
-- Phase 5B current: prepare changelog, release draft, version strategy, and merge guidance without publishing a release.
+- Phase 5B complete: prepared changelog, release draft, version strategy, and merge guidance without publishing a release.
+- Phase 6A complete: conversation and message management were added and unsupported visible UX was polished.
+- Phase 6B P1/P2 complete: Provider Settings basic management, favorite models, Set as current model, and Test Connection were added.
+- Phase 6B P3 complete: Provider import/export safety design was documented without implementing import/export.
+- Phase 6C current: release experience documentation is being aligned with the beta.4 private beta state.
 
 ## Current Architecture
 
@@ -95,8 +99,20 @@ Desktop provider endpoints:
 
 - `GET /api/desktop/providers`
 - `POST /api/desktop/providers`
+- `DELETE /api/desktop/providers/{id}`
+- `POST /api/desktop/providers/{id}/test`
 - `POST /api/desktop/providers/{id}/secret`
 - `DELETE /api/desktop/providers/{id}/secret`
+
+Additional settings/conversation endpoints now used by the desktop beta:
+
+- `POST /api/settings/favorite-models`
+- `POST /api/conversations/{id}/title`
+- `POST /api/conversations/{id}/pin`
+- `DELETE /api/conversations/{id}`
+- `POST /api/conversations/{id}/messages/{messageId}/edit`
+- `DELETE /api/conversations/{id}/messages/{messageId}`
+- `POST /api/conversations/{id}/regenerate`
 
 The local state is persisted under the Tauri app data directory. Sending a message appends a user message, then either streams an OpenAI-compatible text response or falls back to a safe mock response. SSE streams send `update`, `invalidate`, and `snapshot` events matching the frontend listeners.
 
@@ -124,8 +140,9 @@ The current prototype intentionally does not implement:
 - Search and search index APIs.
 - MCP servers and MCP tools.
 - Tool approval execution.
-- Conversation fork, branch selection, message edit/delete/regenerate, and title generation.
-- Favorite models and other deeper settings mutations beyond basic assistant/model selection.
+- Workspace behavior.
+- Conversation fork, branch selection, and AI title generation.
+- Provider import/export implementation.
 - Gemini, Claude, Anthropic, Vertex, or provider-specific protocols.
 - Multimodal provider requests, tool calls, or upstream feature parity.
 
@@ -184,6 +201,9 @@ Build outputs:
 - The sidebar shows persisted conversations.
 - Provider Settings opens from the sidebar.
 - Saving a provider shows `hasSecret` without showing the API key.
+- Provider Settings can add, edit, delete, and test OpenAI-compatible providers.
+- Set as current model updates the model selector.
+- Favorite model updates work from the model selector.
 - Sending a text message produces either a streaming OpenAI-compatible response or the mock fallback.
 - `pnpm run desktop:build` produces MSI and NSIS installers.
 
@@ -193,5 +213,6 @@ Recommended next steps:
 
 - Keep the mock fallback as a protocol safety net while hardening the real provider path.
 - Verify unsigned Windows installer behavior with local beta testers.
-- Decide whether the first public prerelease should use `0.1.0` or `0.1.0-beta.1`.
+- Keep `rikkadesk-v0.1.0-beta.4` as the current feature-stable private beta tag until the next validated feature checkpoint.
+- Decide whether a future public prerelease should use `0.1.0` or a beta label in release notes/artifact naming.
 - Keep P2/P3 features deferred until provider settings, persistence, and streaming behavior are stable.

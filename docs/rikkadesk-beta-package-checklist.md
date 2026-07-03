@@ -4,6 +4,8 @@ RikkaDesk is an unofficial desktop derivative / experiment based on RikkaHub. Th
 
 Do not paste real API keys into documentation, commit messages, terminal transcripts, screenshots, or issue comments.
 
+Current feature-stable private beta tag: `rikkadesk-v0.1.0-beta.4`.
+
 ## Current Beta Scope
 
 Included:
@@ -11,7 +13,8 @@ Included:
 - Tauri v2 Windows desktop shell.
 - Local Rust HTTP API bound to `127.0.0.1`.
 - JSON persistence for settings, conversations, messages, provider config, and id sequence.
-- Desktop Provider Settings UI for one OpenAI-compatible provider.
+- Desktop Provider Settings UI for basic OpenAI-compatible provider management.
+- Provider list, add/edit/delete provider, favorite model updates, Set as current model, and Test Connection.
 - Secret references in JSON and encrypted local secret blobs for API keys.
 - OpenAI-compatible text chat with streaming responses.
 - Mock fallback when a real provider is not configured or cannot be used.
@@ -20,7 +23,7 @@ Not included:
 
 - Public GitHub Release publishing.
 - Gemini, Claude, Anthropic, Vertex, or provider-specific protocols.
-- Files, attachments, images, audio, tools, MCP, search, forks, or release auto-updates.
+- Files, attachments, images, audio, tools, MCP, search, Workspace, forks, or release auto-updates.
 - SQLite, sync, multi-device backup, or production-grade migration tooling.
 - Any change to the upstream Android `app` module.
 
@@ -57,6 +60,8 @@ Expected build outputs:
 
 Use the NSIS installer for the normal local beta installation smoke test. Keep the MSI as an alternate enterprise-style installer artifact.
 
+The current Windows installers are unsigned. Windows SmartScreen or unsigned publisher warnings are expected until a signing workflow is configured.
+
 ## Install
 
 1. Close any running RikkaDesk development windows.
@@ -83,7 +88,7 @@ Use Windows Settings:
 
 Or use the uninstaller created by the NSIS package in the install directory.
 
-Uninstalling the app may leave user data in the app data directory. That is normal for many desktop apps, but beta testers should know how to clear it manually.
+Uninstalling the app may leave user data and encrypted local secret blobs in the app data directory. That is normal for many desktop apps, but beta testers should know how to clear it manually.
 
 ## App Data Directory
 
@@ -144,17 +149,47 @@ Do not copy these files into the repository, README, logs, screenshots, or issue
 1. Start RikkaDesk.
 2. Open the sidebar.
 3. Click `Provider Settings`.
-4. Fill:
+4. Click `Add Provider` when creating a new provider.
+5. Fill:
    - Provider Name: `OpenAI Compatible`
    - Base URL: an OpenAI-compatible API root, for example `https://api.openai.com/v1`
    - Model ID: a model supported by the endpoint, for example `gpt-4o-mini`
    - Display Name: optional, defaults to Model ID
    - API Key: enter locally only, never paste into documentation
-5. Click `Save`.
-6. Confirm the API Key field clears.
-7. Confirm `hasSecret: true` when a key was saved.
+6. Click `Save`.
+7. Confirm the API Key field clears.
+8. Confirm `hasSecret: true` when a key was saved.
+9. Add a second provider.
+10. Switch between providers in the provider list and confirm the edit form updates.
+11. Edit provider name, base URL, model ID, or display name and save again.
+12. Delete a provider and confirm the app uses an in-app confirmation dialog.
+13. Confirm deleting a provider also deletes the corresponding local secret.
 
 Leaving API Key blank should save only non-sensitive provider config. Existing saved secrets are kept.
+
+Deleting a provider should remove its local secret and clear related favorite model entries. It must not expose the secret value.
+
+## Test Favorite And Current Model Behavior
+
+1. Open the model selector.
+2. Confirm provider models appear after Provider Settings changes.
+3. Click the favorite heart for a model.
+4. Confirm the Favorites tab updates immediately.
+5. Click the heart again and confirm the model leaves Favorites.
+6. Open Provider Settings.
+7. Select a provider.
+8. Click `Set as current model`.
+9. Confirm the chat model selector and input area reflect the selected provider model.
+10. Confirm Set as current model does not automatically favorite the model.
+
+## Test Connection
+
+1. Open Provider Settings.
+2. Select a provider with Base URL, Model ID, and `hasSecret: true`.
+3. Click `Test Connection`.
+4. With a valid local provider configuration, confirm a success toast appears.
+5. With an invalid Base URL, Model ID, or local key, confirm a safe failure toast appears.
+6. Confirm the failure message does not include the API key, Authorization header, `x-api-key`, full request headers, or full request body.
 
 ## Test Real OpenAI-Compatible Streaming Chat
 
@@ -173,6 +208,7 @@ Signals that the real provider path was used:
 - Provider Settings shows `hasSecret: true`.
 - The response is not the fixed mock fallback text.
 - Streaming text appears incrementally.
+- Test Connection succeeds for the same provider configuration.
 
 ## Test Mock Fallback
 
@@ -258,13 +294,18 @@ Checklist:
 - Save a test provider and fake key.
 - Confirm `hasSecret: true`.
 - Confirm the API Key field clears.
+- Add, edit, and delete a second provider.
+- Confirm deleting a provider removes its local secret.
+- Favorite and unfavorite a provider model from the model selector.
+- Use Set as current model from Provider Settings.
+- Run Test Connection with both a valid test endpoint and an intentionally invalid endpoint when available.
 - Send a text message.
 - Restart RikkaDesk.
 - Confirm the conversation remains.
 - Confirm Provider Settings still shows `hasSecret: true`.
 - Uninstall RikkaDesk.
-- Check whether app data remains.
-- Decide whether the beta notes should tell testers to clear app data manually.
+- Check whether app data and encrypted local secret blobs remain.
+- Tell beta testers that uninstall may not remove app data or secrets.
 - Run plaintext key searches for the fake key.
 
 Expected security result, replacing the placeholder with the fake key fragment used in the local UI:
@@ -295,8 +336,8 @@ Before sharing a local beta installer:
 - Only OpenAI-compatible text chat is supported.
 - Streaming support handles text deltas only.
 - Stop/cancel behavior is minimal and may not abort the underlying provider request immediately.
-- Provider Settings is intentionally a minimal single-provider UI.
+- Provider Settings supports basic multi-provider list, add, edit, delete, favorite model, Set as current model, and Test Connection flows.
 - API keys are not exported or synced.
-- No file attachments, images, audio, tools, MCP, search, forks, or multimodal provider calls.
+- No file attachments, images, audio, tools, MCP, search, Workspace, forks, or multimodal provider calls.
 - Local JSON state is a beta prototype store, not a final database schema.
 - Installers are unsigned unless a signing workflow is added later.
