@@ -117,6 +117,34 @@
     "delete_provider_title": "Delete Provider",
     "delete_provider_description": "Delete this Provider? Its local secret will be deleted as well."
   },
+  "about_rikkadesk": {
+    "title": "About RikkaDesk",
+    "description": "RikkaDesk is an unofficial desktop derivative of RikkaHub.",
+    "private_beta": "Private Beta",
+    "unsigned_installer": "Unsigned Windows installer",
+    "version_label": "Version",
+    "feature_tag_label": "Feature stable tag",
+    "support_title": "Current support",
+    "support": {
+      "openai_streaming": "OpenAI-compatible text streaming chat",
+      "conversation_management": "Conversation and message management",
+      "provider_settings": "Provider Settings",
+      "test_connection": "Test Connection"
+    },
+    "unsupported_title": "Not supported",
+    "unsupported": {
+      "files": "Files and attachments",
+      "media": "Images and audio",
+      "search": "Search",
+      "tools": "MCP and tools",
+      "workspace": "Workspace",
+      "multimodal": "Multimodal",
+      "import_export": "Provider import/export implementation"
+    },
+    "docs_title": "Related docs",
+    "docs_description": "See these repository docs for private beta testing, package checks, and release history.",
+    "close": "Close"
+  },
   "quick_jump": {
     "role_user": "user",
     "role_assistant": "assistant",
