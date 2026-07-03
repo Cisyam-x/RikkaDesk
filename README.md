@@ -4,7 +4,12 @@ RikkaDesk is an unofficial desktop derivative / experiment based on RikkaHub.
 
 RikkaDesk is a non-official desktop-oriented derivative of [RikkaHub](https://github.com/rikkahub/rikkahub). It currently focuses on making the existing RikkaHub `web-ui` usable as the foundation for a local Windows desktop app.
 
-This repository is in an early staged migration. The current prototype is experimental and is being prepared as a local/private beta, not a public production release. It includes a local Tauri desktop shell with a Rust desktop API, JSON persistence, Provider Settings, and an OpenAI-compatible text chat path.
+This repository is in an early staged migration. The current prototype is experimental and is being prepared as a local/private beta, not a public production release. The current feature-stable private beta tag is `rikkadesk-v0.1.0-beta.4`.
+
+> [!IMPORTANT]
+> The upstream RikkaHub feature list later in this README describes the Android upstream project. It does not mean every upstream feature is available in the current RikkaDesk desktop beta.
+
+The current RikkaDesk beta includes a local Tauri desktop shell with a Rust desktop API, JSON persistence, conversation and message management, multi-provider Provider Settings basics, and an OpenAI-compatible text streaming chat path.
 
 - Phase 0 is complete: the upstream architecture, `web-ui`, Web Interface, and license were reviewed without code changes.
 - Phase 1 is complete: the `web-ui` can run locally in a browser at `http://localhost:5173/`.
@@ -15,21 +20,29 @@ This repository is in an early staged migration. The current prototype is experi
 - Phase 3B/3C are complete: provider config uses `secretRef`; API keys must not be stored in JSON.
 - Phase 3D/3E are complete: one OpenAI-compatible provider path can return real text chat responses with streaming.
 - Phase 4A/4B are complete: Provider Settings UI and smoke-test docs are available for local validation.
+- Phase 6A is complete: conversation title, pin, delete, message edit/delete, regenerate, and unsupported visible action polish are available.
+- Phase 6B P1/P2 are complete: Provider Settings supports a provider list, add/edit/delete, favorite model updates, setting the current model, and Test Connection.
+- Phase 6B P3 is complete: Provider import/export safety has been documented; the feature itself is not implemented.
 
 Current limitations:
 
 - RikkaDesk currently supports only the OpenAI-compatible text chat path for real provider testing.
 - API keys must never be written to source files, README files, logs, tests, or `state.v1.json`.
 - On Windows, provider secrets are referenced from JSON by `secretRef` and stored as encrypted local secret blobs under app data.
-- File uploads, attachments, search, MCP, tools, branching, and other P2/P3 endpoints are intentionally deferred.
-- SQLite, sync, advanced migration tooling, multimodal input, and full upstream feature parity are not implemented.
+- File uploads, attachments, images, audio, search, MCP, tools, Workspace, multimodal input, and other P2/P3 endpoints are intentionally deferred.
+- SQLite, sync, advanced migration tooling, and full upstream feature parity are not implemented.
+- JSON remains the beta prototype persistence layer.
+- Windows installers are currently unsigned, so Windows SmartScreen or similar unsigned-app warnings are expected.
+- RikkaDesk is still a private beta and is not recommended for a public GitHub Release yet.
 
 What works in the current prototype:
 
 - The Windows desktop window can load the production `web-ui` build.
 - The local Rust API starts inside the Tauri process and listens on `127.0.0.1`.
-- The UI can load settings, show persisted conversations, send messages, and receive either mock fallback replies or OpenAI-compatible streaming text responses.
-- Provider Settings can save non-sensitive provider config and store API keys through the desktop secret mechanism without returning the key to the frontend.
+- The UI can load settings, show persisted conversations, rename/pin/delete conversations, edit/delete/regenerate text messages, send messages, and receive either mock fallback replies or OpenAI-compatible streaming text responses.
+- Provider Settings can add, select, edit, and delete OpenAI-compatible providers.
+- Provider Settings can set the current model and run a safe Test Connection request.
+- Provider Settings can save non-sensitive provider config and store API keys through the desktop SecretStore / Windows DPAPI-backed secret mechanism without returning the key to the frontend.
 - If `127.0.0.1:8080` is already in use, the local API falls back to a random loopback port and the frontend reads it through the Tauri command `get_api_base_url`.
 
 ## RikkaDesk Development
@@ -68,6 +81,8 @@ Build outputs:
 - `web-ui/src-tauri/target/release/bundle/msi/RikkaDesk_0.1.0_x64_en-US.msi`
 - `web-ui/src-tauri/target/release/bundle/nsis/RikkaDesk_0.1.0_x64-setup.exe`
 
+The Windows installer artifacts are currently unsigned. For private beta testing, SmartScreen or unsigned publisher warnings are expected. Do not publish a public Release until signing, support scope, and license obligations are reviewed.
+
 Useful validation commands:
 
 ```powershell
@@ -81,6 +96,8 @@ pnpm run desktop:build
 More details are in [docs/rikkadesk-dev.md](docs/rikkadesk-dev.md).
 
 Beta packaging notes are in [docs/rikkadesk-beta-package-checklist.md](docs/rikkadesk-beta-package-checklist.md).
+
+Private beta tester notes are in [docs/rikkadesk-beta4-release-notes.md](docs/rikkadesk-beta4-release-notes.md).
 
 Beta release draft notes are in [docs/rikkadesk-release-draft.md](docs/rikkadesk-release-draft.md), and desktop changes are summarized in [CHANGELOG.md](CHANGELOG.md).
 
