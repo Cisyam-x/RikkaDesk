@@ -97,6 +97,8 @@ More details are in [docs/rikkadesk-dev.md](docs/rikkadesk-dev.md).
 
 Beta packaging notes are in [docs/rikkadesk-beta-package-checklist.md](docs/rikkadesk-beta-package-checklist.md).
 
+Private beta tester notes are in [docs/rikkadesk-beta4-release-notes.md](docs/rikkadesk-beta4-release-notes.md).
+
 Beta release draft notes are in [docs/rikkadesk-release-draft.md](docs/rikkadesk-release-draft.md), and desktop changes are summarized in [CHANGELOG.md](CHANGELOG.md).
 
 Security and compliance:

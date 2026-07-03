@@ -70,6 +70,8 @@ This beta includes:
 
 This beta is intended for local/private validation only.
 
+Tester-facing installation and feedback notes are in [rikkadesk-beta4-release-notes.md](rikkadesk-beta4-release-notes.md).
+
 ## Installation Artifacts
 
 Expected artifacts after `pnpm run desktop:build`:
