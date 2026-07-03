@@ -5,6 +5,7 @@ import type { TFunction } from "i18next";
 import { toast } from "sonner";
 import {
   Check,
+  Info,
   KeyRound,
   Laptop,
   Languages,
@@ -69,6 +70,7 @@ import {
   type Theme,
 } from "~/components/theme-provider";
 import { ConversationSearchButton } from "~/components/conversation-search-button";
+import { AboutRikkaDeskDialog } from "~/components/about-rikkadesk-dialog";
 import { CustomThemeDialog } from "~/components/custom-theme-dialog";
 import { ProviderSettingsDialog } from "~/components/provider-settings-dialog";
 import { getAssistantDisplayName } from "~/lib/display";
@@ -627,6 +629,7 @@ export const ConversationSidebar = React.memo(({
   const [pickerOpen, setPickerOpen] = React.useState(false);
   const [customThemeOpen, setCustomThemeOpen] = React.useState(false);
   const [providerSettingsOpen, setProviderSettingsOpen] = React.useState(false);
+  const [aboutOpen, setAboutOpen] = React.useState(false);
   const [selectedTagIds, setSelectedTagIds] = React.useState<string[]>([]);
   const [switchingAssistantId, setSwitchingAssistantId] = React.useState<string | null>(null);
   const [switchError, setSwitchError] = React.useState<string | null>(null);
@@ -956,6 +959,7 @@ export const ConversationSidebar = React.memo(({
           open={providerSettingsOpen}
           onOpenChange={setProviderSettingsOpen}
         />
+        <AboutRikkaDeskDialog open={aboutOpen} onOpenChange={setAboutOpen} />
 
         <div className="flex items-center gap-2">
           {webAuthEnabled && (
@@ -984,6 +988,18 @@ export const ConversationSidebar = React.memo(({
             title={t("provider_settings.title")}
           >
             <KeyRound className="size-4" />
+          </Button>
+
+          <Button
+            variant="outline"
+            size="icon-sm"
+            className="text-foreground"
+            type="button"
+            onClick={() => setAboutOpen(true)}
+            aria-label={t("about_rikkadesk.title")}
+            title={t("about_rikkadesk.title")}
+          >
+            <Info className="size-4" />
           </Button>
 
           <DropdownMenu>

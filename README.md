@@ -32,7 +32,8 @@ Current limitations:
 - File uploads, attachments, images, audio, search, MCP, tools, Workspace, multimodal input, and other P2/P3 endpoints are intentionally deferred.
 - SQLite, sync, advanced migration tooling, and full upstream feature parity are not implemented.
 - JSON remains the beta prototype persistence layer.
-- Windows installers are currently unsigned, so Windows SmartScreen or similar unsigned-app warnings are expected.
+- Windows installers and `rikkadesk.exe` are currently unsigned, so Windows SmartScreen or similar unsigned-app warnings are expected.
+- Windows 11 Smart App Control may directly block the installed unsigned executable from launching. This is a Windows security policy block for an unverified publisher, not an application crash. The private beta is best tested on development/test machines where Smart App Control is not enabled; do not disable Windows security features or bypass enterprise policy just to run this build.
 - RikkaDesk is still a private beta and is not recommended for a public GitHub Release yet.
 
 What works in the current prototype:
@@ -81,7 +82,7 @@ Build outputs:
 - `web-ui/src-tauri/target/release/bundle/msi/RikkaDesk_0.1.0_x64_en-US.msi`
 - `web-ui/src-tauri/target/release/bundle/nsis/RikkaDesk_0.1.0_x64-setup.exe`
 
-The Windows installer artifacts are currently unsigned. For private beta testing, SmartScreen or unsigned publisher warnings are expected. Do not publish a public Release until signing, support scope, and license obligations are reviewed.
+The Windows installer artifacts and installed executable are currently unsigned. For private beta testing, SmartScreen or unsigned publisher warnings are expected. Windows 11 Smart App Control may block the unsigned `rikkadesk.exe` before it starts; that should be treated as an unsigned-publisher security policy block. Do not publish a public Release until code signing, support scope, and license obligations are reviewed.
 
 Useful validation commands:
 

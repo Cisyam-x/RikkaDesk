@@ -60,7 +60,9 @@ Expected build outputs:
 
 Use the NSIS installer for the normal local beta installation smoke test. Keep the MSI as an alternate enterprise-style installer artifact.
 
-The current Windows installers are unsigned. Windows SmartScreen or unsigned publisher warnings are expected until a signing workflow is configured.
+The current Windows installers and `rikkadesk.exe` executable are unsigned. Windows SmartScreen or unsigned publisher warnings are expected until a signing workflow is configured.
+
+Windows 11 Smart App Control can be stricter than SmartScreen and may block the installed unsigned executable from launching, for example from `C:\Users\<you>\AppData\Local\RikkaDesk\rikkadesk.exe`. That is a Windows security policy block for an unverified publisher, not a RikkaDesk runtime crash. For the private beta, prefer development or testing machines where Smart App Control is not enabled. Do not ask testers to disable Windows security features or bypass enterprise security policy for this build. The long-term release-quality fix is code signing for the executable and installer, which should be handled as a separate Windows code signing phase.
 
 ## Install
 
@@ -75,7 +77,7 @@ web-ui/src-tauri/target/release/bundle/nsis/RikkaDesk_0.1.0_x64-setup.exe
 4. Start RikkaDesk from the installer finish screen, Start Menu, or installed shortcut.
 5. Confirm the desktop window opens.
 
-If Windows SmartScreen warns about an unsigned installer, that is expected for the local beta until signing is configured.
+If Windows SmartScreen warns about an unsigned installer, that is expected for the local beta until signing is configured. If Windows 11 Smart App Control blocks the installed `rikkadesk.exe` outright, record it as an unsigned-publisher security policy block and test on an appropriate development/test machine instead of changing system security settings.
 
 ## Uninstall
 
@@ -340,4 +342,5 @@ Before sharing a local beta installer:
 - API keys are not exported or synced.
 - No file attachments, images, audio, tools, MCP, search, Workspace, forks, or multimodal provider calls.
 - Local JSON state is a beta prototype store, not a final database schema.
-- Installers are unsigned unless a signing workflow is added later.
+- Installers and `rikkadesk.exe` are unsigned unless a signing workflow is added later.
+- Windows 11 Smart App Control may block unsigned private beta builds before the app starts.

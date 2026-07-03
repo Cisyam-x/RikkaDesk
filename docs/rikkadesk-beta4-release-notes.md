@@ -30,6 +30,11 @@ For most private testing, use the NSIS setup `.exe`.
 
 - Windows 安装包目前未签名。
 - Windows SmartScreen / unknown publisher warnings are expected.
+- Windows 11 Smart App Control may block the installed unsigned executable, for example `C:\Users\<you>\AppData\Local\RikkaDesk\rikkadesk.exe`, before RikkaDesk can start.
+- If Smart App Control blocks the app, this is a Windows security policy decision for an unverified publisher, not an application crash.
+- This private beta is recommended for development or testing machines where Smart App Control is not enabled.
+- Do not disable Windows security features or bypass enterprise security policy just to run a private beta build.
+- The long-term fix is Windows code signing for the app executable and installer. Code signing can be handled in a separate future phase.
 - This is a private beta, not a public release.
 - Do not send real API keys to developers, Codex, GitHub issues, screenshots, logs, or chat transcripts.
 - Do not paste real API keys into any feedback form.

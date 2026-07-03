@@ -117,6 +117,34 @@
     "delete_provider_title": "删除 Provider",
     "delete_provider_description": "确定要删除这个 Provider 吗？对应的本地密钥也会一并删除。"
   },
+  "about_rikkadesk": {
+    "title": "关于 RikkaDesk",
+    "description": "RikkaDesk 是基于 RikkaHub 的非官方桌面端衍生项目。",
+    "private_beta": "Private Beta",
+    "unsigned_installer": "Windows 安装包未签名",
+    "version_label": "版本",
+    "feature_tag_label": "功能稳定 tag",
+    "support_title": "当前支持",
+    "support": {
+      "openai_streaming": "OpenAI-compatible 文本流式聊天",
+      "conversation_management": "会话和消息管理",
+      "provider_settings": "模型服务设置",
+      "test_connection": "测试连接"
+    },
+    "unsupported_title": "当前不支持",
+    "unsupported": {
+      "files": "文件和附件",
+      "media": "图片和音频",
+      "search": "搜索",
+      "tools": "MCP 和工具调用",
+      "workspace": "Workspace",
+      "multimodal": "多模态",
+      "import_export": "Provider 导入/导出实现"
+    },
+    "docs_title": "相关文档",
+    "docs_description": "可查看这些仓库文档了解私测说明、打包检查和版本记录。",
+    "close": "关闭"
+  },
   "quick_jump": {
     "role_user": "用户",
     "role_assistant": "助手",
