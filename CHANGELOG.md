@@ -6,11 +6,11 @@ This changelog tracks the RikkaDesk desktop work in this fork. It does not repla
 
 ## 0.1.0 Private Beta Line
 
-The current feature-stable private beta tag is `rikkadesk-v0.1.0-beta.5`. The `beta/0.1.0` branch may contain later documentation or feature work after that tag.
+The current feature-stable private beta tag is planned as `rikkadesk-v0.1.0-beta.6`. The `beta/0.1.0` branch may contain later documentation or feature work after that tag.
 
 This beta line is not a public GitHub Release.
 
-### Unreleased - Phase 7
+### `rikkadesk-v0.1.0-beta.6` - Phase 7
 
 Added:
 
@@ -103,7 +103,7 @@ The `beta/0.1.0` branch includes follow-up updates after the beta.4 feature tag:
 - Release experience review and beta documentation refresh work.
 - About RikkaDesk version dialog and unsigned Windows installer notes, tagged as `rikkadesk-v0.1.0-beta.5`.
 
-The current tagged feature-stable baseline is `rikkadesk-v0.1.0-beta.5`; later Phase 7 provider import/export work is not tagged yet.
+The current Phase 7 provider import/export work is planned for the `rikkadesk-v0.1.0-beta.6` tag.
 
 ## Security
 

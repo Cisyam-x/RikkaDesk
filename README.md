@@ -4,7 +4,7 @@ RikkaDesk is an unofficial desktop derivative / experiment based on RikkaHub.
 
 RikkaDesk is a non-official desktop-oriented derivative of [RikkaHub](https://github.com/rikkahub/rikkahub). It currently focuses on making the existing RikkaHub `web-ui` usable as the foundation for a local Windows desktop app.
 
-This repository is in an early staged migration. The current prototype is experimental and is being prepared as a local/private beta, not a public production release. The current feature-stable private beta tag is `rikkadesk-v0.1.0-beta.5`.
+This repository is in an early staged migration. The current prototype is experimental and is being prepared as a local/private beta, not a public production release. The current feature-stable private beta tag is `rikkadesk-v0.1.0-beta.6`.
 
 > [!IMPORTANT]
 > The upstream RikkaHub feature list later in this README describes the Android upstream project. It does not mean every upstream feature is available in the current RikkaDesk desktop beta.
