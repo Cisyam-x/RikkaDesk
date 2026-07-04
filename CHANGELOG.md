@@ -6,9 +6,25 @@ This changelog tracks the RikkaDesk desktop work in this fork. It does not repla
 
 ## 0.1.0 Private Beta Line
 
-The current feature-stable private beta tag is planned as `rikkadesk-v0.1.0-beta.6`. The `beta/0.1.0` branch may contain later documentation or feature work after that tag.
+The current feature-stable private beta tag is planned as `rikkadesk-v0.1.0-beta.8`. The `beta/0.1.0` branch may contain later documentation or feature work after that tag.
 
 This beta line is not a public GitHub Release.
+
+### `rikkadesk-v0.1.0-beta.8` - Release Copy Hotfix
+
+Changed:
+
+- Fix About / README release copy to show the current feature-stable tag.
+- No provider, schema, secret, or streaming behavior changes.
+
+### `rikkadesk-v0.1.0-beta.7` - Long Stream Timeout Hotfix
+
+Fixed:
+
+- Fix long OpenAI-compatible streaming responses timing out after about 30 seconds.
+- Run long chat streams in the background after `POST /api/conversations/{id}/messages` or `POST /api/conversations/{id}/regenerate` returns accepted.
+- Remove global Rust reqwest total timeout for streaming requests.
+- Keep Test Connection timeout separate.
 
 ### `rikkadesk-v0.1.0-beta.6` - Phase 7
 
@@ -95,15 +111,15 @@ Added:
 - Windows MSI and NSIS installer build outputs.
 - Documentation for development, provider smoke tests, Provider Settings smoke tests, beta package checks, model config, and secret storage.
 
-## Updates After `rikkadesk-v0.1.0-beta.4`
+## Historical Updates After `rikkadesk-v0.1.0-beta.4`
 
-The `beta/0.1.0` branch includes follow-up updates after the beta.4 feature tag:
+The `beta/0.1.0` branch included these follow-up updates after the beta.4 feature tag:
 
 - Provider import/export safety design.
 - Release experience review and beta documentation refresh work.
 - About RikkaDesk version dialog and unsigned Windows installer notes, tagged as `rikkadesk-v0.1.0-beta.5`.
-
-The current Phase 7 provider import/export work is planned for the `rikkadesk-v0.1.0-beta.6` tag.
+- Safe Provider import/export support, tagged as `rikkadesk-v0.1.0-beta.6`.
+- Long streaming timeout hotfix, tagged as `rikkadesk-v0.1.0-beta.7`.
 
 ## Security
 
