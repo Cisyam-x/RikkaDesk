@@ -51,7 +51,7 @@ const SECRETS_DIR_NAME: &str = "secrets";
 const SECRET_SERVICE_NAME: &str = "RikkaDesk";
 const OPENAI_COMPATIBLE_PROVIDER_TYPE: &str = "openai-compatible";
 const PROVIDER_SECRET_REF_PREFIX: &str = "rikkadesk:provider:";
-const OPENAI_CHAT_TIMEOUT_SECS: u64 = 60;
+const OPENAI_TEST_TIMEOUT_SECS: u64 = 60;
 const PROVIDER_IMPORT_EXPORT_VERSION: u32 = 1;
 const PROVIDER_IMPORT_MAX_ITEMS: usize = 50;
 const PROVIDER_IMPORT_MAX_NAME_LEN: usize = 120;
@@ -689,7 +689,6 @@ impl MockApiState {
             persistence,
             secret_store,
             http_client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(OPENAI_CHAT_TIMEOUT_SECS))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             settings: RwLock::new(persisted.settings),
@@ -1412,16 +1411,7 @@ async fn send_message(
     let assistant_message_id =
         append_empty_streaming_assistant_reply(&state, &id, &assistant_id, &model_id, now).await;
     start_generation(&state, &id).await;
-
-    let stream_result =
-        stream_openai_compatible_chat(&state, &id, &assistant_message_id, &config, messages).await;
-
-    if let Err(error) = stream_result {
-        let error_text = format!("Real provider request failed: {error}");
-        append_text_to_assistant_message(&state, &id, &assistant_message_id, &error_text).await;
-    }
-
-    finish_streaming_assistant_reply(&state, &id, &assistant_message_id).await;
+    spawn_openai_stream_generation(state.clone(), id, assistant_message_id, config, messages);
 
     Json(json!({ "status": "accepted" }))
 }
@@ -1712,16 +1702,7 @@ async fn regenerate_message(
     let assistant_message_id =
         append_empty_streaming_assistant_reply(&state, &id, &assistant_id, &model_id, now).await;
     start_generation(&state, &id).await;
-
-    let stream_result =
-        stream_openai_compatible_chat(&state, &id, &assistant_message_id, &config, messages).await;
-
-    if let Err(error) = stream_result {
-        let error_text = format!("Real provider request failed: {error}");
-        append_text_to_assistant_message(&state, &id, &assistant_message_id, &error_text).await;
-    }
-
-    finish_streaming_assistant_reply(&state, &id, &assistant_message_id).await;
+    spawn_openai_stream_generation(state.clone(), id, assistant_message_id, config, messages);
 
     Json(json!({ "status": "accepted" })).into_response()
 }
@@ -2239,6 +2220,7 @@ async fn test_openai_compatible_chat_connection(
     let response = state
         .http_client
         .post(openai_chat_completions_url(&config.base_url))
+        .timeout(Duration::from_secs(OPENAI_TEST_TIMEOUT_SECS))
         .bearer_auth(&config.api_key)
         .json(&request)
         .send()
@@ -2256,6 +2238,38 @@ async fn test_openai_compatible_chat_connection(
         .map_err(|_| "provider response was not valid JSON".to_string())?;
 
     Ok(())
+}
+
+fn spawn_openai_stream_generation(
+    state: Arc<MockApiState>,
+    conversation_id: String,
+    assistant_message_id: String,
+    config: OpenAiChatConfig,
+    messages: Vec<OpenAiChatMessage>,
+) {
+    tokio::spawn(async move {
+        let stream_result = stream_openai_compatible_chat(
+            &state,
+            &conversation_id,
+            &assistant_message_id,
+            &config,
+            messages,
+        )
+        .await;
+
+        if let Err(error) = stream_result {
+            let error_text = format!("Real provider request failed: {error}");
+            append_text_to_assistant_message(
+                &state,
+                &conversation_id,
+                &assistant_message_id,
+                &error_text,
+            )
+            .await;
+        }
+
+        finish_streaming_assistant_reply(&state, &conversation_id, &assistant_message_id).await;
+    });
 }
 
 async fn stream_openai_compatible_chat(
