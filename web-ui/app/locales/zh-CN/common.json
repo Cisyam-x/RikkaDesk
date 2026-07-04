@@ -147,7 +147,8 @@
       "openai_streaming": "OpenAI-compatible 文本流式聊天",
       "conversation_management": "会话和消息管理",
       "provider_settings": "模型服务设置",
-      "test_connection": "测试连接"
+      "test_connection": "测试连接",
+      "provider_import_export": "安全 Provider 导入/导出"
     },
     "unsupported_title": "当前不支持",
     "unsupported": {
@@ -156,8 +157,7 @@
       "search": "搜索",
       "tools": "MCP 和工具调用",
       "workspace": "Workspace",
-      "multimodal": "多模态",
-      "import_export": "Provider 导入/导出实现"
+      "multimodal": "多模态"
     },
     "docs_title": "相关文档",
     "docs_description": "可查看这些仓库文档了解私测说明、打包检查和版本记录。",

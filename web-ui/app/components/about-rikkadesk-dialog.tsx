@@ -20,6 +20,7 @@ const SUPPORT_KEYS = [
   "conversation_management",
   "provider_settings",
   "test_connection",
+  "provider_import_export",
 ] as const;
 
 const UNSUPPORTED_KEYS = [
@@ -29,7 +30,6 @@ const UNSUPPORTED_KEYS = [
   "tools",
   "workspace",
   "multimodal",
-  "import_export",
 ] as const;
 
 const DOC_PATHS = [

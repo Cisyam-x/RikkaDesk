@@ -147,7 +147,8 @@
       "openai_streaming": "OpenAI-compatible text streaming chat",
       "conversation_management": "Conversation and message management",
       "provider_settings": "Provider Settings",
-      "test_connection": "Test Connection"
+      "test_connection": "Test Connection",
+      "provider_import_export": "Safe provider import/export"
     },
     "unsupported_title": "Not supported",
     "unsupported": {
@@ -156,8 +157,7 @@
       "search": "Search",
       "tools": "MCP and tools",
       "workspace": "Workspace",
-      "multimodal": "Multimodal",
-      "import_export": "Provider import/export implementation"
+      "multimodal": "Multimodal"
     },
     "docs_title": "Related docs",
     "docs_description": "See these repository docs for private beta testing, package checks, and release history.",
