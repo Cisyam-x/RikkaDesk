@@ -14,7 +14,7 @@ use std::{
 
 use async_stream::stream;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{rejection::JsonRejection, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -52,6 +52,12 @@ const SECRET_SERVICE_NAME: &str = "RikkaDesk";
 const OPENAI_COMPATIBLE_PROVIDER_TYPE: &str = "openai-compatible";
 const PROVIDER_SECRET_REF_PREFIX: &str = "rikkadesk:provider:";
 const OPENAI_CHAT_TIMEOUT_SECS: u64 = 60;
+const PROVIDER_IMPORT_EXPORT_VERSION: u32 = 1;
+const PROVIDER_IMPORT_MAX_ITEMS: usize = 50;
+const PROVIDER_IMPORT_MAX_NAME_LEN: usize = 120;
+const PROVIDER_IMPORT_MAX_DISPLAY_NAME_LEN: usize = 160;
+const PROVIDER_IMPORT_MAX_MODEL_ID_LEN: usize = 200;
+const PROVIDER_IMPORT_MAX_BASE_URL_LEN: usize = 512;
 const MOCK_ASSISTANT_ID: &str = "mock-assistant";
 const MOCK_MODEL_ID: &str = "mock-chat";
 const MOCK_PROVIDER_ID: &str = "mock-provider";
@@ -415,6 +421,70 @@ impl DesktopProviderResponse {
     }
 }
 
+#[derive(Clone)]
+struct ValidatedProviderImportItem {
+    provider_type: String,
+    enabled: bool,
+    name: String,
+    base_url: String,
+    model_id: String,
+    display_name: String,
+    has_secret: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProviderExportItem {
+    #[serde(rename = "type")]
+    provider_type: String,
+    enabled: bool,
+    name: String,
+    base_url: String,
+    model_id: String,
+    display_name: String,
+    has_secret: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProviderExportDocument {
+    version: u32,
+    app: String,
+    exported_at: String,
+    providers: Vec<ProviderExportItem>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderImportPreviewResponse {
+    status: &'static str,
+    importable_count: usize,
+    notice: &'static str,
+    providers: Vec<ProviderExportItem>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderImportConfirmResponse {
+    status: &'static str,
+    imported_count: usize,
+    providers: Vec<ProviderImportConfirmItem>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderImportConfirmItem {
+    id: String,
+    #[serde(rename = "type")]
+    provider_type: String,
+    enabled: bool,
+    name: String,
+    base_url: String,
+    model_id: String,
+    display_name: String,
+    has_secret: bool,
+}
+
 struct OpenAiChatConfig {
     base_url: String,
     model_id: String,
@@ -663,6 +733,18 @@ pub async fn start(app_data_dir: PathBuf) -> Result<MockApiHandle, Box<dyn std::
             get(desktop_providers).post(upsert_desktop_provider),
         )
         .route(
+            "/api/desktop/providers/export",
+            get(export_desktop_providers),
+        )
+        .route(
+            "/api/desktop/providers/import/preview",
+            post(preview_desktop_provider_import),
+        )
+        .route(
+            "/api/desktop/providers/import/confirm",
+            post(confirm_desktop_provider_import),
+        )
+        .route(
             "/api/desktop/providers/{id}",
             delete(delete_desktop_provider),
         )
@@ -837,6 +919,113 @@ async fn desktop_providers(State(state): State<Arc<MockApiState>>) -> impl IntoR
         Ok(providers) => Json(providers).into_response(),
         Err(error) => internal_error_response(error),
     }
+}
+
+async fn export_desktop_providers(State(state): State<Arc<MockApiState>>) -> impl IntoResponse {
+    match provider_export_items(&state).await {
+        Ok(providers) => Json(ProviderExportDocument {
+            version: PROVIDER_IMPORT_EXPORT_VERSION,
+            app: "RikkaDesk".to_string(),
+            exported_at: now_iso(),
+            providers,
+        })
+        .into_response(),
+        Err(error) => internal_error_response(error),
+    }
+}
+
+async fn preview_desktop_provider_import(
+    payload: Result<Json<ProviderExportDocument>, JsonRejection>,
+) -> impl IntoResponse {
+    let document = match import_document_from_payload(payload) {
+        Ok(document) => document,
+        Err(response) => return response,
+    };
+    let providers = match validate_provider_import_document(&document) {
+        Ok(providers) => providers,
+        Err(response) => return response,
+    };
+    let providers = providers
+        .iter()
+        .map(provider_import_preview_item)
+        .collect::<Vec<_>>();
+
+    Json(ProviderImportPreviewResponse {
+        status: "ok",
+        importable_count: providers.len(),
+        notice: "hasSecret only indicates the source provider had a secret; imported providers will not restore API keys.",
+        providers,
+    })
+    .into_response()
+}
+
+async fn confirm_desktop_provider_import(
+    State(state): State<Arc<MockApiState>>,
+    payload: Result<Json<ProviderExportDocument>, JsonRejection>,
+) -> impl IntoResponse {
+    let document = match import_document_from_payload(payload) {
+        Ok(document) => document,
+        Err(response) => return response,
+    };
+    let providers = match validate_provider_import_document(&document) {
+        Ok(providers) => providers,
+        Err(response) => return response,
+    };
+
+    let mut imported_configs = Vec::with_capacity(providers.len());
+    let mut imported = Vec::with_capacity(providers.len());
+    for provider in providers {
+        let id = state.next_id("desktop-provider");
+        let model_record_id = state.next_id("desktop-model");
+        let config = DesktopProviderConfig {
+            secret_ref: secret_ref_for_provider(&id),
+            id: id.clone(),
+            provider_type: provider.provider_type.clone(),
+            enabled: provider.enabled,
+            name: provider.name.clone(),
+            base_url: provider.base_url.clone(),
+            model: DesktopProviderModelConfig {
+                id: model_record_id,
+                model_id: provider.model_id.clone(),
+                display_name: provider.display_name.clone(),
+            },
+        };
+
+        imported.push(ProviderImportConfirmItem {
+            id,
+            provider_type: provider.provider_type,
+            enabled: provider.enabled,
+            name: provider.name,
+            base_url: provider.base_url,
+            model_id: provider.model_id,
+            display_name: provider.display_name,
+            has_secret: false,
+        });
+        imported_configs.push(config);
+    }
+
+    if !imported_configs.is_empty() {
+        {
+            let mut providers = state.providers.write().await;
+            providers.extend(imported_configs);
+        }
+
+        {
+            let providers = state.providers.read().await;
+            let mut settings = state.settings.write().await;
+            sync_settings_with_desktop_providers(&mut settings, &providers);
+        }
+
+        persist_mock_state(&state).await;
+        broadcast_settings_update(&state).await;
+    }
+
+    Json(ProviderImportConfirmResponse {
+        status: "ok",
+        imported_count: imported.len(),
+        providers: imported,
+    })
+    .into_response()
 }
 
 async fn upsert_desktop_provider(
@@ -1628,6 +1817,158 @@ async fn desktop_provider_responses(
                 .map(|has_secret| DesktopProviderResponse::from_config(provider, has_secret))
         })
         .collect()
+}
+
+async fn provider_export_items(
+    state: &Arc<MockApiState>,
+) -> Result<Vec<ProviderExportItem>, String> {
+    let providers = state.providers.read().await.clone();
+    providers
+        .iter()
+        .map(|provider| {
+            state
+                .secret_store
+                .has_secret(&provider.secret_ref)
+                .map(|has_secret| ProviderExportItem {
+                    provider_type: provider.provider_type.clone(),
+                    enabled: provider.enabled,
+                    name: provider.name.clone(),
+                    base_url: provider.base_url.clone(),
+                    model_id: provider.model.model_id.clone(),
+                    display_name: provider.model.display_name.clone(),
+                    has_secret,
+                })
+        })
+        .collect()
+}
+
+fn import_document_from_payload(
+    payload: Result<Json<ProviderExportDocument>, JsonRejection>,
+) -> Result<ProviderExportDocument, Response> {
+    payload
+        .map(|Json(document)| document)
+        .map_err(|_| bad_request_response("Invalid provider import document"))
+}
+
+fn validate_provider_import_document(
+    document: &ProviderExportDocument,
+) -> Result<Vec<ValidatedProviderImportItem>, Response> {
+    if document.version != PROVIDER_IMPORT_EXPORT_VERSION {
+        return Err(bad_request_response(
+            "Unsupported provider import document version",
+        ));
+    }
+
+    if document.providers.len() > PROVIDER_IMPORT_MAX_ITEMS {
+        return Err(bad_request_response(
+            "Provider import document contains too many providers",
+        ));
+    }
+
+    document
+        .providers
+        .iter()
+        .enumerate()
+        .map(|(index, provider)| validate_provider_import_item(index + 1, provider))
+        .collect()
+}
+
+fn validate_provider_import_item(
+    position: usize,
+    provider: &ProviderExportItem,
+) -> Result<ValidatedProviderImportItem, Response> {
+    let provider_type = provider.provider_type.trim();
+    if provider_type != OPENAI_COMPATIBLE_PROVIDER_TYPE {
+        return Err(bad_request_response(&format!(
+            "Provider {position} type is not supported"
+        )));
+    }
+
+    let base_url = provider.base_url.trim();
+    if base_url.is_empty() {
+        return Err(bad_request_response(&format!(
+            "Provider {position} baseUrl is required"
+        )));
+    }
+    if field_is_too_long(base_url, PROVIDER_IMPORT_MAX_BASE_URL_LEN) {
+        return Err(bad_request_response(&format!(
+            "Provider {position} baseUrl is too long"
+        )));
+    }
+    if !is_supported_provider_base_url(base_url) {
+        return Err(bad_request_response(&format!(
+            "Provider {position} baseUrl must use http or https"
+        )));
+    }
+
+    let model_id = provider.model_id.trim();
+    if model_id.is_empty() {
+        return Err(bad_request_response(&format!(
+            "Provider {position} modelId is required"
+        )));
+    }
+    if field_is_too_long(model_id, PROVIDER_IMPORT_MAX_MODEL_ID_LEN) {
+        return Err(bad_request_response(&format!(
+            "Provider {position} modelId is too long"
+        )));
+    }
+
+    let name = provider.name.trim();
+    if field_is_too_long(name, PROVIDER_IMPORT_MAX_NAME_LEN) {
+        return Err(bad_request_response(&format!(
+            "Provider {position} name is too long"
+        )));
+    }
+    let name = if name.is_empty() {
+        "OpenAI Compatible"
+    } else {
+        name
+    };
+
+    let display_name = provider.display_name.trim();
+    if field_is_too_long(display_name, PROVIDER_IMPORT_MAX_DISPLAY_NAME_LEN) {
+        return Err(bad_request_response(&format!(
+            "Provider {position} displayName is too long"
+        )));
+    }
+    let display_name = if display_name.is_empty() {
+        model_id
+    } else {
+        display_name
+    };
+
+    Ok(ValidatedProviderImportItem {
+        provider_type: OPENAI_COMPATIBLE_PROVIDER_TYPE.to_string(),
+        enabled: provider.enabled,
+        name: name.to_string(),
+        base_url: base_url.to_string(),
+        model_id: model_id.to_string(),
+        display_name: display_name.to_string(),
+        has_secret: provider.has_secret,
+    })
+}
+
+fn provider_import_preview_item(provider: &ValidatedProviderImportItem) -> ProviderExportItem {
+    ProviderExportItem {
+        provider_type: provider.provider_type.clone(),
+        enabled: provider.enabled,
+        name: provider.name.clone(),
+        base_url: provider.base_url.clone(),
+        model_id: provider.model_id.clone(),
+        display_name: provider.display_name.clone(),
+        has_secret: provider.has_secret,
+    }
+}
+
+fn is_supported_provider_base_url(value: &str) -> bool {
+    match reqwest::Url::parse(value) {
+        Ok(url) => matches!(url.scheme(), "http" | "https") && url.host_str().is_some(),
+        Err(_) => false,
+    }
+}
+
+fn field_is_too_long(value: &str, max_chars: usize) -> bool {
+    value.chars().count() > max_chars
 }
 
 async fn append_assistant_reply(
@@ -2432,9 +2773,9 @@ fn sync_settings_with_desktop_providers(settings: &mut Value, providers: &[Deskt
                 .and_then(Value::as_str)
                 .is_some_and(|secret_ref| secret_ref.starts_with(PROVIDER_SECRET_REF_PREFIX))
                 && provider
-                .get("id")
-                .and_then(Value::as_str)
-                .is_none_or(|id| !providers.iter().any(|provider| provider.id == id))
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_none_or(|id| !providers.iter().any(|provider| provider.id == id))
         })
         .collect();
 
@@ -2513,8 +2854,8 @@ fn ensure_current_model_exists(settings: &mut Value) {
                 is_current.then(|| assistant.get("chatModelId").and_then(Value::as_str))?
             })
         });
-    let assistant_model_exists = assistant_model_id
-        .is_some_and(|model_id| settings_contains_model(settings, model_id));
+    let assistant_model_exists =
+        assistant_model_id.is_some_and(|model_id| settings_contains_model(settings, model_id));
 
     if !assistant_model_exists {
         if let Some(model_id) = current_model_id {
@@ -2565,8 +2906,12 @@ fn first_settings_model_id(settings: &Value) -> Option<String> {
                         .get("type")
                         .and_then(Value::as_str)
                         .is_none_or(|model_type| model_type == "CHAT");
-                    is_chat
-                        .then(|| model.get("id").and_then(Value::as_str).map(ToOwned::to_owned))?
+                    is_chat.then(|| {
+                        model
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned)
+                    })?
                 })
         })
 }
