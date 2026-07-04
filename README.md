@@ -4,7 +4,7 @@ RikkaDesk is an unofficial desktop derivative / experiment based on RikkaHub.
 
 RikkaDesk is a non-official desktop-oriented derivative of [RikkaHub](https://github.com/rikkahub/rikkahub). It currently focuses on making the existing RikkaHub `web-ui` usable as the foundation for a local Windows desktop app.
 
-This repository is in an early staged migration. The current prototype is experimental and is being prepared as a local/private beta, not a public production release. The current feature-stable private beta tag is `rikkadesk-v0.1.0-beta.6`.
+This repository is in an early staged migration. The current prototype is experimental and is being prepared as a local/private beta, not a public production release. The current feature-stable private beta tag is `rikkadesk-v0.1.0-beta.8`.
 
 > [!IMPORTANT]
 > The upstream RikkaHub feature list later in this README describes the Android upstream project. It does not mean every upstream feature is available in the current RikkaDesk desktop beta.
@@ -23,6 +23,7 @@ The current RikkaDesk beta includes a local Tauri desktop shell with a Rust desk
 - Phase 6A is complete: conversation title, pin, delete, message edit/delete, regenerate, and unsupported visible action polish are available.
 - Phase 6B P1/P2 are complete: Provider Settings supports a provider list, add/edit/delete, favorite model updates, setting the current model, and Test Connection.
 - Phase 7 P1/P2 are complete: Provider Settings can safely export and import non-sensitive provider metadata.
+- Beta 7 hotfix is complete: long OpenAI-compatible streaming responses run in the background after message send/regenerate requests return accepted, avoiding the previous 30-second POST timeout.
 
 Current limitations:
 
