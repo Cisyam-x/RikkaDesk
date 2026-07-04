@@ -44,7 +44,8 @@ const PREFERRED_ADDR: &str = "127.0.0.1:8080";
 const PERSIST_DIR_NAME: &str = "mock-api";
 const STATE_FILE_NAME: &str = "state.v1.json";
 const STATE_TMP_FILE_NAME: &str = "state.v1.json.tmp";
-const STATE_SCHEMA_VERSION: u32 = 2;
+const STATE_SCHEMA_VERSION: u32 = 3;
+const PREVIOUS_STATE_SCHEMA_VERSION: u32 = 2;
 const LEGACY_STATE_SCHEMA_VERSION: u32 = 1;
 const SECRETS_DIR_NAME: &str = "secrets";
 #[cfg(not(windows))]
@@ -338,16 +339,53 @@ struct DesktopProviderConfig {
     enabled: bool,
     name: String,
     base_url: String,
-    model: DesktopProviderModelConfig,
+    #[serde(default)]
+    models: Vec<DesktopProviderModelConfig>,
+    #[serde(default, rename = "model", skip_serializing)]
+    legacy_model: Option<DesktopProviderModelConfig>,
     secret_ref: String,
 }
 
 impl DesktopProviderConfig {
-    fn model_id_for_settings(&self) -> &str {
-        &self.model.id
+    fn normalize_models(&mut self) {
+        if self.models.is_empty() {
+            if let Some(model) = self.legacy_model.take() {
+                self.models.push(model);
+            }
+        } else {
+            self.legacy_model = None;
+        }
+    }
+
+    fn primary_model(&self) -> Option<&DesktopProviderModelConfig> {
+        self.models.first()
+    }
+
+    fn primary_model_id_for_settings(&self) -> Option<&str> {
+        self.primary_model().map(|model| model.id.as_str())
+    }
+
+    fn model_ids_for_settings(&self) -> impl Iterator<Item = &str> {
+        self.models.iter().map(|model| model.id.as_str())
     }
 
     fn to_settings_provider(&self) -> Value {
+        let models = self
+            .models
+            .iter()
+            .map(|model| {
+                json!({
+                    "id": model.id,
+                    "modelId": model.model_id,
+                    "displayName": model.display_name,
+                    "type": "CHAT",
+                    "inputModalities": ["TEXT"],
+                    "outputModalities": ["TEXT"],
+                    "abilities": []
+                })
+            })
+            .collect::<Vec<_>>();
+
         json!({
             "id": self.id,
             "type": self.provider_type,
@@ -355,17 +393,7 @@ impl DesktopProviderConfig {
             "name": self.name,
             "baseUrl": self.base_url,
             "secretRef": self.secret_ref,
-            "models": [
-                {
-                    "id": self.model.id,
-                    "modelId": self.model.model_id,
-                    "displayName": self.model.display_name,
-                    "type": "CHAT",
-                    "inputModalities": ["TEXT"],
-                    "outputModalities": ["TEXT"],
-                    "abilities": []
-                }
-            ]
+            "models": models
         })
     }
 }
@@ -402,22 +430,29 @@ struct DesktopProviderResponse {
     name: String,
     base_url: String,
     model: DesktopProviderModelConfig,
+    models: Vec<DesktopProviderModelConfig>,
     secret_ref: String,
     has_secret: bool,
 }
 
 impl DesktopProviderResponse {
-    fn from_config(config: &DesktopProviderConfig, has_secret: bool) -> Self {
-        Self {
+    fn from_config(config: &DesktopProviderConfig, has_secret: bool) -> Result<Self, String> {
+        let model = config
+            .primary_model()
+            .cloned()
+            .ok_or_else(|| "Provider has no models".to_string())?;
+
+        Ok(Self {
             id: config.id.clone(),
             provider_type: config.provider_type.clone(),
             enabled: config.enabled,
             name: config.name.clone(),
             base_url: config.base_url.clone(),
-            model: config.model.clone(),
+            model,
+            models: config.models.clone(),
             secret_ref: config.secret_ref.clone(),
             has_secret,
-        }
+        })
     }
 }
 
@@ -836,12 +871,24 @@ async fn load_persisted_state(persistence: &MockPersistence) -> PersistedMockSta
 
     match serde_json::from_slice::<PersistedMockState>(&bytes) {
         Ok(mut persisted) if persisted.schema_version == STATE_SCHEMA_VERSION => {
+            normalize_desktop_providers(&mut persisted.providers);
             sync_settings_with_desktop_providers(&mut persisted.settings, &persisted.providers);
+            ensure_current_model_exists(&mut persisted.settings);
             persisted
         }
-        Ok(persisted) if persisted.schema_version == LEGACY_STATE_SCHEMA_VERSION => {
-            let mut migrated = migrate_v1_to_v2(persisted);
+        Ok(persisted) if persisted.schema_version == PREVIOUS_STATE_SCHEMA_VERSION => {
+            let mut migrated = migrate_v2_to_v3(persisted);
             sync_settings_with_desktop_providers(&mut migrated.settings, &migrated.providers);
+            ensure_current_model_exists(&mut migrated.settings);
+            if let Err(error) = persistence.save(&migrated).await {
+                eprintln!("RikkaDesk mock API failed to save migrated state: {error}");
+            }
+            migrated
+        }
+        Ok(persisted) if persisted.schema_version == LEGACY_STATE_SCHEMA_VERSION => {
+            let mut migrated = migrate_v1_to_v3(persisted);
+            sync_settings_with_desktop_providers(&mut migrated.settings, &migrated.providers);
+            ensure_current_model_exists(&mut migrated.settings);
             if let Err(error) = persistence.save(&migrated).await {
                 eprintln!("RikkaDesk mock API failed to save migrated state: {error}");
             }
@@ -983,11 +1030,12 @@ async fn confirm_desktop_provider_import(
             enabled: provider.enabled,
             name: provider.name.clone(),
             base_url: provider.base_url.clone(),
-            model: DesktopProviderModelConfig {
+            models: vec![DesktopProviderModelConfig {
                 id: model_record_id,
                 model_id: provider.model_id.clone(),
                 display_name: provider.display_name.clone(),
-            },
+            }],
+            legacy_model: None,
         };
 
         imported.push(ProviderImportConfirmItem {
@@ -1056,7 +1104,9 @@ async fn upsert_desktop_provider(
                 let providers = state.providers.read().await;
                 let mut settings = state.settings.write().await;
                 sync_settings_with_desktop_providers(&mut settings, &providers);
-                set_current_model_in_settings(&mut settings, provider.model_id_for_settings());
+                if let Some(model_id) = provider.primary_model_id_for_settings() {
+                    set_current_model_in_settings(&mut settings, model_id);
+                }
             }
 
             persist_mock_state(&state).await;
@@ -1070,7 +1120,10 @@ async fn upsert_desktop_provider(
                 }
             };
 
-            Json(DesktopProviderResponse::from_config(&provider, has_secret)).into_response()
+            match DesktopProviderResponse::from_config(&provider, has_secret) {
+                Ok(response) => Json(response).into_response(),
+                Err(error) => internal_error_response(error),
+            }
         }
         Err(response) => response,
     }
@@ -1156,7 +1209,7 @@ async fn delete_desktop_provider(
         let providers = state.providers.read().await;
         let mut settings = state.settings.write().await;
         sync_settings_with_desktop_providers(&mut settings, &providers);
-        remove_model_from_favorites(&mut settings, &provider.model.id);
+        remove_models_from_favorites(&mut settings, provider.model_ids_for_settings());
         ensure_current_model_exists(&mut settings);
     }
 
@@ -1795,7 +1848,7 @@ async fn desktop_provider_responses(
             state
                 .secret_store
                 .has_secret(&provider.secret_ref)
-                .map(|has_secret| DesktopProviderResponse::from_config(provider, has_secret))
+                .and_then(|has_secret| DesktopProviderResponse::from_config(provider, has_secret))
         })
         .collect()
 }
@@ -1810,14 +1863,20 @@ async fn provider_export_items(
             state
                 .secret_store
                 .has_secret(&provider.secret_ref)
-                .map(|has_secret| ProviderExportItem {
-                    provider_type: provider.provider_type.clone(),
-                    enabled: provider.enabled,
-                    name: provider.name.clone(),
-                    base_url: provider.base_url.clone(),
-                    model_id: provider.model.model_id.clone(),
-                    display_name: provider.model.display_name.clone(),
-                    has_secret,
+                .and_then(|has_secret| {
+                    let model = provider
+                        .primary_model()
+                        .ok_or_else(|| "Provider has no models".to_string())?;
+
+                    Ok(ProviderExportItem {
+                        provider_type: provider.provider_type.clone(),
+                        enabled: provider.enabled,
+                        name: provider.name.clone(),
+                        base_url: provider.base_url.clone(),
+                        model_id: model.model_id.clone(),
+                        display_name: model.display_name.clone(),
+                        has_secret,
+                    })
                 })
         })
         .collect()
@@ -2124,30 +2183,36 @@ async fn resolve_openai_chat_config(
     state: &Arc<MockApiState>,
     selected_model_id: &str,
 ) -> Result<Option<OpenAiChatConfig>, String> {
-    let provider = {
+    let config = {
         let providers = state.providers.read().await;
-        providers
-            .iter()
-            .find(|provider| {
-                provider.enabled
-                    && provider.provider_type == OPENAI_COMPATIBLE_PROVIDER_TYPE
-                    && (provider.model.id == selected_model_id
-                        || provider.model.model_id == selected_model_id)
+        providers.iter().find_map(|provider| {
+            if !provider.enabled || provider.provider_type != OPENAI_COMPATIBLE_PROVIDER_TYPE {
+                return None;
+            }
+
+            provider.models.iter().find_map(|model| {
+                (model.id == selected_model_id || model.model_id == selected_model_id).then(|| {
+                    (
+                        provider.base_url.clone(),
+                        model.model_id.clone(),
+                        provider.secret_ref.clone(),
+                    )
+                })
             })
-            .cloned()
+        })
     };
 
-    let Some(provider) = provider else {
+    let Some((base_url, model_id, secret_ref)) = config else {
         return Ok(None);
     };
 
-    let base_url = provider.base_url.trim();
-    let model_id = provider.model.model_id.trim();
+    let base_url = base_url.trim();
+    let model_id = model_id.trim();
     if base_url.is_empty() || model_id.is_empty() {
         return Ok(None);
     }
 
-    let Some(api_key) = state.secret_store.get_secret(&provider.secret_ref)? else {
+    let Some(api_key) = state.secret_store.get_secret(&secret_ref)? else {
         return Ok(None);
     };
     let api_key = api_key.trim().to_string();
@@ -2183,7 +2248,10 @@ async fn resolve_openai_chat_config_for_provider(
     }
 
     let base_url = provider.base_url.trim();
-    let model_id = provider.model.model_id.trim();
+    let Some(model) = provider.primary_model() else {
+        return Ok(None);
+    };
+    let model_id = model.model_id.trim();
     if base_url.is_empty() || model_id.is_empty() {
         return Ok(None);
     }
@@ -2540,7 +2608,8 @@ async fn build_desktop_provider(
         .or_else(|| {
             existing
                 .as_ref()
-                .map(|provider| provider.model.model_id.clone())
+                .and_then(|provider| provider.primary_model())
+                .map(|model| model.model_id.clone())
         })
         .ok_or_else(|| bad_request_response("modelId is required"))?;
 
@@ -2553,13 +2622,15 @@ async fn build_desktop_provider(
         .or_else(|| {
             existing
                 .as_ref()
-                .map(|provider| provider.model.display_name.clone())
+                .and_then(|provider| provider.primary_model())
+                .map(|model| model.display_name.clone())
         })
         .unwrap_or_else(|| model_id.clone());
 
     let model_record_id = existing
         .as_ref()
-        .map(|provider| provider.model.id.clone())
+        .and_then(|provider| provider.primary_model())
+        .map(|model| model.id.clone())
         .unwrap_or_else(|| state.next_id("desktop-model"));
 
     let name = payload
@@ -2570,6 +2641,22 @@ async fn build_desktop_provider(
         .map(ToOwned::to_owned)
         .or_else(|| existing.as_ref().map(|provider| provider.name.clone()))
         .unwrap_or_else(|| "OpenAI Compatible".to_string());
+
+    let mut models = existing
+        .as_ref()
+        .map(|provider| provider.models.clone())
+        .unwrap_or_default();
+    if let Some(model) = models.first_mut() {
+        model.id = model_record_id;
+        model.model_id = model_id;
+        model.display_name = display_name;
+    } else {
+        models.push(DesktopProviderModelConfig {
+            id: model_record_id,
+            model_id,
+            display_name,
+        });
+    }
 
     let provider = DesktopProviderConfig {
         secret_ref: existing
@@ -2584,11 +2671,8 @@ async fn build_desktop_provider(
             .unwrap_or(true),
         name,
         base_url,
-        model: DesktopProviderModelConfig {
-            id: model_record_id,
-            model_id,
-            display_name,
-        },
+        models,
+        legacy_model: None,
     };
 
     let api_key = payload
@@ -2765,11 +2849,24 @@ fn default_persisted_state() -> PersistedMockState {
     }
 }
 
-fn migrate_v1_to_v2(mut persisted: PersistedMockState) -> PersistedMockState {
+fn migrate_v1_to_v3(mut persisted: PersistedMockState) -> PersistedMockState {
     persisted.schema_version = STATE_SCHEMA_VERSION;
     persisted.saved_at = now_millis();
     persisted.providers = Vec::new();
     persisted
+}
+
+fn migrate_v2_to_v3(mut persisted: PersistedMockState) -> PersistedMockState {
+    persisted.schema_version = STATE_SCHEMA_VERSION;
+    persisted.saved_at = now_millis();
+    normalize_desktop_providers(&mut persisted.providers);
+    persisted
+}
+
+fn normalize_desktop_providers(providers: &mut Vec<DesktopProviderConfig>) {
+    for provider in providers {
+        provider.normalize_models();
+    }
 }
 
 fn sync_settings_with_desktop_providers(settings: &mut Value, providers: &[DesktopProviderConfig]) {
@@ -2824,7 +2921,15 @@ fn set_current_model_in_settings(settings: &mut Value, model_id: &str) {
     }
 }
 
-fn remove_model_from_favorites(settings: &mut Value, model_id: &str) {
+fn remove_models_from_favorites<'a, I>(settings: &mut Value, model_ids: I)
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let model_ids = model_ids.into_iter().collect::<HashSet<_>>();
+    if model_ids.is_empty() {
+        return;
+    }
+
     let Some(favorite_models) = settings
         .get_mut("favoriteModels")
         .and_then(Value::as_array_mut)
@@ -2832,7 +2937,10 @@ fn remove_model_from_favorites(settings: &mut Value, model_id: &str) {
         return;
     };
 
-    favorite_models.retain(|item| item.as_str() != Some(model_id));
+    favorite_models.retain(|item| {
+        item.as_str()
+            .is_none_or(|model_id| !model_ids.contains(model_id))
+    });
 }
 
 fn ensure_current_model_exists(settings: &mut Value) {
