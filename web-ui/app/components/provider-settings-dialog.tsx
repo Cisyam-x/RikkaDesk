@@ -1,6 +1,6 @@
 import * as React from "react";
 
-import { CheckCircle2, KeyRound, Loader2, Plus, Trash2 } from "lucide-react";
+import { CheckCircle2, Download, KeyRound, Loader2, Plus, Trash2, Upload } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
@@ -22,6 +22,7 @@ import { cn } from "~/lib/utils";
 
 const DEFAULT_PROVIDER_NAME = "OpenAI Compatible";
 const PROVIDER_TYPE = "openai-compatible";
+const PROVIDER_IMPORT_MAX_FILE_BYTES = 512 * 1024;
 
 interface DesktopProviderModelConfig {
   id: string;
@@ -43,6 +44,40 @@ interface DesktopProviderResponse {
 interface DesktopProviderTestResponse {
   ok: boolean;
   error?: string;
+}
+
+interface ProviderExportItem {
+  type: typeof PROVIDER_TYPE;
+  enabled: boolean;
+  name: string;
+  baseUrl: string;
+  modelId: string;
+  displayName: string;
+  hasSecret: boolean;
+}
+
+interface ProviderExportDocument {
+  version: number;
+  app: string;
+  exportedAt: string;
+  providers: ProviderExportItem[];
+}
+
+interface ProviderImportPreviewResponse {
+  status: string;
+  importableCount: number;
+  notice: string;
+  providers: ProviderExportItem[];
+}
+
+interface ProviderImportConfirmItem extends ProviderExportItem {
+  id: string;
+}
+
+interface ProviderImportConfirmResponse {
+  status: string;
+  importedCount: number;
+  providers: ProviderImportConfirmItem[];
 }
 
 interface ProviderFormState {
@@ -100,6 +135,35 @@ function providerModelLabel(provider: DesktopProviderResponse): string {
   return displayName || provider.model.modelId;
 }
 
+function providerExportFileName(): string {
+  const now = new Date();
+  const pad = (value: number) => value.toString().padStart(2, "0");
+  const timestamp = [
+    now.getFullYear(),
+    pad(now.getMonth() + 1),
+    pad(now.getDate()),
+    "-",
+    pad(now.getHours()),
+    pad(now.getMinutes()),
+    pad(now.getSeconds()),
+  ].join("");
+  return `rikkadesk-providers-export-${timestamp}.json`;
+}
+
+function downloadJson(document: ProviderExportDocument) {
+  const blob = new Blob([JSON.stringify(document, null, 2)], {
+    type: "application/json;charset=utf-8",
+  });
+  const url = URL.createObjectURL(blob);
+  const link = window.document.createElement("a");
+  link.href = url;
+  link.download = providerExportFileName();
+  window.document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
 export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsDialogProps) {
   const { t } = useTranslation();
   const { settings, currentAssistant, currentAssistantId } = useCurrentAssistant();
@@ -112,8 +176,16 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
   const [testingConnection, setTestingConnection] = React.useState(false);
   const [deleting, setDeleting] = React.useState(false);
   const [clearingSecret, setClearingSecret] = React.useState(false);
+  const [exporting, setExporting] = React.useState(false);
+  const [importing, setImporting] = React.useState(false);
+  const [confirmingImport, setConfirmingImport] = React.useState(false);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = React.useState(false);
+  const [importPreviewOpen, setImportPreviewOpen] = React.useState(false);
+  const [importPreview, setImportPreview] = React.useState<ProviderImportPreviewResponse | null>(null);
+  const [importDocument, setImportDocument] = React.useState<ProviderExportDocument | null>(null);
+  const [importError, setImportError] = React.useState<string | null>(null);
   const [error, setError] = React.useState<string | null>(null);
+  const importInputRef = React.useRef<HTMLInputElement>(null);
 
   const isExistingProvider = React.useMemo(
     () => providers.some((provider) => provider.id === form.id),
@@ -128,7 +200,16 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
   const canTestConnection = Boolean(
     selectedProvider && form.baseUrl.trim() && form.modelId.trim() && form.hasSecret,
   );
-  const busy = loading || saving || settingCurrentModel || testingConnection || deleting || clearingSecret;
+  const busy =
+    loading
+    || saving
+    || settingCurrentModel
+    || testingConnection
+    || deleting
+    || clearingSecret
+    || exporting
+    || importing
+    || confirmingImport;
 
   const selectProvider = React.useCallback((provider: DesktopProviderResponse) => {
     setSelectedProviderId(provider.id);
@@ -309,6 +390,93 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
     }
   }, [deleting, form.id, isExistingProvider, loadProviders, t]);
 
+  const handleExportProviders = React.useCallback(async () => {
+    if (exporting) return;
+
+    setExporting(true);
+    setError(null);
+    try {
+      const document = await api.get<ProviderExportDocument>("desktop/providers/export");
+      downloadJson(document);
+      toast.success(t("provider_settings.export_success"));
+    } catch {
+      toast.error(t("provider_settings.export_failed"));
+    } finally {
+      setExporting(false);
+    }
+  }, [exporting, t]);
+
+  const handleImportClick = React.useCallback(() => {
+    if (busy) return;
+    if (importInputRef.current) {
+      importInputRef.current.value = "";
+      importInputRef.current.click();
+    }
+  }, [busy]);
+
+  const handleImportFileChange = React.useCallback(async (
+    event: React.ChangeEvent<HTMLInputElement>,
+  ) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    if (!file.name.toLowerCase().endsWith(".json")) {
+      toast.error(t("provider_settings.import_invalid_file"));
+      event.target.value = "";
+      return;
+    }
+    if (file.size > PROVIDER_IMPORT_MAX_FILE_BYTES) {
+      toast.error(t("provider_settings.import_file_too_large"));
+      event.target.value = "";
+      return;
+    }
+
+    setImporting(true);
+    setImportError(null);
+    try {
+      const text = await file.text();
+      const document = JSON.parse(text) as ProviderExportDocument;
+      const preview = await api.post<ProviderImportPreviewResponse>(
+        "desktop/providers/import/preview",
+        document,
+      );
+      setImportDocument(document);
+      setImportPreview(preview);
+      setImportPreviewOpen(true);
+    } catch {
+      toast.error(t("provider_settings.import_failed"));
+      setImportDocument(null);
+      setImportPreview(null);
+      setImportPreviewOpen(false);
+    } finally {
+      setImporting(false);
+      event.target.value = "";
+    }
+  }, [t]);
+
+  const handleConfirmImport = React.useCallback(async () => {
+    if (!importDocument || confirmingImport) return;
+
+    setConfirmingImport(true);
+    setImportError(null);
+    try {
+      const result = await api.post<ProviderImportConfirmResponse>(
+        "desktop/providers/import/confirm",
+        importDocument,
+      );
+      const firstImportedProviderId = result.providers[0]?.id ?? selectedProviderId;
+      await loadProviders(firstImportedProviderId);
+      setImportPreviewOpen(false);
+      setImportPreview(null);
+      setImportDocument(null);
+      toast.success(t("provider_settings.import_success", { count: result.importedCount }));
+    } catch (confirmError) {
+      setImportError(safeErrorMessage(confirmError, t("provider_settings.import_failed")));
+    } finally {
+      setConfirmingImport(false);
+    }
+  }, [confirmingImport, importDocument, loadProviders, selectedProviderId, t]);
+
   return (
     <>
       <Dialog open={open} onOpenChange={onOpenChange}>
@@ -332,17 +500,54 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
                     {t("provider_settings.configured_count", { count: providers.length })}
                   </div>
                 </div>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={handleAddProvider}
-                  disabled={busy}
-                >
-                  <Plus className="size-4" />
-                  {t("provider_settings.add_provider")}
-                </Button>
+                <div className="flex flex-wrap justify-end gap-1.5">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => void handleExportProviders()}
+                    disabled={busy}
+                  >
+                    {exporting ? (
+                      <Loader2 className="size-4 animate-spin" />
+                    ) : (
+                      <Download className="size-4" />
+                    )}
+                    {t("provider_settings.export_providers")}
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={handleImportClick}
+                    disabled={busy}
+                  >
+                    {importing ? (
+                      <Loader2 className="size-4 animate-spin" />
+                    ) : (
+                      <Upload className="size-4" />
+                    )}
+                    {t("provider_settings.import_providers")}
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={handleAddProvider}
+                    disabled={busy}
+                  >
+                    <Plus className="size-4" />
+                    {t("provider_settings.add_provider")}
+                  </Button>
+                </div>
               </div>
+              <input
+                ref={importInputRef}
+                type="file"
+                accept=".json,application/json"
+                className="hidden"
+                onChange={(event) => void handleImportFileChange(event)}
+              />
 
               <ScrollArea className="min-h-0 flex-1">
                 <div className="space-y-2 p-2">
@@ -577,6 +782,110 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
             >
               {deleting ? <Loader2 className="size-4 animate-spin" /> : null}
               {t("provider_settings.delete")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={importPreviewOpen}
+        onOpenChange={(nextOpen) => {
+          if (confirmingImport) return;
+          setImportPreviewOpen(nextOpen);
+          if (!nextOpen) {
+            setImportError(null);
+          }
+        }}
+      >
+        <DialogContent className="max-h-[86svh] overflow-y-auto sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>{t("provider_settings.import_preview_title")}</DialogTitle>
+            <DialogDescription>
+              {t("provider_settings.import_preview_description", {
+                count: importPreview?.importableCount ?? 0,
+              })}
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4">
+            <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-700 dark:text-amber-300">
+              {t("provider_settings.import_no_api_keys_notice")}
+            </div>
+
+            {importError && (
+              <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+                {importError}
+              </div>
+            )}
+
+            <div className="space-y-2">
+              {importPreview?.providers.map((provider, index) => (
+                <div
+                  key={`${provider.name}-${provider.baseUrl}-${provider.modelId}-${index}`}
+                  className="rounded-md border px-3 py-2"
+                >
+                  <div className="flex flex-wrap items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <div className="truncate text-sm font-medium">{provider.name}</div>
+                      <div className="mt-0.5 text-xs text-muted-foreground">
+                        {provider.type}
+                      </div>
+                    </div>
+                    <Badge variant={provider.enabled ? "secondary" : "outline"}>
+                      {provider.enabled
+                        ? t("provider_settings.import_enabled")
+                        : t("provider_settings.import_disabled")}
+                    </Badge>
+                  </div>
+                  <div className="mt-2 grid gap-1 text-xs sm:grid-cols-2">
+                    <div className="min-w-0">
+                      <span className="text-muted-foreground">
+                        {t("provider_settings.base_url")}:{" "}
+                      </span>
+                      <span className="break-all">{provider.baseUrl}</span>
+                    </div>
+                    <div className="min-w-0">
+                      <span className="text-muted-foreground">
+                        {t("provider_settings.model_id")}:{" "}
+                      </span>
+                      <span className="break-all">{provider.modelId}</span>
+                    </div>
+                    <div className="min-w-0">
+                      <span className="text-muted-foreground">
+                        {t("provider_settings.display_name")}:{" "}
+                      </span>
+                      <span className="break-all">{provider.displayName}</span>
+                    </div>
+                    <div>
+                      <span className="text-muted-foreground">
+                        {t("provider_settings.import_source_had_key")}:{" "}
+                      </span>
+                      {provider.hasSecret
+                        ? t("provider_settings.yes")
+                        : t("provider_settings.no")}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <DialogFooter className="gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setImportPreviewOpen(false)}
+              disabled={confirmingImport}
+            >
+              {t("provider_settings.import_cancel")}
+            </Button>
+            <Button
+              type="button"
+              onClick={() => void handleConfirmImport()}
+              disabled={confirmingImport || !importDocument}
+            >
+              {confirmingImport ? <Loader2 className="size-4 animate-spin" /> : null}
+              {t("provider_settings.import_confirm")}
             </Button>
           </DialogFooter>
         </DialogContent>
