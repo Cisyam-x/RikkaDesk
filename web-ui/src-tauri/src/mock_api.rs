@@ -59,6 +59,7 @@ const PROVIDER_IMPORT_MAX_NAME_LEN: usize = 120;
 const PROVIDER_IMPORT_MAX_DISPLAY_NAME_LEN: usize = 160;
 const PROVIDER_IMPORT_MAX_MODEL_ID_LEN: usize = 200;
 const PROVIDER_IMPORT_MAX_BASE_URL_LEN: usize = 512;
+const PROVIDER_MODEL_MAX_ITEMS: usize = 50;
 const MOCK_ASSISTANT_ID: &str = "mock-assistant";
 const MOCK_MODEL_ID: &str = "mock-chat";
 const MOCK_PROVIDER_ID: &str = "mock-provider";
@@ -415,9 +416,31 @@ struct UpsertDesktopProviderRequest {
     enabled: Option<bool>,
     name: Option<String>,
     base_url: Option<String>,
+    models: Option<Vec<UpsertDesktopProviderModelRequest>>,
     model_id: Option<String>,
     display_name: Option<String>,
     api_key: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpsertDesktopProviderModelRequest {
+    id: Option<String>,
+    model_id: String,
+    display_name: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TestDesktopProviderConnectionRequest {
+    model_id: Option<String>,
+}
+
+struct BuiltDesktopProvider {
+    provider: DesktopProviderConfig,
+    api_key: Option<String>,
+    removed_model_ids: Vec<String>,
+    used_models_request: bool,
 }
 
 #[derive(Serialize)]
@@ -1080,7 +1103,12 @@ async fn upsert_desktop_provider(
     Json(payload): Json<UpsertDesktopProviderRequest>,
 ) -> impl IntoResponse {
     match build_desktop_provider(&state, payload).await {
-        Ok((provider, api_key)) => {
+        Ok(BuiltDesktopProvider {
+            provider,
+            api_key,
+            removed_model_ids,
+            used_models_request,
+        }) => {
             if let Some(api_key) = api_key {
                 if let Err(error) = state
                     .secret_store
@@ -1104,9 +1132,18 @@ async fn upsert_desktop_provider(
                 let providers = state.providers.read().await;
                 let mut settings = state.settings.write().await;
                 sync_settings_with_desktop_providers(&mut settings, &providers);
-                if let Some(model_id) = provider.primary_model_id_for_settings() {
-                    set_current_model_in_settings(&mut settings, model_id);
+                if !removed_model_ids.is_empty() {
+                    remove_models_from_favorites(
+                        &mut settings,
+                        removed_model_ids.iter().map(String::as_str),
+                    );
                 }
+                if !used_models_request {
+                    if let Some(model_id) = provider.primary_model_id_for_settings() {
+                        set_current_model_in_settings(&mut settings, model_id);
+                    }
+                }
+                ensure_current_model_exists(&mut settings);
             }
 
             persist_mock_state(&state).await;
@@ -1128,7 +1165,6 @@ async fn upsert_desktop_provider(
         Err(response) => response,
     }
 }
-
 async fn update_desktop_provider_secret(
     State(state): State<Arc<MockApiState>>,
     Path(id): Path<String>,
@@ -1223,8 +1259,15 @@ async fn delete_desktop_provider(
 async fn test_desktop_provider_connection(
     State(state): State<Arc<MockApiState>>,
     Path(id): Path<String>,
+    payload: Option<Json<TestDesktopProviderConnectionRequest>>,
 ) -> impl IntoResponse {
-    match resolve_openai_chat_config_for_provider(&state, &id).await {
+    let selected_model_id = payload
+        .as_ref()
+        .and_then(|Json(payload)| payload.model_id.as_deref())
+        .map(str::trim)
+        .filter(|model_id| !model_id.is_empty());
+
+    match resolve_openai_chat_config_for_provider(&state, &id, selected_model_id).await {
         Ok(Some(config)) => match test_openai_compatible_chat_connection(&state, &config).await {
             Ok(()) => Json(json!({ "ok": true })).into_response(),
             Err(error) => Json(json!({ "ok": false, "error": error })).into_response(),
@@ -2230,6 +2273,7 @@ async fn resolve_openai_chat_config(
 async fn resolve_openai_chat_config_for_provider(
     state: &Arc<MockApiState>,
     provider_id: &str,
+    selected_model_id: Option<&str>,
 ) -> Result<Option<OpenAiChatConfig>, String> {
     let provider = {
         let providers = state.providers.read().await;
@@ -2248,8 +2292,16 @@ async fn resolve_openai_chat_config_for_provider(
     }
 
     let base_url = provider.base_url.trim();
-    let Some(model) = provider.primary_model() else {
-        return Ok(None);
+    let model = if let Some(selected_model_id) = selected_model_id {
+        provider
+            .models
+            .iter()
+            .find(|model| model.id == selected_model_id || model.model_id == selected_model_id)
+            .ok_or_else(|| "Provider model not found.".to_string())?
+    } else {
+        provider
+            .primary_model()
+            .ok_or_else(|| "Provider has no models.".to_string())?
     };
     let model_id = model.model_id.trim();
     if base_url.is_empty() || model_id.is_empty() {
@@ -2552,10 +2604,11 @@ fn trim_openai_message_history(messages: Vec<OpenAiChatMessage>) -> Vec<OpenAiCh
 async fn build_desktop_provider(
     state: &Arc<MockApiState>,
     payload: UpsertDesktopProviderRequest,
-) -> Result<(DesktopProviderConfig, Option<String>), Response> {
+) -> Result<BuiltDesktopProvider, Response> {
     let requested_type = payload
         .provider_type
-        .unwrap_or_else(|| OPENAI_COMPATIBLE_PROVIDER_TYPE.to_string());
+        .as_deref()
+        .unwrap_or(OPENAI_COMPATIBLE_PROVIDER_TYPE);
     let provider_type = requested_type.trim();
     if provider_type != OPENAI_COMPATIBLE_PROVIDER_TYPE {
         return Err(bad_request_response(
@@ -2599,40 +2652,6 @@ async fn build_desktop_provider(
         .or_else(|| existing.as_ref().map(|provider| provider.base_url.clone()))
         .ok_or_else(|| bad_request_response("baseUrl is required"))?;
 
-    let model_id = payload
-        .model_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            existing
-                .as_ref()
-                .and_then(|provider| provider.primary_model())
-                .map(|model| model.model_id.clone())
-        })
-        .ok_or_else(|| bad_request_response("modelId is required"))?;
-
-    let display_name = payload
-        .display_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            existing
-                .as_ref()
-                .and_then(|provider| provider.primary_model())
-                .map(|model| model.display_name.clone())
-        })
-        .unwrap_or_else(|| model_id.clone());
-
-    let model_record_id = existing
-        .as_ref()
-        .and_then(|provider| provider.primary_model())
-        .map(|model| model.id.clone())
-        .unwrap_or_else(|| state.next_id("desktop-model"));
-
     let name = payload
         .name
         .as_deref()
@@ -2642,21 +2661,33 @@ async fn build_desktop_provider(
         .or_else(|| existing.as_ref().map(|provider| provider.name.clone()))
         .unwrap_or_else(|| "OpenAI Compatible".to_string());
 
-    let mut models = existing
-        .as_ref()
-        .map(|provider| provider.models.clone())
-        .unwrap_or_default();
-    if let Some(model) = models.first_mut() {
-        model.id = model_record_id;
-        model.model_id = model_id;
-        model.display_name = display_name;
+    let used_models_request = payload.models.is_some();
+    let models = if let Some(models) = payload.models.as_ref() {
+        build_models_from_multi_request(state, existing.as_ref(), models)?
     } else {
-        models.push(DesktopProviderModelConfig {
-            id: model_record_id,
-            model_id,
-            display_name,
-        });
-    }
+        build_models_from_singular_request(
+            state,
+            existing.as_ref(),
+            payload.model_id.as_deref(),
+            payload.display_name.as_deref(),
+        )?
+    };
+
+    let new_model_ids = models
+        .iter()
+        .map(|model| model.id.as_str())
+        .collect::<HashSet<_>>();
+    let removed_model_ids = existing
+        .as_ref()
+        .map(|provider| {
+            provider
+                .models
+                .iter()
+                .filter(|model| !new_model_ids.contains(model.id.as_str()))
+                .map(|model| model.id.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
 
     let provider = DesktopProviderConfig {
         secret_ref: existing
@@ -2680,9 +2711,161 @@ async fn build_desktop_provider(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
 
-    Ok((provider, api_key))
+    Ok(BuiltDesktopProvider {
+        provider,
+        api_key,
+        removed_model_ids,
+        used_models_request,
+    })
 }
 
+fn build_models_from_multi_request(
+    state: &Arc<MockApiState>,
+    existing: Option<&DesktopProviderConfig>,
+    requests: &[UpsertDesktopProviderModelRequest],
+) -> Result<Vec<DesktopProviderModelConfig>, Response> {
+    if requests.is_empty() {
+        return Err(bad_request_response(
+            "models must include at least one model",
+        ));
+    }
+    if requests.len() > PROVIDER_MODEL_MAX_ITEMS {
+        return Err(bad_request_response("Provider has too many models"));
+    }
+
+    let mut seen_model_ids = HashSet::new();
+    let mut seen_record_ids = HashSet::new();
+    let mut models = Vec::with_capacity(requests.len());
+
+    for (index, request) in requests.iter().enumerate() {
+        let position = index + 1;
+        let model_id = request.model_id.trim();
+        if model_id.is_empty() {
+            return Err(bad_request_response(&format!(
+                "Provider model {position} modelId is required"
+            )));
+        }
+        if field_is_too_long(model_id, PROVIDER_IMPORT_MAX_MODEL_ID_LEN) {
+            return Err(bad_request_response(&format!(
+                "Provider model {position} modelId is too long"
+            )));
+        }
+        if !seen_model_ids.insert(model_id.to_string()) {
+            return Err(bad_request_response(&format!(
+                "Provider model {position} modelId is duplicated"
+            )));
+        }
+
+        let display_name = request
+            .display_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(model_id);
+        if field_is_too_long(display_name, PROVIDER_IMPORT_MAX_DISPLAY_NAME_LEN) {
+            return Err(bad_request_response(&format!(
+                "Provider model {position} displayName is too long"
+            )));
+        }
+
+        let record_id = request
+            .id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(|id| {
+                if is_safe_config_id(id) {
+                    Ok(id.to_string())
+                } else {
+                    Err(bad_request_response(&format!(
+                        "Provider model {position} id contains unsupported characters"
+                    )))
+                }
+            })
+            .transpose()?
+            .or_else(|| {
+                existing.and_then(|provider| {
+                    provider
+                        .models
+                        .iter()
+                        .find(|model| model.model_id == model_id)
+                        .map(|model| model.id.clone())
+                })
+            })
+            .unwrap_or_else(|| state.next_id("desktop-model"));
+
+        if !seen_record_ids.insert(record_id.clone()) {
+            return Err(bad_request_response(&format!(
+                "Provider model {position} id is duplicated"
+            )));
+        }
+
+        models.push(DesktopProviderModelConfig {
+            id: record_id,
+            model_id: model_id.to_string(),
+            display_name: display_name.to_string(),
+        });
+    }
+
+    Ok(models)
+}
+
+fn build_models_from_singular_request(
+    state: &Arc<MockApiState>,
+    existing: Option<&DesktopProviderConfig>,
+    model_id: Option<&str>,
+    display_name: Option<&str>,
+) -> Result<Vec<DesktopProviderModelConfig>, Response> {
+    let model_id = model_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            existing
+                .and_then(DesktopProviderConfig::primary_model)
+                .map(|model| model.model_id.clone())
+        })
+        .ok_or_else(|| bad_request_response("modelId is required"))?;
+    if field_is_too_long(&model_id, PROVIDER_IMPORT_MAX_MODEL_ID_LEN) {
+        return Err(bad_request_response("modelId is too long"));
+    }
+
+    let display_name = display_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            existing
+                .and_then(DesktopProviderConfig::primary_model)
+                .map(|model| model.display_name.clone())
+        })
+        .unwrap_or_else(|| model_id.clone());
+    if field_is_too_long(&display_name, PROVIDER_IMPORT_MAX_DISPLAY_NAME_LEN) {
+        return Err(bad_request_response("displayName is too long"));
+    }
+
+    let model_record_id = existing
+        .and_then(DesktopProviderConfig::primary_model)
+        .map(|model| model.id.clone())
+        .unwrap_or_else(|| state.next_id("desktop-model"));
+
+    let mut models = existing
+        .map(|provider| provider.models.clone())
+        .unwrap_or_default();
+    if let Some(model) = models.first_mut() {
+        model.id = model_record_id;
+        model.model_id = model_id;
+        model.display_name = display_name;
+    } else {
+        models.push(DesktopProviderModelConfig {
+            id: model_record_id,
+            model_id,
+            display_name,
+        });
+    }
+
+    Ok(models)
+}
 fn bad_request_response(message: &str) -> Response {
     (
         StatusCode::BAD_REQUEST,
