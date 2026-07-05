@@ -6,9 +6,22 @@ This changelog tracks the RikkaDesk desktop work in this fork. It does not repla
 
 ## 0.1.0 Private Beta Line
 
-The current feature-stable private beta tag is planned as `rikkadesk-v0.1.0-beta.8`. The `beta/0.1.0` branch may contain later documentation or feature work after that tag.
+The current feature-stable private beta tag is planned as `rikkadesk-v0.1.0-beta.9`. The `beta/0.1.0` branch may contain later documentation or feature work after that tag.
 
 This beta line is not a public GitHub Release.
+
+### `rikkadesk-v0.1.0-beta.9` - Provider Multi-Model
+
+Added:
+
+- Add multi-model Provider Settings.
+- Upgrade local provider state to `schemaVersion: 3` with `providers[].models[]`.
+- Migrate `schemaVersion: 2` providers from `model` to `models[0]`.
+- Allow one OpenAI-compatible provider to contain multiple models sharing the same Base URL and API key.
+- Allow setting current model and testing connection per model row.
+- Upgrade provider import/export to version 2 with `models[]`.
+- Keep import compatibility for version 1 provider exports.
+- Continue excluding API keys, `secretRef`, tokens, Authorization headers, DPAPI blobs, and local secret-store files from provider exports.
 
 ### `rikkadesk-v0.1.0-beta.8` - Release Copy Hotfix
 
@@ -120,6 +133,8 @@ The `beta/0.1.0` branch included these follow-up updates after the beta.4 featur
 - About RikkaDesk version dialog and unsigned Windows installer notes, tagged as `rikkadesk-v0.1.0-beta.5`.
 - Safe Provider import/export support, tagged as `rikkadesk-v0.1.0-beta.6`.
 - Long streaming timeout hotfix, tagged as `rikkadesk-v0.1.0-beta.7`.
+- Beta release copy hotfix, tagged as `rikkadesk-v0.1.0-beta.8`.
+- Provider multi-model state, UI, and import/export v2 work, planned as `rikkadesk-v0.1.0-beta.9`.
 
 ## Security
 
@@ -135,7 +150,7 @@ The `beta/0.1.0` branch included these follow-up updates after the beta.4 featur
 - Only OpenAI-compatible text chat is supported.
 - Gemini, Claude, Anthropic, Vertex, and provider-specific protocols are not implemented.
 - Files, attachments, images, audio, tools, MCP, search, Workspace, forks, and multimodal requests are not implemented.
-- One provider currently maps to one model in Provider Settings.
+- One provider can contain multiple text models, but per-model secrets, per-model Base URLs, tools, and multimodal abilities are not implemented.
 - Stop/cancel behavior is minimal and may not abort the underlying provider HTTP request immediately.
 - JSON state is a beta prototype store, not the final database architecture.
 - Windows installers are unsigned.

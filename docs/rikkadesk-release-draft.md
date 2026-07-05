@@ -1,11 +1,11 @@
-# RikkaDesk 0.1.0 Beta 4 Release Draft
+# RikkaDesk 0.1.0 Beta 9 Release Draft
 
 This document is a private release draft for RikkaDesk. Do not publish a public GitHub Release from this phase.
 
 ## Release Title Suggestion
 
 ```text
-RikkaDesk 0.1.0 Beta 4 - Private Windows Desktop Candidate
+RikkaDesk 0.1.0 Beta 9 - Private Windows Desktop Candidate
 ```
 
 ## Tag Suggestion
@@ -13,10 +13,10 @@ RikkaDesk 0.1.0 Beta 4 - Private Windows Desktop Candidate
 Current feature-stable private beta tag:
 
 ```text
-rikkadesk-v0.1.0-beta.4
+rikkadesk-v0.1.0-beta.9
 ```
 
-The `beta/0.1.0` branch currently contains additional documentation-only work after beta.4, including the Provider import/export safety design. The feature-stable installer behavior remains represented by `rikkadesk-v0.1.0-beta.4`.
+The `beta/0.1.0` branch should use this tag after Phase 8 multi-model provider testing is accepted. Do not publish a public GitHub Release from this draft.
 
 ## Version Strategy
 
@@ -28,7 +28,7 @@ Current version files:
 Recommendation:
 
 - Keep the internal package version as `0.1.0` for this private beta line.
-- Use `RikkaDesk 0.1.0 Beta 4` in release notes and private tester instructions.
+- Use `RikkaDesk 0.1.0 Beta 9` in release notes and private tester instructions.
 - Keep beta labels in Git tags and release notes unless the Windows bundler version strategy is explicitly changed later.
 - Do not publish a public prerelease until installer signing, support scope, and license obligations are reviewed.
 
@@ -58,19 +58,20 @@ This beta includes:
   - add providers
   - select and edit providers
   - delete providers and corresponding local secret blobs
-  - one model per provider
+  - multiple models per provider
 - Favorite model updates through the local settings API.
-- Set as current model from Provider Settings.
-- Test Connection for OpenAI-compatible providers using a safe non-streaming `/chat/completions` probe.
+- Set as current model from each Provider Settings model row.
+- Test Connection for a specific OpenAI-compatible model row using a safe non-streaming `/chat/completions` probe.
+- Provider state schema v3 with `providers[].models[]` and migration from schema v2 `provider.model`.
 - OpenAI-compatible text chat with streaming responses.
 - Secret reference design where JSON stores `secretRef`, not the API key.
 - Windows encrypted local secret blobs under app data.
-- Provider import/export safety design documentation. The import/export feature itself is not implemented.
+- Safe provider import/export v2 for multi-model metadata, with v1 import compatibility.
 - Windows MSI and NSIS installer artifacts.
 
 This beta is intended for local/private validation only.
 
-Tester-facing installation and feedback notes are in [rikkadesk-beta4-release-notes.md](rikkadesk-beta4-release-notes.md).
+Tester-facing installation and feedback checks are in [rikkadesk-beta-package-checklist.md](rikkadesk-beta-package-checklist.md). The beta4 private testing notes remain a historical document.
 
 ## Installation Artifacts
 
@@ -103,7 +104,7 @@ The installer is currently unsigned. Windows SmartScreen or unsigned publisher w
 - `state.v1.json` must not contain API keys, access tokens, refresh tokens, `Authorization` header values, or `x-api-key` values.
 - Provider APIs should return `hasSecret`, never the actual key.
 - Test Connection should return only safe success/failure results and must not expose API keys, Authorization headers, or full request bodies.
-- Provider import/export, when implemented later, must export non-sensitive provider config only and must not export keys or reusable local `secretRef` values.
+- Provider import/export must export non-sensitive provider config only and must not export keys, reusable local `secretRef` values, tokens, DPAPI blobs, or local secret-store files.
 - API key fields in docs or API shapes are field names only; they are not secret values.
 - When validating with a real provider, search only for a short key fragment and never paste the full key into terminal history.
 
@@ -125,8 +126,8 @@ Expected result:
 - Only OpenAI-compatible text chat is supported.
 - No Gemini, Claude, Anthropic, Vertex, or provider-specific protocols.
 - No files, attachments, images, audio, tools, MCP, search, Workspace, forks, or multimodal provider calls.
-- One provider currently maps to one model in Provider Settings.
-- Provider import/export is documented but not implemented.
+- One provider can contain multiple text models, but per-model secrets, per-model Base URLs, provider-specific protocols, tools, and multimodal abilities are not implemented.
+- Provider import/export supports non-sensitive provider metadata only; imported providers require API keys to be entered again.
 - Stop/cancel may not abort the underlying provider HTTP request immediately.
 - JSON state is a beta persistence mechanism, not a final database design.
 - Installers are unsigned.
@@ -162,10 +163,14 @@ Before sharing any private beta installer:
 - Start RikkaDesk.
 - Open Provider Settings.
 - Add, edit, and delete a provider without exposing any real key to logs or docs.
+- Add multiple model rows under one provider.
 - Confirm provider deletion removes the corresponding local secret.
 - Confirm favorite model changes work.
-- Confirm Set as current model updates the model selector.
-- Confirm Test Connection succeeds with a valid provider and fails safely with an invalid provider.
+- Confirm Set as current model updates the model selector for a specific model row.
+- Confirm Test Connection succeeds with a valid provider/model row and fails safely with an invalid provider or model.
+- Confirm provider export writes version 2 JSON with `providers[].models[]`.
+- Confirm provider import works for both version 2 multi-model exports and older version 1 single-model exports.
+- Confirm provider exports do not include API keys, `secretRef`, tokens, Authorization headers, DPAPI blobs, local secret-store files, or internal model ids.
 - Confirm `hasSecret: true` only after a local key is saved.
 - Send a text-only test message.
 - Confirm streaming text appears when a real provider is configured.
@@ -183,7 +188,7 @@ Recommended private beta flow:
 1. Develop in phase branches.
 2. Merge accepted phase PRs into `beta/0.1.0`.
 3. Create private beta tags only for feature-stable checkpoints.
-4. Keep `rikkadesk-v0.1.0-beta.4` as the current feature-stable beta tag until a later feature checkpoint is validated.
+4. Keep `rikkadesk-v0.1.0-beta.9` as the current feature-stable beta tag once Phase 8 is validated.
 5. Do not publish a public GitHub Release until signing, support scope, and license obligations are reviewed.
 
 Do not force-push `main`, `master`, or `beta/0.1.0`.

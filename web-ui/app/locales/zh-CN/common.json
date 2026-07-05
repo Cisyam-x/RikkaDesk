@@ -165,6 +165,7 @@
       "openai_streaming": "OpenAI-compatible 文本流式聊天",
       "conversation_management": "会话和消息管理",
       "provider_settings": "模型服务设置",
+      "provider_multi_model": "支持一个 Provider 配置多个模型",
       "test_connection": "测试连接",
       "provider_import_export": "安全 Provider 导入/导出"
     },

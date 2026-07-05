@@ -1,24 +1,27 @@
 # RikkaDesk Provider Settings UI Smoke Test
 
-This guide is for Phase 4B local smoke testing through the RikkaDesk desktop UI. It verifies that an OpenAI-compatible provider can be configured without manual API calls.
+This guide is for local smoke testing through the RikkaDesk desktop UI. It verifies that OpenAI-compatible providers and their model rows can be configured without manual API calls.
 
 Do not send real API keys to Codex or commit them to the repository. Real keys should be entered only by the local user in the desktop UI.
 
 ## Scope
 
-Phase 4B covers:
+Current Provider Settings covers:
 
-- Provider Settings UI for one OpenAI-compatible provider.
+- Provider Settings UI for multiple OpenAI-compatible providers.
+- Multiple model rows under one provider.
 - Non-sensitive provider configuration saved in local JSON state.
 - API key storage through the desktop secret store.
+- Per-model Set as current model and Test Connection actions.
+- Safe provider import/export v2 with v1 import compatibility.
 - Real text chat through the existing OpenAI-compatible path.
-- Streaming text response verification from Phase 3E.
+- Streaming text response verification.
 
-Phase 4B does not cover:
+This guide does not cover:
 
 - Gemini, Claude, Anthropic, Vertex, or provider-specific protocols.
 - Files, attachments, images, audio, MCP, tools, search, or forks.
-- Full provider management, release packaging, or sync across devices.
+- Release packaging or sync across devices.
 - Any change to the Android `app` module.
 
 ## Open Provider Settings
@@ -28,7 +31,7 @@ Phase 4B does not cover:
 3. Click the key-shaped `Provider Settings` button near the sidebar actions.
 4. Confirm the dialog title is `Provider Settings`.
 
-The dialog should show a `Secret status` area with either `hasSecret: true` or `hasSecret: false`.
+The dialog should show a provider list, model rows, and a secret status area with either `hasSecret: true` or `hasSecret: false`.
 
 ## Fill Provider Settings
 
@@ -40,20 +43,21 @@ Recommended fields:
 | --- | --- | --- |
 | Provider Name | `OpenAI Compatible` | Local display name only. |
 | Base URL | `https://api.openai.com/v1` | API root URL is preferred. |
-| Model ID | `gpt-4o-mini` | Use a model supported by the configured endpoint. |
-| Display Name | `gpt-4o-mini` | Optional; defaults to Model ID if blank. |
+| Model ID | `gpt-4o-mini` | Use a model supported by the configured endpoint. Add more model rows for the same provider when needed. |
+| Display Name | `gpt-4o-mini` | Optional per model; defaults to Model ID if blank. |
 | API Key | entered locally in the password field | Never echoed after save. |
 
 The backend also accepts a full chat completions endpoint, for example `https://example.test/v1/chat/completions`, but the API root form is easier to read and less error-prone.
 
 ## Save Behavior
 
-1. Fill `Base URL` and `Model ID`.
-2. Enter the API key in the password field if a secret needs to be saved or replaced.
-3. Click `Save`.
-4. Confirm the success toast appears.
-5. Confirm the API key input is cleared after saving.
-6. Confirm the dialog shows `hasSecret: true` when a key was saved.
+1. Fill `Base URL` and at least one `Model ID`.
+2. Add a second model row if the provider should expose multiple models that share the same Base URL and API key.
+3. Enter the API key in the password field if a secret needs to be saved or replaced.
+4. Click `Save`.
+5. Confirm the success toast appears.
+6. Confirm the API key input is cleared after saving.
+7. Confirm the dialog shows `hasSecret: true` when a key was saved.
 
 If the API key field is left blank, the UI saves only the non-sensitive provider configuration. Existing saved secrets are kept.
 
@@ -65,7 +69,7 @@ After saving a provider:
 
 1. Close the Provider Settings dialog.
 2. Open the model selector in the chat UI.
-3. Confirm the configured model is visible.
+3. Confirm every configured model row is visible, including multiple models from the same provider.
 4. Select the configured model if it is not already selected.
 
 The settings stream should now include the configured provider and model. If the model list does not refresh immediately, close and reopen the window once before debugging deeper.
@@ -116,8 +120,7 @@ The JSON state may include:
 - provider type
 - enabled flag
 - baseUrl
-- model id
-- displayName
+- `models[]` with model id and displayName
 - assistant chatModelId
 - secretRef
 
@@ -161,8 +164,13 @@ The UI uses these local desktop API endpoints:
 
 - `GET /api/desktop/providers`
 - `POST /api/desktop/providers`
+- `DELETE /api/desktop/providers/{id}`
+- `POST /api/desktop/providers/{id}/test`
 - `POST /api/desktop/providers/{id}/secret`
 - `DELETE /api/desktop/providers/{id}/secret`
+- `GET /api/desktop/providers/export`
+- `POST /api/desktop/providers/import/preview`
+- `POST /api/desktop/providers/import/confirm`
 
 `GET /api/desktop/providers` should return `hasSecret`, but it must never return the secret value.
 
@@ -181,28 +189,51 @@ Expected response shape:
       "modelId": "gpt-4o-mini",
       "displayName": "gpt-4o-mini"
     },
+    "models": [
+      {
+        "id": "rikkadesk-openai-compatible:gpt-4o-mini",
+        "modelId": "gpt-4o-mini",
+        "displayName": "gpt-4o-mini"
+      },
+      {
+        "id": "rikkadesk-openai-compatible:gpt-4o-mini-fast",
+        "modelId": "gpt-4o-mini-fast",
+        "displayName": "gpt-4o-mini Fast"
+      }
+    ],
     "secretRef": "rikkadesk.provider.rikkadesk-openai-compatible.api-key",
     "hasSecret": true
   }
 ]
 ```
 
+The `model` field remains for older UI compatibility and mirrors the first entry in `models[]`.
+
 ## Smoke Test Checklist
 
 - Provider Settings opens from the sidebar.
 - `Base URL` and `Model ID` validation prevents empty required fields.
+- Adding and deleting model rows works while keeping at least one model.
 - Saving provider config works without an API key.
 - Saving with an API key changes status to `hasSecret: true`.
 - API key input is cleared after save.
 - API key is not displayed after reopening the dialog.
 - `Clear API Key` changes status to `hasSecret: false`.
 - Model selector shows the configured model.
+- Model selector shows multiple models from the same provider.
+- Set as current model works from a specific model row.
+- Test Connection works from a specific model row.
+- Provider export produces version 2 JSON with `providers[].models[]`.
+- Provider import preview shows every model row.
+- Provider import confirm creates imported providers with `hasSecret: false`.
+- Version 1 provider exports can still be imported as a single model.
 - A text-only message can be sent with the configured model selected.
 - Real provider response streams into the assistant message.
 - Restart keeps provider config, chat history, and `hasSecret` state.
 - Repository search finds no plaintext key fragment.
 - App data search finds no plaintext key fragment.
 - `state.v1.json` contains only `secretRef`, not secret values.
+- Provider exports contain no API keys, `secretRef`, tokens, Authorization headers, DPAPI blobs, local secret-store files, provider IDs, or internal model IDs.
 - Error messages do not include secret values or sensitive headers.
 
 ## Troubleshooting Notes

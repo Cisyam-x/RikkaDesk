@@ -2,25 +2,26 @@
 
 Review date: 2026-07-04
 
-This document defines the safety boundary for future RikkaDesk provider configuration import/export. It is a design note only. Phase 6B P3 does not implement provider import/export, does not change Provider Settings UI, does not change the Mock API, and does not upgrade the local state schema.
+This document defines the safety boundary for RikkaDesk provider configuration import/export. Phase 7 implemented safe non-sensitive import/export, and Phase 8 upgrades the export document to version 2 so a provider can carry multiple `models[]`.
 
 ## Goals
 
 - Allow users to back up and transfer non-sensitive provider configuration.
 - Prevent API keys, tokens, or local credential blobs from entering exported files.
 - Make imported providers explicit and reviewable before they affect local settings.
-- Keep the current `state.v1.json` / `schemaVersion: 2` model unchanged until a later implementation phase needs code changes.
+- Keep provider exports non-sensitive even when local state uses `state.v1.json` with `schemaVersion: 3` and `providers[].models[]`.
+- Keep version 1 provider export imports compatible while emitting version 2 exports for multi-model providers.
 
 ## Exportable Provider Fields
 
 A safe provider export may include only non-sensitive configuration:
 
-- `id`: local provider identifier.
 - `type`: provider type, currently `openai-compatible`.
 - `name`: user-facing provider name.
 - `baseUrl`: provider base URL.
-- `modelId`: provider model identifier.
-- `displayName`: user-facing model display name.
+- `models[]`: provider model metadata.
+  - `modelId`: provider API model identifier.
+  - `displayName`: user-facing model display name.
 - `enabled`: enabled state, if present in the current provider model.
 - `hasSecret`: boolean state such as `true` or `false`, used only to tell the user whether the original provider had a saved secret.
 
@@ -28,18 +29,26 @@ Example safe export shape:
 
 ```json
 {
-  "schema": "rikkadesk.provider-export.v1",
+  "version": 2,
+  "app": "RikkaDesk",
   "exportedAt": "2026-07-04T00:00:00Z",
   "providers": [
     {
-      "id": "provider-openai-compatible-example",
       "type": "openai-compatible",
+      "enabled": true,
       "name": "Example Provider",
       "baseUrl": "https://example.invalid/v1",
-      "modelId": "example-model",
-      "displayName": "Example Model",
-      "enabled": true,
-      "hasSecret": true
+      "hasSecret": true,
+      "models": [
+        {
+          "modelId": "example-model",
+          "displayName": "Example Model"
+        },
+        {
+          "modelId": "example-reasoner",
+          "displayName": "Example Reasoner"
+        }
+      ]
     }
   ]
 }
@@ -56,6 +65,8 @@ Provider export must never include:
 - Refresh tokens.
 - Authorization header values.
 - `x-api-key` header values.
+- Local provider IDs.
+- Internal model IDs.
 - SecretStore raw values.
 - Windows DPAPI blobs.
 - macOS Keychain items.
@@ -93,17 +104,19 @@ Provider import should restore only non-sensitive configuration.
 Recommended behavior:
 
 - Show an import preview before writing anything.
-- Restore provider name, type, base URL, model ID, display name, and enabled state.
+- Restore provider name, type, base URL, model IDs, display names, and enabled state.
 - Never restore an API key or SecretStore entry from the import file.
 - After import, show `hasSecret: false` for imported providers until the user manually enters a new API key.
 - Do not automatically overwrite an existing provider.
 - Do not automatically set imported providers as the current model.
 - Do not automatically favorite imported models.
 - Do not automatically enable real provider calls if required fields are missing.
+- Accept version 1 exports by converting singular `modelId` / `displayName` into `models[0]`.
+- Accept version 2 exports by importing all safe `models[]` entries.
 
 ### ID Conflict Handling
 
-If an imported provider `id` already exists locally, the importer should offer explicit choices:
+Current import behavior generates new local provider IDs and internal model IDs, so exported IDs are not imported. If a future importer ever supports overwrite behavior, it should offer explicit choices:
 
 - `Keep both`: generate a new local ID for the imported provider.
 - `Update existing`: overwrite only non-sensitive fields after user confirmation.
@@ -117,7 +130,7 @@ Suggested generated ID format:
 provider-openai-compatible-imported-<timestamp>
 ```
 
-When generating a new provider ID, the app should also generate a new local secret reference internally after the user saves a new key. The import file should not provide that secret reference.
+When generating a new provider ID, the app also generates a new local secret reference internally. The import file must not provide that secret reference, and no secret is written until the user manually saves a new key.
 
 ## Security UX Recommendations
 
@@ -151,31 +164,25 @@ Suggested Chinese copy:
 - Import success: "Provider 设置已导入。请重新填写 API Key 后再使用真实模型。"
 - Conflict prompt: "本地已存在相同 ID 的 Provider，请选择如何处理。"
 
-## Future Implementation Order
+## Current Implementation Summary
 
-Recommended implementation sequence:
+Implemented behavior:
 
 1. Export non-sensitive JSON only.
-   - Read current provider list.
-   - Strip all secrets and local secret references.
-   - Write only the safe export fields listed in this document.
+   - `GET /api/desktop/providers/export` emits version 2 documents.
+   - Exported providers include `models[]` with `modelId` and `displayName`.
+   - Exports exclude provider IDs, internal model IDs, API keys, local secret references, tokens, and secret blobs.
 
 2. Import preview.
-   - Parse the JSON file.
-   - Validate schema and provider type.
-   - Show providers before changing local state.
-   - Show conflict choices for duplicate IDs.
+   - `POST /api/desktop/providers/import/preview` accepts version 1 and version 2 documents.
+   - Preview validates schema, provider type, Base URL protocol, required model IDs, model count, duplicate model IDs, and maximum field lengths.
+   - Preview does not write local state.
 
 3. Confirmed import.
-   - Write only non-sensitive provider config.
-   - Generate new local secret references internally.
-   - Mark imported providers as missing secrets.
-   - Ask users to enter API keys manually in Provider Settings.
-
-4. Optional export/import polish.
-   - Add localized UI copy.
-   - Add friendly validation errors.
-   - Add import summary and skipped-provider report.
+   - `POST /api/desktop/providers/import/confirm` repeats validation before writing.
+   - Confirm generates new local provider IDs, new internal model IDs, and new internal secret references.
+   - Imported providers have `hasSecret: false`.
+   - Import does not set current model, favorite models, or overwrite existing providers.
 
 RikkaDesk should not implement one-click secret export. If encrypted backup is ever considered, it must be designed as a separate threat model and should not reuse the normal provider export path.
 
@@ -183,12 +190,10 @@ RikkaDesk should not implement one-click secret export. If encrypted backup is e
 
 Phase 6B P3 does not include:
 
-- Provider import/export code.
-- Provider Settings UI changes.
-- Mock API changes.
-- SecretStore changes.
-- Schema migration.
-- Multi-model provider support.
+- Secret export.
+- Provider import overwrite.
+- Reusable `secretRef` export.
+- Provider-specific import of real API keys.
 - Provider connection testing changes.
 - Any real API key handling.
 
@@ -198,6 +203,9 @@ Before approving an import/export implementation, verify:
 
 - Export files contain no API key, token, Authorization header value, `x-api-key` value, SecretStore value, or DPAPI blob.
 - Export files do not include reusable `secretRef` values by default.
+- Export files do not include provider IDs, internal model IDs, app data paths, or local secret-store file names.
+- Version 2 exports include `providers[].models[]`.
+- Version 1 imports remain compatible and become a single model on import.
 - Imported providers require the user to manually enter API keys.
 - Import does not silently overwrite existing providers.
 - Import does not automatically favorite or select imported models.

@@ -165,6 +165,7 @@
       "openai_streaming": "OpenAI-compatible text streaming chat",
       "conversation_management": "Conversation and message management",
       "provider_settings": "Provider Settings",
+      "provider_multi_model": "Provider Settings with multiple models",
       "test_connection": "Test Connection",
       "provider_import_export": "Safe provider import/export"
     },
