@@ -4,7 +4,7 @@ RikkaDesk is an unofficial desktop derivative / experiment based on RikkaHub. Th
 
 Do not paste real API keys into documentation, commit messages, terminal transcripts, screenshots, or issue comments.
 
-Current feature-stable private beta tag: `rikkadesk-v0.1.0-beta.4`.
+Current feature-stable private beta tag: `rikkadesk-v0.1.0-beta.9`.
 
 ## Current Beta Scope
 
@@ -13,8 +13,9 @@ Included:
 - Tauri v2 Windows desktop shell.
 - Local Rust HTTP API bound to `127.0.0.1`.
 - JSON persistence for settings, conversations, messages, provider config, and id sequence.
-- Desktop Provider Settings UI for basic OpenAI-compatible provider management.
-- Provider list, add/edit/delete provider, favorite model updates, Set as current model, and Test Connection.
+- Desktop Provider Settings UI for OpenAI-compatible provider management.
+- Provider list, add/edit/delete provider, multiple models per provider, favorite model updates, Set as current model, and Test Connection.
+- Safe provider import/export v2 for multi-model provider metadata, with v1 import compatibility.
 - Secret references in JSON and encrypted local secret blobs for API keys.
 - OpenAI-compatible text chat with streaming responses.
 - Mock fallback when a real provider is not configured or cannot be used.
@@ -113,7 +114,9 @@ Important files:
 
 ## `state.v1.json`
 
-`state.v1.json` stores non-sensitive local state for the desktop prototype. The filename remains `state.v1.json` even though the JSON payload may contain `schemaVersion: 2`.
+`state.v1.json` stores non-sensitive local state for the desktop prototype. The filename remains `state.v1.json` even though the JSON payload may contain `schemaVersion: 3`.
+
+Phase 8 upgrades provider state from `provider.model` to `provider.models[]`. Old beta.8 or earlier builds should not be started against a schema v3 state file; they may treat the state as unsupported and create a corrupt backup or default state. Back up app data before testing schema migration or moving between beta builds.
 
 It may contain:
 
@@ -123,7 +126,7 @@ It may contain:
 - idSeq
 - provider id, name, type, enabled flag
 - baseUrl
-- model id and displayName
+- model ids and displayNames under `providers[].models[]`
 - assistant chatModelId
 - secretRef
 - savedAt
@@ -158,14 +161,16 @@ Do not copy these files into the repository, README, logs, screenshots, or issue
    - Model ID: a model supported by the endpoint, for example `gpt-4o-mini`
    - Display Name: optional, defaults to Model ID
    - API Key: enter locally only, never paste into documentation
-6. Click `Save`.
-7. Confirm the API Key field clears.
-8. Confirm `hasSecret: true` when a key was saved.
-9. Add a second provider.
-10. Switch between providers in the provider list and confirm the edit form updates.
-11. Edit provider name, base URL, model ID, or display name and save again.
-12. Delete a provider and confirm the app uses an in-app confirmation dialog.
-13. Confirm deleting a provider also deletes the corresponding local secret.
+6. Add a second model row under the same provider and confirm it shares the same Base URL and API Key.
+7. Click `Save`.
+8. Confirm the API Key field clears.
+9. Confirm `hasSecret: true` when a key was saved.
+10. Add a second provider.
+11. Switch between providers in the provider list and confirm the edit form updates.
+12. Edit provider name, base URL, model rows, or display names and save again.
+13. Delete a model row and confirm at least one model remains.
+14. Delete a provider and confirm the app uses an in-app confirmation dialog.
+15. Confirm deleting a provider also deletes the corresponding local secret.
 
 Leaving API Key blank should save only non-sensitive provider config. Existing saved secrets are kept.
 
@@ -174,21 +179,23 @@ Deleting a provider should remove its local secret and clear related favorite mo
 ## Test Favorite And Current Model Behavior
 
 1. Open the model selector.
-2. Confirm provider models appear after Provider Settings changes.
+2. Confirm all provider models appear after Provider Settings changes, including multiple models from the same provider.
 3. Click the favorite heart for a model.
 4. Confirm the Favorites tab updates immediately.
 5. Click the heart again and confirm the model leaves Favorites.
 6. Open Provider Settings.
 7. Select a provider.
-8. Click `Set as current model`.
-9. Confirm the chat model selector and input area reflect the selected provider model.
+8. Click `Set as current model` on a specific model row.
+9. Confirm the chat model selector and input area reflect that exact model.
 10. Confirm Set as current model does not automatically favorite the model.
+11. Delete a non-current model and confirm favorites are cleaned only for the deleted model.
+12. Delete the current model and confirm current-model fallback selects another available model without crashing.
 
 ## Test Connection
 
 1. Open Provider Settings.
-2. Select a provider with Base URL, Model ID, and `hasSecret: true`.
-3. Click `Test Connection`.
+2. Select a provider with Base URL, at least one Model ID, and `hasSecret: true`.
+3. Click `Test Connection` on a specific model row.
 4. With a valid local provider configuration, confirm a success toast appears.
 5. With an invalid Base URL, Model ID, or local key, confirm a safe failure toast appears.
 6. Confirm the failure message does not include the API key, Authorization header, `x-api-key`, full request headers, or full request body.
@@ -298,9 +305,15 @@ Checklist:
 - Confirm the API Key field clears.
 - Add, edit, and delete a second provider.
 - Confirm deleting a provider removes its local secret.
+- Add two models under one provider and confirm both appear in the model selector.
+- Delete one model and confirm current/favorite fallback behavior is safe.
 - Favorite and unfavorite a provider model from the model selector.
 - Use Set as current model from Provider Settings.
-- Run Test Connection with both a valid test endpoint and an intentionally invalid endpoint when available.
+- Run Test Connection for a specific model with both a valid test endpoint and an intentionally invalid endpoint when available.
+- Export providers and confirm the JSON is version 2 with `providers[].models[]`.
+- Import a version 2 provider export with multiple models and confirm imported providers have `hasSecret: false`.
+- Import an older version 1 provider export and confirm it imports as a single model.
+- Confirm exports exclude API keys, `secretRef`, tokens, Authorization headers, DPAPI blobs, local secret-store files, and model internal ids.
 - Send a text message.
 - Restart RikkaDesk.
 - Confirm the conversation remains.
@@ -338,7 +351,7 @@ Before sharing a local beta installer:
 - Only OpenAI-compatible text chat is supported.
 - Streaming support handles text deltas only.
 - Stop/cancel behavior is minimal and may not abort the underlying provider request immediately.
-- Provider Settings supports basic multi-provider list, add, edit, delete, favorite model, Set as current model, and Test Connection flows.
+- Provider Settings supports multi-provider list, add, edit, delete, multiple models per provider, favorite model, Set as current model, and per-model Test Connection flows.
 - API keys are not exported or synced.
 - No file attachments, images, audio, tools, MCP, search, Workspace, forks, or multimodal provider calls.
 - Local JSON state is a beta prototype store, not a final database schema.

@@ -22,8 +22,9 @@ RikkaDesk is an unofficial desktop derivative / experiment based on RikkaHub. Th
 - Phase 5B complete: prepared changelog, release draft, version strategy, and merge guidance without publishing a release.
 - Phase 6A complete: conversation and message management were added and unsupported visible UX was polished.
 - Phase 6B P1/P2 complete: Provider Settings basic management, favorite models, Set as current model, and Test Connection were added.
-- Phase 6B P3 complete: Provider import/export safety design was documented without implementing import/export.
-- Phase 6C current: release experience documentation is being aligned with the beta.4 private beta state.
+- Phase 6B P3 complete: Provider import/export safety design was documented.
+- Phase 7 complete: safe Provider import/export was implemented for non-sensitive provider metadata.
+- Phase 8 current: Provider state, APIs, and Provider Settings support multiple models per provider.
 
 ## Current Architecture
 
@@ -103,6 +104,9 @@ Desktop provider endpoints:
 - `POST /api/desktop/providers/{id}/test`
 - `POST /api/desktop/providers/{id}/secret`
 - `DELETE /api/desktop/providers/{id}/secret`
+- `GET /api/desktop/providers/export`
+- `POST /api/desktop/providers/import/preview`
+- `POST /api/desktop/providers/import/confirm`
 
 Additional settings/conversation endpoints now used by the desktop beta:
 
@@ -126,10 +130,12 @@ On Windows, local beta data lives under:
 
 Important files:
 
-- `state.v1.json`: non-sensitive settings, conversations, messages, provider config, `secretRef`, and schema metadata.
+- `state.v1.json`: non-sensitive settings, conversations, messages, provider config, `secretRef`, and schema metadata. Phase 8 uses `schemaVersion: 3` with provider models stored in `providers[].models[]`.
 - `secrets/*.bin`: encrypted local secret blobs used by the desktop secret mechanism on Windows.
 
 `state.v1.json` must not contain API keys, access tokens, refresh tokens, `Authorization` header values, `x-api-key` values, or service account private keys.
+
+Provider import/export currently uses export document version 2 for multi-model provider metadata. Version 2 exports `providers[].models[]` with non-sensitive `modelId` and `displayName` values only. Version 1 single-model provider exports are still accepted by the import preview and confirm endpoints.
 
 ## Not Implemented
 
@@ -142,7 +148,6 @@ The current prototype intentionally does not implement:
 - Tool approval execution.
 - Workspace behavior.
 - Conversation fork, branch selection, and AI title generation.
-- Provider import/export implementation.
 - Gemini, Claude, Anthropic, Vertex, or provider-specific protocols.
 - Multimodal provider requests, tool calls, or upstream feature parity.
 
@@ -202,8 +207,10 @@ Build outputs:
 - Provider Settings opens from the sidebar.
 - Saving a provider shows `hasSecret` without showing the API key.
 - Provider Settings can add, edit, delete, and test OpenAI-compatible providers.
-- Set as current model updates the model selector.
+- Provider Settings can manage multiple models under one provider.
+- Set as current model updates the model selector for a specific provider model.
 - Favorite model updates work from the model selector.
+- Provider import/export v2 round-trips multiple models without exporting secrets, and v1 imports remain compatible.
 - Sending a text message produces either a streaming OpenAI-compatible response or the mock fallback.
 - `pnpm run desktop:build` produces MSI and NSIS installers.
 
@@ -213,6 +220,6 @@ Recommended next steps:
 
 - Keep the mock fallback as a protocol safety net while hardening the real provider path.
 - Verify unsigned Windows installer behavior with local beta testers.
-- Keep `rikkadesk-v0.1.0-beta.4` as the current feature-stable private beta tag until the next validated feature checkpoint.
+- Keep `rikkadesk-v0.1.0-beta.9` as the current feature-stable private beta tag once Phase 8 is validated.
 - Decide whether a future public prerelease should use `0.1.0` or a beta label in release notes/artifact naming.
 - Keep P2/P3 features deferred until provider settings, persistence, and streaming behavior are stable.

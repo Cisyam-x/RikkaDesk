@@ -37,6 +37,7 @@ interface DesktopProviderResponse {
   name: string;
   baseUrl: string;
   model: DesktopProviderModelConfig;
+  models?: DesktopProviderModelConfig[];
   secretRef: string;
   hasSecret: boolean;
 }
@@ -46,14 +47,18 @@ interface DesktopProviderTestResponse {
   error?: string;
 }
 
+interface ProviderExportModel {
+  modelId: string;
+  displayName: string;
+}
+
 interface ProviderExportItem {
   type: typeof PROVIDER_TYPE;
   enabled: boolean;
   name: string;
   baseUrl: string;
-  modelId: string;
-  displayName: string;
   hasSecret: boolean;
+  models: ProviderExportModel[];
 }
 
 interface ProviderExportDocument {
@@ -70,8 +75,14 @@ interface ProviderImportPreviewResponse {
   providers: ProviderExportItem[];
 }
 
-interface ProviderImportConfirmItem extends ProviderExportItem {
+interface ProviderImportConfirmItem {
   id: string;
+  type: typeof PROVIDER_TYPE;
+  enabled: boolean;
+  name: string;
+  baseUrl: string;
+  hasSecret: boolean;
+  models: Array<ProviderExportModel & { id: string }>;
 }
 
 interface ProviderImportConfirmResponse {
@@ -80,12 +91,18 @@ interface ProviderImportConfirmResponse {
   providers: ProviderImportConfirmItem[];
 }
 
+interface ProviderModelFormState {
+  id?: string;
+  localId: string;
+  modelId: string;
+  displayName: string;
+}
+
 interface ProviderFormState {
   id: string;
   name: string;
   baseUrl: string;
-  modelId: string;
-  displayName: string;
+  models: ProviderModelFormState[];
   apiKey: string;
   hasSecret: boolean;
 }
@@ -99,25 +116,44 @@ function createProviderId(): string {
   return `provider-openai-compatible-${Date.now()}`;
 }
 
+function createModelLocalId(): string {
+  return `model-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function emptyModelForm(): ProviderModelFormState {
+  return {
+    localId: createModelLocalId(),
+    modelId: "",
+    displayName: "",
+  };
+}
+
 function emptyForm(id = createProviderId()): ProviderFormState {
   return {
     id,
     name: DEFAULT_PROVIDER_NAME,
     baseUrl: "",
-    modelId: "",
-    displayName: "",
+    models: [emptyModelForm()],
     apiKey: "",
     hasSecret: false,
   };
 }
 
 function formFromProvider(provider: DesktopProviderResponse): ProviderFormState {
+  const providerModels = provider.models && provider.models.length > 0
+    ? provider.models
+    : [provider.model];
+
   return {
     id: provider.id,
     name: provider.name || DEFAULT_PROVIDER_NAME,
     baseUrl: provider.baseUrl,
-    modelId: provider.model.modelId,
-    displayName: provider.model.displayName,
+    models: providerModels.map((model) => ({
+      id: model.id,
+      localId: model.id || createModelLocalId(),
+      modelId: model.modelId,
+      displayName: model.displayName || model.modelId,
+    })),
     apiKey: "",
     hasSecret: provider.hasSecret,
   };
@@ -131,8 +167,13 @@ function safeErrorMessage(error: unknown, fallback: string): string {
 }
 
 function providerModelLabel(provider: DesktopProviderResponse): string {
-  const displayName = provider.model.displayName.trim();
-  return displayName || provider.model.modelId;
+  const model = provider.models?.[0] ?? provider.model;
+  const displayName = model.displayName.trim();
+  return displayName || model.modelId;
+}
+
+function providerModelCount(provider: DesktopProviderResponse): number {
+  return provider.models?.length ?? 1;
 }
 
 function providerExportFileName(): string {
@@ -172,8 +213,8 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
   const [form, setForm] = React.useState<ProviderFormState>(() => emptyForm());
   const [loading, setLoading] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
-  const [settingCurrentModel, setSettingCurrentModel] = React.useState(false);
-  const [testingConnection, setTestingConnection] = React.useState(false);
+  const [settingCurrentModelId, setSettingCurrentModelId] = React.useState<string | null>(null);
+  const [testingModelId, setTestingModelId] = React.useState<string | null>(null);
   const [deleting, setDeleting] = React.useState(false);
   const [clearingSecret, setClearingSecret] = React.useState(false);
   const [exporting, setExporting] = React.useState(false);
@@ -196,15 +237,11 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
     [form.id, providers],
   );
   const currentModelId = currentAssistant?.chatModelId ?? settings?.chatModelId ?? null;
-  const isCurrentModel = selectedProvider?.model.id === currentModelId;
-  const canTestConnection = Boolean(
-    selectedProvider && form.baseUrl.trim() && form.modelId.trim() && form.hasSecret,
-  );
   const busy =
     loading
     || saving
-    || settingCurrentModel
-    || testingConnection
+    || settingCurrentModelId !== null
+    || testingModelId !== null
     || deleting
     || clearingSecret
     || exporting
@@ -248,7 +285,7 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
   }, [loadProviders, open]);
 
   const updateForm = React.useCallback(
-    (field: keyof ProviderFormState, value: string | boolean) => {
+    (field: Exclude<keyof ProviderFormState, "models">, value: string | boolean) => {
       setForm((current) => ({
         ...current,
         [field]: value,
@@ -256,6 +293,41 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
     },
     [],
   );
+
+  const updateModel = React.useCallback((
+    localId: string,
+    field: "modelId" | "displayName",
+    value: string,
+  ) => {
+    setForm((current) => ({
+      ...current,
+      models: current.models.map((model) =>
+        model.localId === localId ? { ...model, [field]: value } : model
+      ),
+    }));
+  }, []);
+
+  const handleAddModel = React.useCallback(() => {
+    setForm((current) => ({
+      ...current,
+      models: [...current.models, emptyModelForm()],
+    }));
+    setError(null);
+  }, []);
+
+  const handleDeleteModel = React.useCallback((localId: string) => {
+    setForm((current) => {
+      if (current.models.length <= 1) {
+        toast.error(t("provider_settings.at_least_one_model_required"));
+        return current;
+      }
+      return {
+        ...current,
+        models: current.models.filter((model) => model.localId !== localId),
+      };
+    });
+    setError(null);
+  }, [t]);
 
   const handleAddProvider = React.useCallback(() => {
     setSelectedProviderId(null);
@@ -267,17 +339,36 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
     const id = form.id.trim() || createProviderId();
     const name = form.name.trim() || DEFAULT_PROVIDER_NAME;
     const baseUrl = form.baseUrl.trim();
-    const modelId = form.modelId.trim();
-    const displayName = form.displayName.trim() || modelId;
     const apiKey = form.apiKey.trim();
 
     if (!baseUrl) {
       setError(t("provider_settings.base_url_required"));
       return;
     }
-    if (!modelId) {
-      setError(t("provider_settings.model_id_required"));
+    if (form.models.length === 0) {
+      setError(t("provider_settings.at_least_one_model_required"));
       return;
+    }
+
+    const seenModelIds = new Set<string>();
+    const models = [];
+    for (const model of form.models) {
+      const modelId = model.modelId.trim();
+      const displayName = model.displayName.trim() || modelId;
+      if (!modelId) {
+        setError(t("provider_settings.model_required"));
+        return;
+      }
+      if (seenModelIds.has(modelId)) {
+        setError(t("provider_settings.model_duplicate"));
+        return;
+      }
+      seenModelIds.add(modelId);
+      models.push({
+        id: model.id,
+        modelId,
+        displayName,
+      });
     }
 
     setSaving(true);
@@ -289,8 +380,7 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
         enabled: true,
         name,
         baseUrl,
-        modelId,
-        displayName,
+        models,
       });
 
       if (apiKey) {
@@ -327,8 +417,11 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
     }
   }, [clearingSecret, form.id, isExistingProvider, loadProviders, t]);
 
-  const handleSetCurrentModel = React.useCallback(async () => {
-    if (!selectedProvider || settingCurrentModel) return;
+  const handleSetCurrentModel = React.useCallback(async (model: ProviderModelFormState) => {
+    if (!selectedProvider || settingCurrentModelId || !model.id) {
+      if (!model.id) toast.error(t("provider_settings.save_before_set_current_model"));
+      return;
+    }
 
     const assistantId = currentAssistant?.id ?? currentAssistantId;
     if (!assistantId) {
@@ -336,30 +429,34 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
       return;
     }
 
-    setSettingCurrentModel(true);
+    setSettingCurrentModelId(model.localId);
     setError(null);
     try {
       await api.post<{ status: string }>("settings/assistant/model", {
         assistantId,
-        modelId: selectedProvider.model.id,
+        modelId: model.id,
       });
       toast.success(t("provider_settings.current_model_updated"));
     } catch (setModelError) {
       setError(safeErrorMessage(setModelError, t("provider_settings.current_model_failed")));
     } finally {
-      setSettingCurrentModel(false);
+      setSettingCurrentModelId(null);
     }
-  }, [currentAssistant?.id, currentAssistantId, selectedProvider, settingCurrentModel, t]);
+  }, [currentAssistant?.id, currentAssistantId, selectedProvider, settingCurrentModelId, t]);
 
-  const handleTestConnection = React.useCallback(async () => {
-    if (!selectedProvider || testingConnection || !canTestConnection) return;
+  const handleTestConnection = React.useCallback(async (model: ProviderModelFormState) => {
+    if (!selectedProvider || testingModelId || !model.id) {
+      if (!model.id) toast.error(t("provider_settings.save_before_test_model"));
+      return;
+    }
+    if (!form.hasSecret || !form.baseUrl.trim() || !model.modelId.trim()) return;
 
-    setTestingConnection(true);
+    setTestingModelId(model.localId);
     setError(null);
     try {
       const result = await api.post<DesktopProviderTestResponse>(
         `desktop/providers/${selectedProvider.id}/test`,
-        {},
+        { modelId: model.id },
       );
       if (result.ok) {
         toast.success(t("provider_settings.test_connection_success"));
@@ -369,9 +466,9 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
     } catch {
       toast.error(t("provider_settings.test_connection_failed"));
     } finally {
-      setTestingConnection(false);
+      setTestingModelId(null);
     }
-  }, [canTestConnection, selectedProvider, t, testingConnection]);
+  }, [form.baseUrl, form.hasSecret, selectedProvider, t, testingModelId]);
 
   const handleDeleteProvider = React.useCallback(async () => {
     if (!isExistingProvider || deleting) return;
@@ -563,6 +660,8 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
                   ) : (
                     providers.map((provider) => {
                       const selected = provider.id === selectedProviderId;
+                      const primaryModel = provider.models?.[0] ?? provider.model;
+                      const modelCount = providerModelCount(provider);
                       return (
                         <button
                           key={provider.id}
@@ -595,8 +694,13 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
                           </div>
                           <div className="mt-1 truncate text-xs">
                             {providerModelLabel(provider)}
-                            <span className="text-muted-foreground"> / {provider.model.modelId}</span>
+                            <span className="text-muted-foreground"> / {primaryModel.modelId}</span>
                           </div>
+                          {modelCount > 1 && (
+                            <div className="mt-1 text-xs text-muted-foreground">
+                              {t("provider_settings.model_count_short", { count: modelCount })}
+                            </div>
+                          )}
                         </button>
                       );
                     })
@@ -643,39 +747,150 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
                 </label>
 
                 <label className="space-y-1.5 text-sm font-medium">
-                  <span>{t("provider_settings.display_name")}</span>
+                  <span>{t("provider_settings.base_url")}</span>
                   <Input
-                    value={form.displayName}
-                    onChange={(event) => updateForm("displayName", event.target.value)}
-                    placeholder={form.modelId || "gpt-4o-mini"}
+                    value={form.baseUrl}
+                    onChange={(event) => updateForm("baseUrl", event.target.value)}
+                    placeholder="https://api.openai.com/v1"
+                    autoComplete="off"
+                    spellCheck={false}
                     disabled={busy}
                   />
                 </label>
               </div>
 
-              <label className="space-y-1.5 text-sm font-medium">
-                <span>{t("provider_settings.base_url")}</span>
-                <Input
-                  value={form.baseUrl}
-                  onChange={(event) => updateForm("baseUrl", event.target.value)}
-                  placeholder="https://api.openai.com/v1"
-                  autoComplete="off"
-                  spellCheck={false}
-                  disabled={busy}
-                />
-              </label>
+              <div className="space-y-3 rounded-md border p-3">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <div className="text-sm font-medium">
+                      {t("provider_settings.models")}
+                    </div>
+                    <div className="mt-1 text-xs text-muted-foreground">
+                      {t("provider_settings.models_description")}
+                    </div>
+                  </div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={handleAddModel}
+                    disabled={busy}
+                  >
+                    <Plus className="size-4" />
+                    {t("provider_settings.add_model")}
+                  </Button>
+                </div>
 
-              <label className="space-y-1.5 text-sm font-medium">
-                <span>{t("provider_settings.model_id")}</span>
-                <Input
-                  value={form.modelId}
-                  onChange={(event) => updateForm("modelId", event.target.value)}
-                  placeholder="gpt-4o-mini"
-                  autoComplete="off"
-                  spellCheck={false}
-                  disabled={busy}
-                />
-              </label>
+                <div className="space-y-3">
+                  {form.models.map((model, index) => {
+                    const isCurrent = Boolean(model.id && model.id === currentModelId);
+                    const isSettingThisModel = settingCurrentModelId === model.localId;
+                    const isTestingThisModel = testingModelId === model.localId;
+                    const canTestModel = Boolean(
+                      selectedProvider
+                      && form.hasSecret
+                      && form.baseUrl.trim()
+                      && model.id
+                      && model.modelId.trim(),
+                    );
+
+                    return (
+                      <div
+                        key={model.localId}
+                        className="rounded-md border bg-muted/20 p-3"
+                      >
+                        <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                          <div className="flex items-center gap-2">
+                            <div className="text-sm font-medium">
+                              {t("provider_settings.model_row_title", { index: index + 1 })}
+                            </div>
+                            {!model.id && (
+                              <Badge variant="outline">
+                                {t("provider_settings.unsaved_model")}
+                              </Badge>
+                            )}
+                            {isCurrent && (
+                              <Badge variant="secondary">
+                                {t("provider_settings.current_model")}
+                              </Badge>
+                            )}
+                          </div>
+                        </div>
+
+                        <div className="grid gap-3 sm:grid-cols-2">
+                          <label className="space-y-1.5 text-sm font-medium">
+                            <span>{t("provider_settings.model_id")}</span>
+                            <Input
+                              value={model.modelId}
+                              onChange={(event) =>
+                                updateModel(model.localId, "modelId", event.target.value)}
+                              placeholder="gpt-4o-mini"
+                              autoComplete="off"
+                              spellCheck={false}
+                              disabled={busy}
+                            />
+                          </label>
+
+                          <label className="space-y-1.5 text-sm font-medium">
+                            <span>{t("provider_settings.display_name")}</span>
+                            <Input
+                              value={model.displayName}
+                              onChange={(event) =>
+                                updateModel(model.localId, "displayName", event.target.value)}
+                              placeholder={model.modelId || "gpt-4o-mini"}
+                              disabled={busy}
+                            />
+                          </label>
+                        </div>
+
+                        <div className="mt-3 flex flex-wrap gap-2">
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            className="whitespace-nowrap"
+                            onClick={() => void handleSetCurrentModel(model)}
+                            disabled={busy || !selectedProvider || !model.id || isCurrent}
+                            title={!model.id
+                              ? t("provider_settings.save_before_set_current_model")
+                              : undefined}
+                          >
+                            {isSettingThisModel ? <Loader2 className="size-4 animate-spin" /> : null}
+                            {isCurrent
+                              ? t("provider_settings.current_model")
+                              : t("provider_settings.set_current_model")}
+                          </Button>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            className="whitespace-nowrap"
+                            onClick={() => void handleTestConnection(model)}
+                            disabled={busy || !canTestModel}
+                            title={!model.id
+                              ? t("provider_settings.save_before_test_model")
+                              : undefined}
+                          >
+                            {isTestingThisModel ? <Loader2 className="size-4 animate-spin" /> : null}
+                            {t("provider_settings.test_model")}
+                          </Button>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            className="whitespace-nowrap"
+                            onClick={() => handleDeleteModel(model.localId)}
+                            disabled={busy}
+                          >
+                            <Trash2 className="size-4" />
+                            {t("provider_settings.delete_model")}
+                          </Button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
 
               <label className="space-y-1.5 text-sm font-medium">
                 <span>{t("provider_settings.api_key")}</span>
@@ -694,28 +909,6 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
 
               <DialogFooter className="mt-5 flex flex-col gap-3 border-t pt-4 sm:flex-row sm:items-center sm:justify-between">
                 <div className="flex flex-col gap-2.5 sm:flex-row sm:flex-wrap">
-                  <Button
-                    type="button"
-                    variant="outline"
-                    className="whitespace-nowrap"
-                    onClick={() => void handleSetCurrentModel()}
-                    disabled={busy || !selectedProvider || isCurrentModel}
-                  >
-                    {settingCurrentModel ? <Loader2 className="size-4 animate-spin" /> : null}
-                    {isCurrentModel
-                      ? t("provider_settings.current_model")
-                      : t("provider_settings.set_current_model")}
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    className="whitespace-nowrap"
-                    onClick={() => void handleTestConnection()}
-                    disabled={busy || !canTestConnection}
-                  >
-                    {testingConnection ? <Loader2 className="size-4 animate-spin" /> : null}
-                    {t("provider_settings.test_connection")}
-                  </Button>
                   <Button
                     type="button"
                     variant="outline"
@@ -821,7 +1014,7 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
             <div className="space-y-2">
               {importPreview?.providers.map((provider, index) => (
                 <div
-                  key={`${provider.name}-${provider.baseUrl}-${provider.modelId}-${index}`}
+                  key={`${provider.name}-${provider.baseUrl}-${index}`}
                   className="rounded-md border px-3 py-2"
                 >
                   <div className="flex flex-wrap items-start justify-between gap-2">
@@ -846,15 +1039,9 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
                     </div>
                     <div className="min-w-0">
                       <span className="text-muted-foreground">
-                        {t("provider_settings.model_id")}:{" "}
+                        {t("provider_settings.import_model_count")}:{" "}
                       </span>
-                      <span className="break-all">{provider.modelId}</span>
-                    </div>
-                    <div className="min-w-0">
-                      <span className="text-muted-foreground">
-                        {t("provider_settings.display_name")}:{" "}
-                      </span>
-                      <span className="break-all">{provider.displayName}</span>
+                      {t("provider_settings.model_count", { count: provider.models.length })}
                     </div>
                     <div>
                       <span className="text-muted-foreground">
@@ -864,6 +1051,30 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
                         ? t("provider_settings.yes")
                         : t("provider_settings.no")}
                     </div>
+                  </div>
+                  <div className="mt-3 space-y-1.5">
+                    <div className="text-xs font-medium text-muted-foreground">
+                      {t("provider_settings.import_models")}
+                    </div>
+                    {provider.models.map((model, modelIndex) => (
+                      <div
+                        key={`${model.modelId}-${modelIndex}`}
+                        className="grid gap-1 rounded-md bg-muted/40 px-2 py-1.5 text-xs sm:grid-cols-2"
+                      >
+                        <div className="min-w-0">
+                          <span className="text-muted-foreground">
+                            {t("provider_settings.model_id")}:{" "}
+                          </span>
+                          <span className="break-all">{model.modelId}</span>
+                        </div>
+                        <div className="min-w-0">
+                          <span className="text-muted-foreground">
+                            {t("provider_settings.display_name")}:{" "}
+                          </span>
+                          <span className="break-all">{model.displayName}</span>
+                        </div>
+                      </div>
+                    ))}
                   </div>
                 </div>
               ))}
