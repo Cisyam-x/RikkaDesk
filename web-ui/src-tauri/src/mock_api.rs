@@ -53,7 +53,8 @@ const SECRET_SERVICE_NAME: &str = "RikkaDesk";
 const OPENAI_COMPATIBLE_PROVIDER_TYPE: &str = "openai-compatible";
 const PROVIDER_SECRET_REF_PREFIX: &str = "rikkadesk:provider:";
 const OPENAI_TEST_TIMEOUT_SECS: u64 = 60;
-const PROVIDER_IMPORT_EXPORT_VERSION: u32 = 1;
+const PROVIDER_IMPORT_EXPORT_VERSION: u32 = 2;
+const LEGACY_PROVIDER_IMPORT_EXPORT_VERSION: u32 = 1;
 const PROVIDER_IMPORT_MAX_ITEMS: usize = 50;
 const PROVIDER_IMPORT_MAX_NAME_LEN: usize = 120;
 const PROVIDER_IMPORT_MAX_DISPLAY_NAME_LEN: usize = 160;
@@ -485,9 +486,21 @@ struct ValidatedProviderImportItem {
     enabled: bool,
     name: String,
     base_url: String,
+    models: Vec<ValidatedProviderImportModel>,
+    has_secret: bool,
+}
+
+#[derive(Clone)]
+struct ValidatedProviderImportModel {
     model_id: String,
     display_name: String,
-    has_secret: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProviderExportModel {
+    model_id: String,
+    display_name: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -498,14 +511,46 @@ struct ProviderExportItem {
     enabled: bool,
     name: String,
     base_url: String,
+    has_secret: bool,
+    models: Vec<ProviderExportModel>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProviderExportItemV1 {
+    #[serde(rename = "type")]
+    provider_type: String,
+    enabled: bool,
+    name: String,
+    base_url: String,
     model_id: String,
     display_name: String,
     has_secret: bool,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ProviderExportDocument {
+    version: u32,
+    app: String,
+    exported_at: String,
+    providers: Vec<ProviderExportItem>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[allow(dead_code)]
+struct ProviderExportDocumentV1 {
+    version: u32,
+    app: String,
+    exported_at: String,
+    providers: Vec<ProviderExportItemV1>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[allow(dead_code)]
+struct ProviderExportDocumentV2 {
     version: u32,
     app: String,
     exported_at: String,
@@ -538,9 +583,16 @@ struct ProviderImportConfirmItem {
     enabled: bool,
     name: String,
     base_url: String,
+    has_secret: bool,
+    models: Vec<ProviderImportConfirmModel>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderImportConfirmModel {
+    id: String,
     model_id: String,
     display_name: String,
-    has_secret: bool,
 }
 
 struct OpenAiChatConfig {
@@ -1004,7 +1056,7 @@ async fn export_desktop_providers(State(state): State<Arc<MockApiState>>) -> imp
 }
 
 async fn preview_desktop_provider_import(
-    payload: Result<Json<ProviderExportDocument>, JsonRejection>,
+    payload: Result<Json<Value>, JsonRejection>,
 ) -> impl IntoResponse {
     let document = match import_document_from_payload(payload) {
         Ok(document) => document,
@@ -1030,7 +1082,7 @@ async fn preview_desktop_provider_import(
 
 async fn confirm_desktop_provider_import(
     State(state): State<Arc<MockApiState>>,
-    payload: Result<Json<ProviderExportDocument>, JsonRejection>,
+    payload: Result<Json<Value>, JsonRejection>,
 ) -> impl IntoResponse {
     let document = match import_document_from_payload(payload) {
         Ok(document) => document,
@@ -1045,7 +1097,23 @@ async fn confirm_desktop_provider_import(
     let mut imported = Vec::with_capacity(providers.len());
     for provider in providers {
         let id = state.next_id("desktop-provider");
-        let model_record_id = state.next_id("desktop-model");
+        let models = provider
+            .models
+            .iter()
+            .map(|model| DesktopProviderModelConfig {
+                id: state.next_id("desktop-model"),
+                model_id: model.model_id.clone(),
+                display_name: model.display_name.clone(),
+            })
+            .collect::<Vec<_>>();
+        let imported_models = models
+            .iter()
+            .map(|model| ProviderImportConfirmModel {
+                id: model.id.clone(),
+                model_id: model.model_id.clone(),
+                display_name: model.display_name.clone(),
+            })
+            .collect::<Vec<_>>();
         let config = DesktopProviderConfig {
             secret_ref: secret_ref_for_provider(&id),
             id: id.clone(),
@@ -1053,11 +1121,7 @@ async fn confirm_desktop_provider_import(
             enabled: provider.enabled,
             name: provider.name.clone(),
             base_url: provider.base_url.clone(),
-            models: vec![DesktopProviderModelConfig {
-                id: model_record_id,
-                model_id: provider.model_id.clone(),
-                display_name: provider.display_name.clone(),
-            }],
+            models,
             legacy_model: None,
         };
 
@@ -1067,9 +1131,8 @@ async fn confirm_desktop_provider_import(
             enabled: provider.enabled,
             name: provider.name,
             base_url: provider.base_url,
-            model_id: provider.model_id,
-            display_name: provider.display_name,
             has_secret: false,
+            models: imported_models,
         });
         imported_configs.push(config);
     }
@@ -1907,18 +1970,24 @@ async fn provider_export_items(
                 .secret_store
                 .has_secret(&provider.secret_ref)
                 .and_then(|has_secret| {
-                    let model = provider
-                        .primary_model()
-                        .ok_or_else(|| "Provider has no models".to_string())?;
+                    if provider.models.is_empty() {
+                        return Err("Provider has no models".to_string());
+                    }
 
                     Ok(ProviderExportItem {
                         provider_type: provider.provider_type.clone(),
                         enabled: provider.enabled,
                         name: provider.name.clone(),
                         base_url: provider.base_url.clone(),
-                        model_id: model.model_id.clone(),
-                        display_name: model.display_name.clone(),
                         has_secret,
+                        models: provider
+                            .models
+                            .iter()
+                            .map(|model| ProviderExportModel {
+                                model_id: model.model_id.clone(),
+                                display_name: model.display_name.clone(),
+                            })
+                            .collect(),
                     })
                 })
         })
@@ -1926,15 +1995,59 @@ async fn provider_export_items(
 }
 
 fn import_document_from_payload(
-    payload: Result<Json<ProviderExportDocument>, JsonRejection>,
-) -> Result<ProviderExportDocument, Response> {
+    payload: Result<Json<Value>, JsonRejection>,
+) -> Result<Value, Response> {
     payload
         .map(|Json(document)| document)
         .map_err(|_| bad_request_response("Invalid provider import document"))
 }
 
 fn validate_provider_import_document(
-    document: &ProviderExportDocument,
+    document: &Value,
+) -> Result<Vec<ValidatedProviderImportItem>, Response> {
+    let version = document
+        .get("version")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| bad_request_response("Provider import document version is required"))?;
+
+    match version as u32 {
+        LEGACY_PROVIDER_IMPORT_EXPORT_VERSION => {
+            let document = serde_json::from_value::<ProviderExportDocumentV1>(document.clone())
+                .map_err(|_| bad_request_response("Invalid provider import document"))?;
+            validate_provider_import_document_v1(&document)
+        }
+        PROVIDER_IMPORT_EXPORT_VERSION => {
+            let document = serde_json::from_value::<ProviderExportDocumentV2>(document.clone())
+                .map_err(|_| bad_request_response("Invalid provider import document"))?;
+            validate_provider_import_document_v2(&document)
+        }
+        _ => Err(bad_request_response(
+            "Unsupported provider import document version",
+        )),
+    }
+}
+
+fn validate_provider_import_document_v1(
+    document: &ProviderExportDocumentV1,
+) -> Result<Vec<ValidatedProviderImportItem>, Response> {
+    if document.version != LEGACY_PROVIDER_IMPORT_EXPORT_VERSION {
+        return Err(bad_request_response(
+            "Unsupported provider import document version",
+        ));
+    }
+
+    validate_provider_import_count(document.providers.len())?;
+
+    document
+        .providers
+        .iter()
+        .enumerate()
+        .map(|(index, provider)| validate_provider_import_item_v1(index + 1, provider))
+        .collect()
+}
+
+fn validate_provider_import_document_v2(
+    document: &ProviderExportDocumentV2,
 ) -> Result<Vec<ValidatedProviderImportItem>, Response> {
     if document.version != PROVIDER_IMPORT_EXPORT_VERSION {
         return Err(bad_request_response(
@@ -1942,32 +2055,76 @@ fn validate_provider_import_document(
         ));
     }
 
-    if document.providers.len() > PROVIDER_IMPORT_MAX_ITEMS {
-        return Err(bad_request_response(
-            "Provider import document contains too many providers",
-        ));
-    }
+    validate_provider_import_count(document.providers.len())?;
 
     document
         .providers
         .iter()
         .enumerate()
-        .map(|(index, provider)| validate_provider_import_item(index + 1, provider))
+        .map(|(index, provider)| validate_provider_import_item_v2(index + 1, provider))
         .collect()
+}
+
+fn validate_provider_import_count(count: usize) -> Result<(), Response> {
+    if count > PROVIDER_IMPORT_MAX_ITEMS {
+        return Err(bad_request_response(
+            "Provider import document contains too many providers",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_provider_import_item_v1(
+    position: usize,
+    provider: &ProviderExportItemV1,
+) -> Result<ValidatedProviderImportItem, Response> {
+    let models = vec![ProviderExportModel {
+        model_id: provider.model_id.clone(),
+        display_name: provider.display_name.clone(),
+    }];
+    validate_provider_import_item(
+        position,
+        &provider.provider_type,
+        provider.enabled,
+        &provider.name,
+        &provider.base_url,
+        provider.has_secret,
+        &models,
+    )
+}
+
+fn validate_provider_import_item_v2(
+    position: usize,
+    provider: &ProviderExportItem,
+) -> Result<ValidatedProviderImportItem, Response> {
+    validate_provider_import_item(
+        position,
+        &provider.provider_type,
+        provider.enabled,
+        &provider.name,
+        &provider.base_url,
+        provider.has_secret,
+        &provider.models,
+    )
 }
 
 fn validate_provider_import_item(
     position: usize,
-    provider: &ProviderExportItem,
+    provider_type: &str,
+    enabled: bool,
+    name: &str,
+    base_url: &str,
+    has_secret: bool,
+    models: &[ProviderExportModel],
 ) -> Result<ValidatedProviderImportItem, Response> {
-    let provider_type = provider.provider_type.trim();
+    let provider_type = provider_type.trim();
     if provider_type != OPENAI_COMPATIBLE_PROVIDER_TYPE {
         return Err(bad_request_response(&format!(
             "Provider {position} type is not supported"
         )));
     }
 
-    let base_url = provider.base_url.trim();
+    let base_url = base_url.trim();
     if base_url.is_empty() {
         return Err(bad_request_response(&format!(
             "Provider {position} baseUrl is required"
@@ -1984,19 +2141,7 @@ fn validate_provider_import_item(
         )));
     }
 
-    let model_id = provider.model_id.trim();
-    if model_id.is_empty() {
-        return Err(bad_request_response(&format!(
-            "Provider {position} modelId is required"
-        )));
-    }
-    if field_is_too_long(model_id, PROVIDER_IMPORT_MAX_MODEL_ID_LEN) {
-        return Err(bad_request_response(&format!(
-            "Provider {position} modelId is too long"
-        )));
-    }
-
-    let name = provider.name.trim();
+    let name = name.trim();
     if field_is_too_long(name, PROVIDER_IMPORT_MAX_NAME_LEN) {
         return Err(bad_request_response(&format!(
             "Provider {position} name is too long"
@@ -2008,27 +2153,73 @@ fn validate_provider_import_item(
         name
     };
 
-    let display_name = provider.display_name.trim();
-    if field_is_too_long(display_name, PROVIDER_IMPORT_MAX_DISPLAY_NAME_LEN) {
-        return Err(bad_request_response(&format!(
-            "Provider {position} displayName is too long"
-        )));
-    }
-    let display_name = if display_name.is_empty() {
-        model_id
-    } else {
-        display_name
-    };
+    let models = validate_provider_import_models(position, models)?;
 
     Ok(ValidatedProviderImportItem {
         provider_type: OPENAI_COMPATIBLE_PROVIDER_TYPE.to_string(),
-        enabled: provider.enabled,
+        enabled,
         name: name.to_string(),
         base_url: base_url.to_string(),
-        model_id: model_id.to_string(),
-        display_name: display_name.to_string(),
-        has_secret: provider.has_secret,
+        models,
+        has_secret,
     })
+}
+
+fn validate_provider_import_models(
+    provider_position: usize,
+    models: &[ProviderExportModel],
+) -> Result<Vec<ValidatedProviderImportModel>, Response> {
+    if models.is_empty() {
+        return Err(bad_request_response(&format!(
+            "Provider {provider_position} must include at least one model"
+        )));
+    }
+    if models.len() > PROVIDER_MODEL_MAX_ITEMS {
+        return Err(bad_request_response(&format!(
+            "Provider {provider_position} contains too many models"
+        )));
+    }
+
+    let mut seen_model_ids = HashSet::new();
+    let mut validated = Vec::with_capacity(models.len());
+    for (index, model) in models.iter().enumerate() {
+        let model_position = index + 1;
+        let model_id = model.model_id.trim();
+        if model_id.is_empty() {
+            return Err(bad_request_response(&format!(
+                "Provider {provider_position} model {model_position} modelId is required"
+            )));
+        }
+        if field_is_too_long(model_id, PROVIDER_IMPORT_MAX_MODEL_ID_LEN) {
+            return Err(bad_request_response(&format!(
+                "Provider {provider_position} model {model_position} modelId is too long"
+            )));
+        }
+        if !seen_model_ids.insert(model_id.to_string()) {
+            return Err(bad_request_response(&format!(
+                "Provider {provider_position} model {model_position} modelId is duplicated"
+            )));
+        }
+
+        let display_name = model.display_name.trim();
+        if field_is_too_long(display_name, PROVIDER_IMPORT_MAX_DISPLAY_NAME_LEN) {
+            return Err(bad_request_response(&format!(
+                "Provider {provider_position} model {model_position} displayName is too long"
+            )));
+        }
+        let display_name = if display_name.is_empty() {
+            model_id
+        } else {
+            display_name
+        };
+
+        validated.push(ValidatedProviderImportModel {
+            model_id: model_id.to_string(),
+            display_name: display_name.to_string(),
+        });
+    }
+
+    Ok(validated)
 }
 
 fn provider_import_preview_item(provider: &ValidatedProviderImportItem) -> ProviderExportItem {
@@ -2037,9 +2228,15 @@ fn provider_import_preview_item(provider: &ValidatedProviderImportItem) -> Provi
         enabled: provider.enabled,
         name: provider.name.clone(),
         base_url: provider.base_url.clone(),
-        model_id: provider.model_id.clone(),
-        display_name: provider.display_name.clone(),
         has_secret: provider.has_secret,
+        models: provider
+            .models
+            .iter()
+            .map(|model| ProviderExportModel {
+                model_id: model.model_id.clone(),
+                display_name: model.display_name.clone(),
+            })
+            .collect(),
     }
 }
 

@@ -103,6 +103,8 @@
     "import_invalid_file": "Please choose a JSON provider export file.",
     "import_no_api_keys_notice": "API keys are not included and must be re-entered after import. hasSecret only means the source provider had a key; it will not be restored.",
     "import_source_had_key": "Source had key",
+    "import_model_count": "Models",
+    "import_models": "Models to import",
     "import_enabled": "Enabled",
     "import_disabled": "Disabled",
     "yes": "yes",

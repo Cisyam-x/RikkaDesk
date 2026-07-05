@@ -103,6 +103,8 @@
     "import_invalid_file": "请选择 JSON 格式的 Provider 导出文件。",
     "import_no_api_keys_notice": "导入文件不包含 API Key，导入后需要重新填写。hasSecret 只表示来源环境曾保存密钥，不会恢复 API Key。",
     "import_source_had_key": "来源有密钥",
+    "import_model_count": "模型数量",
+    "import_models": "将导入的模型",
     "import_enabled": "已启用",
     "import_disabled": "已停用",
     "yes": "是",

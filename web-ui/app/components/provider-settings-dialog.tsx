@@ -47,14 +47,18 @@ interface DesktopProviderTestResponse {
   error?: string;
 }
 
+interface ProviderExportModel {
+  modelId: string;
+  displayName: string;
+}
+
 interface ProviderExportItem {
   type: typeof PROVIDER_TYPE;
   enabled: boolean;
   name: string;
   baseUrl: string;
-  modelId: string;
-  displayName: string;
   hasSecret: boolean;
+  models: ProviderExportModel[];
 }
 
 interface ProviderExportDocument {
@@ -71,8 +75,14 @@ interface ProviderImportPreviewResponse {
   providers: ProviderExportItem[];
 }
 
-interface ProviderImportConfirmItem extends ProviderExportItem {
+interface ProviderImportConfirmItem {
   id: string;
+  type: typeof PROVIDER_TYPE;
+  enabled: boolean;
+  name: string;
+  baseUrl: string;
+  hasSecret: boolean;
+  models: Array<ProviderExportModel & { id: string }>;
 }
 
 interface ProviderImportConfirmResponse {
@@ -1004,7 +1014,7 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
             <div className="space-y-2">
               {importPreview?.providers.map((provider, index) => (
                 <div
-                  key={`${provider.name}-${provider.baseUrl}-${provider.modelId}-${index}`}
+                  key={`${provider.name}-${provider.baseUrl}-${index}`}
                   className="rounded-md border px-3 py-2"
                 >
                   <div className="flex flex-wrap items-start justify-between gap-2">
@@ -1029,15 +1039,9 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
                     </div>
                     <div className="min-w-0">
                       <span className="text-muted-foreground">
-                        {t("provider_settings.model_id")}:{" "}
+                        {t("provider_settings.import_model_count")}:{" "}
                       </span>
-                      <span className="break-all">{provider.modelId}</span>
-                    </div>
-                    <div className="min-w-0">
-                      <span className="text-muted-foreground">
-                        {t("provider_settings.display_name")}:{" "}
-                      </span>
-                      <span className="break-all">{provider.displayName}</span>
+                      {t("provider_settings.model_count", { count: provider.models.length })}
                     </div>
                     <div>
                       <span className="text-muted-foreground">
@@ -1047,6 +1051,30 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
                         ? t("provider_settings.yes")
                         : t("provider_settings.no")}
                     </div>
+                  </div>
+                  <div className="mt-3 space-y-1.5">
+                    <div className="text-xs font-medium text-muted-foreground">
+                      {t("provider_settings.import_models")}
+                    </div>
+                    {provider.models.map((model, modelIndex) => (
+                      <div
+                        key={`${model.modelId}-${modelIndex}`}
+                        className="grid gap-1 rounded-md bg-muted/40 px-2 py-1.5 text-xs sm:grid-cols-2"
+                      >
+                        <div className="min-w-0">
+                          <span className="text-muted-foreground">
+                            {t("provider_settings.model_id")}:{" "}
+                          </span>
+                          <span className="break-all">{model.modelId}</span>
+                        </div>
+                        <div className="min-w-0">
+                          <span className="text-muted-foreground">
+                            {t("provider_settings.display_name")}:{" "}
+                          </span>
+                          <span className="break-all">{model.displayName}</span>
+                        </div>
+                      </div>
+                    ))}
                   </div>
                 </div>
               ))}
