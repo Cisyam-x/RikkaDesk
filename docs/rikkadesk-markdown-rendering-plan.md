@@ -20,7 +20,8 @@ RikkaDesk desktop renders message content through the current web-ui message par
 - `reasoning` parts also render through the shared `Markdown` component.
 - Tool previews that show textual answers also reuse `Markdown`.
 - `Markdown` uses `Streamdown`.
-- `Markdown` uses `remark-gfm`, `remark-math`, `rehype-katex`, and `rehype-raw`.
+- `Markdown` uses `remark-gfm`, `remark-math`, and `rehype-katex`.
+- `Markdown` no longer explicitly enables `rehypeRaw` in the RikkaDesk plugin list.
 - `Markdown` preprocesses escaped math delimiters:
   - `\(...\)` to `$...$`
   - `\[...\]` to `$$...$$`
@@ -30,6 +31,7 @@ RikkaDesk desktop renders message content through the current web-ui message par
 - Mermaid is not rendered directly inside message Markdown.
 - Mermaid is currently available indirectly through Workbench code preview.
 - Workbench Mermaid preview renders inside an iframe and currently imports Mermaid from `https://esm.sh/mermaid@11`.
+- Workbench Mermaid preview currently uses `securityLevel: "strict"`.
 
 ## Current Capability Matrix
 
@@ -43,13 +45,78 @@ RikkaDesk desktop renders message content through the current web-ui message par
 | Code preview | Partially supported | Depends on language and Workbench preview support. |
 | Shiki highlight | Supported | Long code has a size limit and fallback path. |
 | GFM table | Supported | Via `remark-gfm`. |
-| Table overflow | Needs polish | Wide tables can stress narrow message layouts. |
+| Table overflow | Supported | Wide tables scroll inside Markdown content after P2 polish. |
 | Inline math | Supported | Via `remark-math` and `rehype-katex`. |
 | Block math | Supported | Via `remark-math` and `rehype-katex`. |
-| mhchem | Dependency available, not enabled | `katex` is installed, but `katex/dist/contrib/mhchem.mjs` is not imported yet. |
+| mhchem | Supported | `katex/dist/contrib/mhchem.mjs` is imported after P3. |
 | Mermaid in message | Not supported | Message Markdown disables Mermaid controls/rendering. |
-| Mermaid in Workbench | Supported with caveats | Uses remote CDN and `securityLevel: "loose"`; requires later review. |
-| Raw HTML | Enabled | `rehypeRaw` is configured; needs XSS/security verification. |
+| Mermaid in Workbench | Supported with caveats | Uses remote CDN, `securityLevel: "strict"`, and an iframe sandbox; requires later review before public release. |
+| Raw HTML | Hardened | RikkaDesk no longer explicitly enables `rehypeRaw`; unsafe link and image sources are blocked. |
+
+## Phase 9C Progress
+
+P2 completed:
+
+- CSS-only table overflow polish completed.
+- Wide GFM tables now scroll inside Markdown content instead of expanding the app viewport.
+- Code block overflow/header minor polish completed.
+- No parser, plugin, or dependency changes were made.
+
+P3 completed:
+
+- KaTeX mhchem enabled through `katex/dist/contrib/mhchem.mjs`.
+- Existing math pipeline kept unchanged.
+- Inline math, block math, and `\ce{...}` chemistry fixtures passed.
+- Invalid chemistry does not crash rendering.
+
+P4.1 completed:
+
+- Removed explicit `rehypeRaw` from the RikkaDesk Markdown plugin list.
+- Markdown now keeps `rehypeKatex` but no longer explicitly enables raw HTML parsing.
+- Added safe link handling.
+- Added safe image source handling.
+- Dangerous href schemes are not clickable:
+  - `javascript:`
+  - `data:`
+  - `file:`
+  - `blob:`
+  - relative URL by default
+- Links keep `target="_blank"` and `rel="noopener noreferrer"`.
+- Raw HTML no longer overrides link target/rel in message Markdown.
+
+P4.2a completed:
+
+- Workbench iframe sandbox narrowed.
+- HTML preview sandbox is empty.
+- SVG preview sandbox is empty.
+- Mermaid preview sandbox is `allow-scripts`.
+- Removed `allow-same-origin` from the Workbench preview iframe.
+- Mermaid `securityLevel` changed from `loose` to `strict`.
+- No dependency changes were made.
+- Mermaid message rendering remains deferred.
+
+## Residual Risks
+
+Workbench Mermaid still uses the remote CDN `https://esm.sh/mermaid@11`.
+This remains a supply-chain and network-availability concern. It is accepted temporarily for the beta.11 candidate, but should be revisited before any public release.
+
+Workbench HTML/SVG preview still renders user-provided `srcDoc`.
+The iframe sandbox is now narrowed, but the content is still user-controlled. HTML/SVG preview should remain scoped to Workbench preview, not message bubbles. Further review may decide whether HTML/SVG preview should be disabled, sanitized, or moved to stricter isolated rendering.
+
+Message Mermaid remains deferred.
+Mermaid fenced blocks in messages should remain code blocks. Do not enable Streamdown message Mermaid rendering before a separate design. Do not put Mermaid loose security in the message stream.
+
+Raw HTML in message Markdown remains intentionally disabled.
+P4.1 removed explicit `rehypeRaw`. Any future attempt to re-enable raw HTML must include an explicit sanitize policy and XSS fixtures.
+
+## Future Workbench Security Candidates
+
+- Replace the remote Mermaid CDN with a local bundled Mermaid package.
+- Keep Mermaid `securityLevel: "strict"`.
+- Re-evaluate whether `allow-scripts` is needed only for Mermaid.
+- Consider disabling HTML preview scripts permanently.
+- Consider sanitizing or disabling SVG preview if needed.
+- Add automated XSS fixture tests if test infrastructure is added later.
 
 ## Security Boundaries
 
@@ -59,15 +126,15 @@ Phase 9C must preserve these boundaries:
 - Do not introduce provider, API key, app data, SecretStore, or DPAPI logic into Markdown rendering.
 - Markdown rendering must not read SecretStore, DPAPI, `secrets/*.bin`, app data, or provider secrets.
 - Markdown rendering must not log message HTML, secret-bearing content, app data paths, or provider credentials.
-- Raw HTML is the largest security concern in this phase.
-- If `rehypeRaw` remains enabled, the Streamdown sanitize/harden behavior must be verified against the exact RikkaDesk plugin combination.
+- Raw HTML was the largest security concern in this phase.
+- P4.1 removed explicit `rehypeRaw`; if raw HTML is re-enabled later, the Streamdown sanitize/harden behavior must be verified against the exact RikkaDesk plugin combination.
 - Markdown must not execute `<script>`.
 - Markdown must not allow event handlers such as `onclick` or `onerror`.
 - Markdown must not allow `javascript:` links.
 - Markdown should not allow dangerous message tags such as `iframe`, `object`, or `embed`.
 - Normal links must keep `target="_blank"` and `rel="noopener noreferrer"`.
 - Mermaid must not be enabled directly in the message stream with loose security.
-- Workbench Mermaid preview currently uses a remote CDN and loose Mermaid security; this is a design issue for P4, not something to expand in P2/P3.
+- Workbench Mermaid preview currently uses a remote CDN and strict Mermaid security; the remote CDN remains a residual risk, not something to expand in message rendering.
 
 ## XSS And Raw HTML Fixture Checklist
 
@@ -196,9 +263,9 @@ Current LaTeX state:
 - `katex/dist/katex.min.css` is imported.
 - `\(...\)` is preprocessed to `$...$`.
 - `\[...\]` is preprocessed to `$$...$$`.
-- `katex/dist/contrib/mhchem.mjs` is not imported yet.
+- `katex/dist/contrib/mhchem.mjs` is imported after P3.
 
-P3 low-risk candidate:
+P3 completed approach:
 
 - Import `katex/dist/contrib/mhchem.mjs` in `markdown.tsx`.
 - Do not change the general math rendering structure.
@@ -231,7 +298,7 @@ Expected behavior:
 
 - Existing inline math still renders.
 - Existing block math still renders.
-- Chemical formulas render only after mhchem is enabled.
+- Chemical formulas render after mhchem is enabled.
 - Invalid chemistry syntax should not crash the app.
 
 ## Mermaid Design Review
@@ -242,7 +309,8 @@ Current Mermaid state:
 - Workbench preview supports Mermaid code blocks.
 - Workbench preview uses an iframe.
 - Workbench preview imports Mermaid from `https://esm.sh/mermaid@11`.
-- Workbench preview initializes Mermaid with `securityLevel: "loose"`.
+- Workbench preview initializes Mermaid with `securityLevel: "strict"`.
+- Workbench Mermaid iframe sandbox is `allow-scripts` and no longer includes `allow-same-origin`.
 
 Decision:
 
@@ -308,9 +376,9 @@ Validation:
 
 Scope:
 
-- Review whether `rehypeRaw` should remain enabled.
-- Review whether explicit sanitize policy should be configured.
-- Review Streamdown sanitize/harden behavior with the current plugin combination.
+- P4.1 removed explicit `rehypeRaw`.
+- Any future raw HTML support must include an explicit sanitize policy.
+- Streamdown sanitize/harden behavior should be verified again if the plugin combination changes.
 - Review Workbench Mermaid remote CDN usage.
 - Review Mermaid sandbox and security level.
 - Do not enable Mermaid in message rendering until the review is complete.

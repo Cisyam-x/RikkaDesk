@@ -230,6 +230,26 @@ Deleting a provider should remove its local secret and clear related favorite mo
 12. Confirm Streaming Chat uses the same safe request builder and preserves allowed custom body fields such as `max_tokens`.
 13. Confirm safe errors do not echo full custom header values or full custom body JSON.
 
+## Test Markdown And Workbench Rendering Security
+
+Markdown raw HTML hardening:
+
+- Confirm `rehypeRaw` is not explicitly enabled in the RikkaDesk Markdown plugin list.
+- Confirm unsafe href schemes are blocked in message Markdown: `javascript:`, `data:`, `file:`, `blob:`, and relative URLs by default.
+- Confirm unsafe image sources are blocked in message Markdown.
+- Confirm normal `http:`, `https:`, and `mailto:` links remain clickable and keep `target="_blank"` plus `rel="noopener noreferrer"`.
+- Confirm raw HTML cannot override link `target` or `rel` in message Markdown.
+- Run the XSS fixture from `docs/rikkadesk-markdown-rendering-plan.md` and confirm scripts, event handlers, dangerous embed tags, and dangerous links do not execute in message bubbles.
+
+Workbench preview hardening:
+
+- Confirm HTML iframe sandbox is empty.
+- Confirm SVG iframe sandbox is empty.
+- Confirm Mermaid iframe sandbox is `allow-scripts`.
+- Confirm Workbench preview iframe does not include `allow-same-origin`.
+- Confirm Mermaid preview uses `securityLevel: "strict"`.
+- Confirm remote Mermaid CDN residual risk is documented in `docs/rikkadesk-markdown-rendering-plan.md`.
+
 ## Test Real OpenAI-Compatible Streaming Chat
 
 1. Configure Provider Settings with a real OpenAI-compatible endpoint and a local user-entered API key.
