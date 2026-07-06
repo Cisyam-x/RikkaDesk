@@ -425,6 +425,30 @@ struct DesktopProviderCustomHeaderConfig {
     value: String,
 }
 
+#[derive(Clone)]
+enum CustomBodyUpdate {
+    Missing,
+    Clear,
+    Set(Value),
+}
+
+impl Default for CustomBodyUpdate {
+    fn default() -> Self {
+        Self::Missing
+    }
+}
+
+fn deserialize_custom_body_update<'de, D>(deserializer: D) -> Result<CustomBodyUpdate, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(value) => CustomBodyUpdate::Set(value),
+        None => CustomBodyUpdate::Clear,
+    })
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UpsertDesktopProviderRequest {
@@ -439,7 +463,8 @@ struct UpsertDesktopProviderRequest {
     display_name: Option<String>,
     api_key: Option<String>,
     custom_headers: Option<Vec<DesktopProviderCustomHeaderConfig>>,
-    custom_body: Option<Option<Value>>,
+    #[serde(default, deserialize_with = "deserialize_custom_body_update")]
+    custom_body: CustomBodyUpdate,
 }
 
 #[derive(Deserialize)]
@@ -2980,12 +3005,12 @@ async fn build_desktop_provider(
             .unwrap_or_default()
     };
 
-    let custom_body = match payload.custom_body.as_ref() {
-        Some(Some(value)) => Some(
+    let custom_body = match &payload.custom_body {
+        CustomBodyUpdate::Set(value) => Some(
             validate_custom_body_value(value).map_err(|message| bad_request_response(&message))?,
         ),
-        Some(None) => None,
-        None => existing
+        CustomBodyUpdate::Clear => None,
+        CustomBodyUpdate::Missing => existing
             .as_ref()
             .and_then(|provider| provider.custom_body.clone()),
     };
