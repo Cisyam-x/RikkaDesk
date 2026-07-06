@@ -4,12 +4,12 @@ RikkaDesk is an unofficial desktop derivative / experiment based on RikkaHub.
 
 RikkaDesk is a non-official desktop-oriented derivative of [RikkaHub](https://github.com/rikkahub/rikkahub). It currently focuses on making the existing RikkaHub `web-ui` usable as the foundation for a local Windows desktop app.
 
-This repository is in an early staged migration. The current prototype is experimental and is being prepared as a local/private beta, not a public production release. The current feature-stable private beta tag is `rikkadesk-v0.1.0-beta.9`.
+This repository is in an early staged migration. The current prototype is experimental and is being prepared as a local/private beta, not a public production release. The current feature-stable private beta tag is `rikkadesk-v0.1.0-beta.10`.
 
 > [!IMPORTANT]
 > The upstream RikkaHub feature list later in this README describes the Android upstream project. It does not mean every upstream feature is available in the current RikkaDesk desktop beta.
 
-The current RikkaDesk beta includes a local Tauri desktop shell with a Rust desktop API, JSON persistence, conversation and message management, multi-provider and multi-model Provider Settings, safe provider import/export, and an OpenAI-compatible text streaming chat path.
+The current RikkaDesk beta includes a local Tauri desktop shell with a Rust desktop API, JSON persistence, conversation and message management, multi-provider and multi-model Provider Settings, advanced non-sensitive provider request config, safe provider import/export, and an OpenAI-compatible text streaming chat path.
 
 - Phase 0 is complete: the upstream architecture, `web-ui`, Web Interface, and license were reviewed without code changes.
 - Phase 1 is complete: the `web-ui` can run locally in a browser at `http://localhost:5173/`.
@@ -24,6 +24,7 @@ The current RikkaDesk beta includes a local Tauri desktop shell with a Rust desk
 - Phase 6B P1/P2 are complete: Provider Settings supports a provider list, add/edit/delete, favorite model updates, setting the current model, and Test Connection.
 - Phase 7 P1/P2 are complete: Provider Settings can safely export and import non-sensitive provider metadata.
 - Phase 8 P1-P4 are complete: Provider state now supports `providers[].models[]`, Provider Settings can manage multiple models per provider, and provider import/export v2 handles multi-model config while retaining v1 import compatibility.
+- Phase 9B P1-P4 are complete: Provider Settings can save non-sensitive custom headers and safe custom body JSON, Test Connection and Streaming Chat share the safe OpenAI-compatible request builder, and provider import/export v3 handles safe advanced request config while retaining v1/v2 import compatibility.
 - Beta 7 hotfix is complete: long OpenAI-compatible streaming responses run in the background after message send/regenerate requests return accepted, avoiding the previous 30-second POST timeout.
 
 Current limitations:
@@ -31,6 +32,7 @@ Current limitations:
 - RikkaDesk currently supports only the OpenAI-compatible text chat path for real provider testing.
 - API keys must never be written to source files, README files, logs, tests, or `state.v1.json`.
 - On Windows, provider secrets are referenced from JSON by `secretRef` and stored as encrypted local secret blobs under app data.
+- Provider custom headers/body must not contain API keys, tokens, passwords, Authorization headers, `x-api-key`, cookies, or other credentials; API keys still belong only in the API Key field and SecretStore / DPAPI path.
 - File uploads, attachments, images, audio, search, MCP, tools, Workspace, multimodal input, and other P2/P3 endpoints are intentionally deferred.
 - SQLite, sync, advanced migration tooling, and full upstream feature parity are not implemented.
 - JSON remains the beta prototype persistence layer.
@@ -47,7 +49,8 @@ What works in the current prototype:
 - Provider Settings can manage multiple models under one provider; those models share the provider Base URL and API key.
 - The model selector can show multiple models from the same provider.
 - Provider Settings can set the current model and run a safe Test Connection request for a specific model row.
-- Provider Settings can export/import non-sensitive provider metadata; export v2 includes multi-model `models[]`, v1 imports remain compatible, and exported files exclude API keys, `secretRef`, tokens, and local secret-store blobs, so imported providers require API keys to be re-entered.
+- Provider Settings supports Advanced request config for non-sensitive custom headers and safe custom body JSON. Test Connection and Streaming Chat share the same safe request builder; Test Connection forces `max_tokens=1`, while Streaming Chat can preserve allowed custom body fields such as `max_tokens`.
+- Provider Settings can export/import non-sensitive provider metadata; export v3 includes multi-model `models[]` plus safe `customHeaders` / `customBody`, v1/v2 imports remain compatible, and exported files exclude API keys, `secretRef`, tokens, Authorization headers, `x-api-key`, cookies, DPAPI blobs, and local secret-store files, so imported providers require API keys to be re-entered.
 - Provider Settings can save non-sensitive provider config and store API keys through the desktop SecretStore / Windows DPAPI-backed secret mechanism without returning the key to the frontend.
 - If `127.0.0.1:8080` is already in use, the local API falls back to a random loopback port and the frontend reads it through the Tauri command `get_api_base_url`.
 

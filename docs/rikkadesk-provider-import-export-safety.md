@@ -2,15 +2,15 @@
 
 Review date: 2026-07-04
 
-This document defines the safety boundary for RikkaDesk provider configuration import/export. Phase 7 implemented safe non-sensitive import/export, and Phase 8 upgrades the export document to version 2 so a provider can carry multiple `models[]`.
+This document defines the safety boundary for RikkaDesk provider configuration import/export. Phase 7 implemented safe non-sensitive import/export, Phase 8 upgraded the export document to version 2 for multiple `models[]`, and Phase 9B upgrades the export document to version 3 for safe non-sensitive `customHeaders[]` and `customBody`.
 
 ## Goals
 
 - Allow users to back up and transfer non-sensitive provider configuration.
 - Prevent API keys, tokens, or local credential blobs from entering exported files.
 - Make imported providers explicit and reviewable before they affect local settings.
-- Keep provider exports non-sensitive even when local state uses `state.v1.json` with `schemaVersion: 3` and `providers[].models[]`.
-- Keep version 1 provider export imports compatible while emitting version 2 exports for multi-model providers.
+- Keep provider exports non-sensitive even when local state uses `state.v1.json` with `schemaVersion: 4`, `providers[].models[]`, `providers[].customHeaders`, and `providers[].customBody`.
+- Keep version 1 and version 2 provider export imports compatible while emitting version 3 exports for multi-model providers with safe advanced request config.
 
 ## Exportable Provider Fields
 
@@ -22,6 +22,10 @@ A safe provider export may include only non-sensitive configuration:
 - `models[]`: provider model metadata.
   - `modelId`: provider API model identifier.
   - `displayName`: user-facing model display name.
+- `customHeaders[]`: non-sensitive custom request headers that pass the backend allowlist/denylist validation.
+  - `name`: HTTP header name.
+  - `value`: non-sensitive HTTP header value.
+- `customBody`: non-sensitive JSON object fields that pass backend validation.
 - `enabled`: enabled state, if present in the current provider model.
 - `hasSecret`: boolean state such as `true` or `false`, used only to tell the user whether the original provider had a saved secret.
 
@@ -29,7 +33,7 @@ Example safe export shape:
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "app": "RikkaDesk",
   "exportedAt": "2026-07-04T00:00:00Z",
   "providers": [
@@ -48,7 +52,17 @@ Example safe export shape:
           "modelId": "example-reasoner",
           "displayName": "Example Reasoner"
         }
-      ]
+      ],
+      "customHeaders": [
+        {
+          "name": "OpenAI-Beta",
+          "value": "assistants=v2"
+        }
+      ],
+      "customBody": {
+        "temperature": 0.7,
+        "top_p": 0.9
+      }
     }
   ]
 }
@@ -65,6 +79,8 @@ Provider export must never include:
 - Refresh tokens.
 - Authorization header values.
 - `x-api-key` header values.
+- Cookie values.
+- Passwords or credential-bearing custom header/body fields.
 - Local provider IDs.
 - Internal model IDs.
 - SecretStore raw values.
@@ -72,7 +88,7 @@ Provider export must never include:
 - macOS Keychain items.
 - Linux Secret Service values.
 - Any local encrypted credential blob or raw secret file.
-- Request headers that could contain credentials.
+- Sensitive request headers or body fields that could contain credentials.
 - Runtime logs, error payloads, or request bodies that contain sensitive credential material.
 
 ### `secretRef` Export Policy
@@ -112,7 +128,8 @@ Recommended behavior:
 - Do not automatically favorite imported models.
 - Do not automatically enable real provider calls if required fields are missing.
 - Accept version 1 exports by converting singular `modelId` / `displayName` into `models[0]`.
-- Accept version 2 exports by importing all safe `models[]` entries.
+- Accept version 2 exports by importing all safe `models[]` entries with empty advanced request config.
+- Accept version 3 exports by importing all safe `models[]`, `customHeaders[]`, and `customBody` entries after backend validation.
 
 ### ID Conflict Handling
 
@@ -169,13 +186,15 @@ Suggested Chinese copy:
 Implemented behavior:
 
 1. Export non-sensitive JSON only.
-   - `GET /api/desktop/providers/export` emits version 2 documents.
+   - `GET /api/desktop/providers/export` emits version 3 documents.
    - Exported providers include `models[]` with `modelId` and `displayName`.
-   - Exports exclude provider IDs, internal model IDs, API keys, local secret references, tokens, and secret blobs.
+   - Exported providers include safe non-sensitive `customHeaders[]` and safe `customBody` only after backend validation.
+   - Exports exclude provider IDs, internal model IDs, API keys, local secret references, Authorization headers, `x-api-key`, tokens, cookies, DPAPI blobs, and secret-store files.
 
 2. Import preview.
-   - `POST /api/desktop/providers/import/preview` accepts version 1 and version 2 documents.
-   - Preview validates schema, provider type, Base URL protocol, required model IDs, model count, duplicate model IDs, and maximum field lengths.
+   - `POST /api/desktop/providers/import/preview` accepts version 1, version 2, and version 3 documents.
+   - Preview validates schema, provider type, Base URL protocol, required model IDs, model count, duplicate model IDs, maximum field lengths, and safe advanced request config.
+   - Preview shows advanced config summaries instead of full custom header values or full custom body JSON.
    - Preview does not write local state.
 
 3. Confirmed import.
@@ -183,12 +202,14 @@ Implemented behavior:
    - Confirm generates new local provider IDs, new internal model IDs, and new internal secret references.
    - Imported providers have `hasSecret: false`.
    - Import does not set current model, favorite models, or overwrite existing providers.
+   - Version 1 and version 2 imports set `customHeaders = []` and `customBody = null`.
+   - Version 3 imports preserve safe validated `customHeaders[]` and `customBody`.
 
 RikkaDesk should not implement one-click secret export. If encrypted backup is ever considered, it must be designed as a separate threat model and should not reuse the normal provider export path.
 
 ## Non-Goals
 
-Phase 6B P3 does not include:
+The normal provider import/export path does not include:
 
 - Secret export.
 - Provider import overwrite.
@@ -204,8 +225,10 @@ Before approving an import/export implementation, verify:
 - Export files contain no API key, token, Authorization header value, `x-api-key` value, SecretStore value, or DPAPI blob.
 - Export files do not include reusable `secretRef` values by default.
 - Export files do not include provider IDs, internal model IDs, app data paths, or local secret-store file names.
-- Version 2 exports include `providers[].models[]`.
+- Version 3 exports include `providers[].models[]` and safe non-sensitive `customHeaders[]` / `customBody`.
 - Version 1 imports remain compatible and become a single model on import.
+- Version 2 imports remain compatible and import multiple models with empty advanced request config.
+- Version 3 imports validate advanced request config and reject sensitive header/body fields.
 - Imported providers require the user to manually enter API keys.
 - Import does not silently overwrite existing providers.
 - Import does not automatically favorite or select imported models.

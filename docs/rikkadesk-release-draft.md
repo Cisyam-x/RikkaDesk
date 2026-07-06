@@ -1,11 +1,11 @@
-# RikkaDesk 0.1.0 Beta 9 Release Draft
+# RikkaDesk 0.1.0 Beta 10 Release Draft
 
 This document is a private release draft for RikkaDesk. Do not publish a public GitHub Release from this phase.
 
 ## Release Title Suggestion
 
 ```text
-RikkaDesk 0.1.0 Beta 9 - Private Windows Desktop Candidate
+RikkaDesk 0.1.0 Beta 10 - Private Windows Desktop Candidate
 ```
 
 ## Tag Suggestion
@@ -13,10 +13,10 @@ RikkaDesk 0.1.0 Beta 9 - Private Windows Desktop Candidate
 Current feature-stable private beta tag:
 
 ```text
-rikkadesk-v0.1.0-beta.9
+rikkadesk-v0.1.0-beta.10
 ```
 
-The `beta/0.1.0` branch should use this tag after Phase 8 multi-model provider testing is accepted. Do not publish a public GitHub Release from this draft.
+The `beta/0.1.0` branch should use this tag after Phase 9B Provider Advanced request config testing is accepted. Do not publish a public GitHub Release from this draft.
 
 ## Version Strategy
 
@@ -28,7 +28,7 @@ Current version files:
 Recommendation:
 
 - Keep the internal package version as `0.1.0` for this private beta line.
-- Use `RikkaDesk 0.1.0 Beta 9` in release notes and private tester instructions.
+- Use `RikkaDesk 0.1.0 Beta 10` in release notes and private tester instructions.
 - Keep beta labels in Git tags and release notes unless the Windows bundler version strategy is explicitly changed later.
 - Do not publish a public prerelease until installer signing, support scope, and license obligations are reviewed.
 
@@ -62,11 +62,15 @@ This beta includes:
 - Favorite model updates through the local settings API.
 - Set as current model from each Provider Settings model row.
 - Test Connection for a specific OpenAI-compatible model row using a safe non-streaming `/chat/completions` probe.
-- Provider state schema v3 with `providers[].models[]` and migration from schema v2 `provider.model`.
+- Provider state schema v4 with `providers[].models[]`, `providers[].customHeaders`, `providers[].customBody`, and migration from earlier provider schema shapes.
+- Advanced provider request config for non-sensitive custom headers and safe custom body JSON.
+- Shared OpenAI-compatible request builder for Test Connection and Streaming Chat:
+  - Test Connection forces `max_tokens=1`
+  - Streaming Chat preserves allowed custom body fields such as `max_tokens`
 - OpenAI-compatible text chat with streaming responses.
 - Secret reference design where JSON stores `secretRef`, not the API key.
 - Windows encrypted local secret blobs under app data.
-- Safe provider import/export v2 for multi-model metadata, with v1 import compatibility.
+- Safe provider import/export v3 for multi-model metadata and safe advanced request config, with v1/v2 import compatibility.
 - Windows MSI and NSIS installer artifacts.
 
 This beta is intended for local/private validation only.
@@ -164,13 +168,15 @@ Before sharing any private beta installer:
 - Open Provider Settings.
 - Add, edit, and delete a provider without exposing any real key to logs or docs.
 - Add multiple model rows under one provider.
+- Add safe Advanced request config and confirm unsafe custom headers/body are rejected.
 - Confirm provider deletion removes the corresponding local secret.
 - Confirm favorite model changes work.
 - Confirm Set as current model updates the model selector for a specific model row.
 - Confirm Test Connection succeeds with a valid provider/model row and fails safely with an invalid provider or model.
-- Confirm provider export writes version 2 JSON with `providers[].models[]`.
-- Confirm provider import works for both version 2 multi-model exports and older version 1 single-model exports.
-- Confirm provider exports do not include API keys, `secretRef`, tokens, Authorization headers, DPAPI blobs, local secret-store files, or internal model ids.
+- Confirm Test Connection and Streaming Chat both use the safe custom request config behavior.
+- Confirm provider export writes version 3 JSON with `providers[].models[]`, safe `customHeaders[]`, and safe `customBody`.
+- Confirm provider import works for version 3 advanced exports, version 2 multi-model exports, and older version 1 single-model exports.
+- Confirm provider exports do not include API keys, `secretRef`, tokens, Authorization headers, `x-api-key`, cookies, DPAPI blobs, local secret-store files, or internal model ids.
 - Confirm `hasSecret: true` only after a local key is saved.
 - Send a text-only test message.
 - Confirm streaming text appears when a real provider is configured.
@@ -188,7 +194,7 @@ Recommended private beta flow:
 1. Develop in phase branches.
 2. Merge accepted phase PRs into `beta/0.1.0`.
 3. Create private beta tags only for feature-stable checkpoints.
-4. Keep `rikkadesk-v0.1.0-beta.9` as the current feature-stable beta tag once Phase 8 is validated.
+4. Keep `rikkadesk-v0.1.0-beta.10` as the current feature-stable beta tag once Phase 9B is validated.
 5. Do not publish a public GitHub Release until signing, support scope, and license obligations are reviewed.
 
 Do not force-push `main`, `master`, or `beta/0.1.0`.

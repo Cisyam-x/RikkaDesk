@@ -141,7 +141,7 @@
     "advanced_request_config": "Advanced request config",
     "advanced_request_config_description": "Optional non-secret request headers and JSON body fields for OpenAI-compatible gateways.",
     "advanced_request_config_warning": "Do not enter API keys, tokens, passwords, Authorization headers, or cookies here. API keys belong in the API Key field and are saved in the local SecretStore.",
-    "advanced_export_note": "Advanced request config is not included in provider export until export v3 is implemented.",
+    "advanced_export_note": "Provider export v3 includes safe non-sensitive custom headers and custom body. Sensitive headers and credentials are still blocked.",
     "configured": "Configured",
     "optional": "Optional",
     "custom_headers": "Custom headers",
@@ -192,6 +192,7 @@
       "conversation_management": "Conversation and message management",
       "provider_settings": "Provider Settings",
       "provider_multi_model": "Provider Settings with multiple models",
+      "provider_advanced_request_config": "Advanced provider request config with custom headers/body",
       "test_connection": "Test Connection",
       "provider_import_export": "Safe provider import/export"
     },

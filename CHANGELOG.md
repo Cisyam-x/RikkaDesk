@@ -6,9 +6,23 @@ This changelog tracks the RikkaDesk desktop work in this fork. It does not repla
 
 ## 0.1.0 Private Beta Line
 
-The current feature-stable private beta tag is planned as `rikkadesk-v0.1.0-beta.9`. The `beta/0.1.0` branch may contain later documentation or feature work after that tag.
+The current feature-stable private beta tag is planned as `rikkadesk-v0.1.0-beta.10`. The `beta/0.1.0` branch may contain later documentation or feature work after that tag.
 
 This beta line is not a public GitHub Release.
+
+### `rikkadesk-v0.1.0-beta.10` - Provider Advanced Request Config
+
+Added:
+
+- Add provider Advanced request config for OpenAI-compatible providers.
+- Add non-sensitive custom headers and safe custom body JSON.
+- Upgrade local provider state to `schemaVersion: 4`.
+- Add shared OpenAI-compatible request builder for Test Connection and Streaming Chat.
+- Keep Test Connection `max_tokens` forced to `1`.
+- Preserve allowed custom `max_tokens` for streaming chat.
+- Upgrade provider import/export to version 3 with safe `customHeaders` / `customBody`.
+- Keep import compatibility for provider export versions 1 and 2.
+- Continue excluding API keys, `secretRef`, Authorization, `x-api-key`, tokens, cookies, DPAPI blobs, and local secret-store files from exports.
 
 ### `rikkadesk-v0.1.0-beta.9` - Provider Multi-Model
 
@@ -134,7 +148,8 @@ The `beta/0.1.0` branch included these follow-up updates after the beta.4 featur
 - Safe Provider import/export support, tagged as `rikkadesk-v0.1.0-beta.6`.
 - Long streaming timeout hotfix, tagged as `rikkadesk-v0.1.0-beta.7`.
 - Beta release copy hotfix, tagged as `rikkadesk-v0.1.0-beta.8`.
-- Provider multi-model state, UI, and import/export v2 work, planned as `rikkadesk-v0.1.0-beta.9`.
+- Provider multi-model state, UI, and import/export v2 work, tagged or planned as `rikkadesk-v0.1.0-beta.9`.
+- Provider advanced request config and import/export v3 work, planned as `rikkadesk-v0.1.0-beta.10`.
 
 ## Security
 

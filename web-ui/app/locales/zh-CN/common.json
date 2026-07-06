@@ -141,7 +141,7 @@
     "advanced_request_config": "高级请求配置",
     "advanced_request_config_description": "用于 OpenAI-compatible 网关的可选非敏感请求 Header 和 JSON Body 字段。",
     "advanced_request_config_warning": "不要在这里填写 API Key、Token、密码、Authorization Header 或 Cookie。API Key 应填写在 API Key 输入框，并保存到本地 SecretStore。",
-    "advanced_export_note": "当前高级请求配置暂不会进入 Provider 导出文件，后续 export v3 会处理。",
+    "advanced_export_note": "Provider export v3 会包含安全的非敏感自定义 Header 和 Body；敏感 Header 和凭据仍会被阻止。",
     "configured": "已配置",
     "optional": "可选",
     "custom_headers": "自定义 Header",
@@ -192,6 +192,7 @@
       "conversation_management": "会话和消息管理",
       "provider_settings": "模型服务设置",
       "provider_multi_model": "支持一个 Provider 配置多个模型",
+      "provider_advanced_request_config": "高级 Provider 请求配置和自定义 Header / Body 配置",
       "test_connection": "测试连接",
       "provider_import_export": "安全 Provider 导入/导出"
     },

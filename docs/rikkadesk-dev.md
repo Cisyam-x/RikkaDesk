@@ -24,7 +24,8 @@ RikkaDesk is an unofficial desktop derivative / experiment based on RikkaHub. Th
 - Phase 6B P1/P2 complete: Provider Settings basic management, favorite models, Set as current model, and Test Connection were added.
 - Phase 6B P3 complete: Provider import/export safety design was documented.
 - Phase 7 complete: safe Provider import/export was implemented for non-sensitive provider metadata.
-- Phase 8 current: Provider state, APIs, and Provider Settings support multiple models per provider.
+- Phase 8 complete: Provider state, APIs, and Provider Settings support multiple models per provider.
+- Phase 9B current: Provider Settings supports advanced non-sensitive custom headers/body, shared OpenAI-compatible request building, and provider import/export v3.
 
 ## Current Architecture
 
@@ -130,12 +131,14 @@ On Windows, local beta data lives under:
 
 Important files:
 
-- `state.v1.json`: non-sensitive settings, conversations, messages, provider config, `secretRef`, and schema metadata. Phase 8 uses `schemaVersion: 3` with provider models stored in `providers[].models[]`.
+- `state.v1.json`: non-sensitive settings, conversations, messages, provider config, `secretRef`, and schema metadata. Phase 9B uses `schemaVersion: 4` with provider models stored in `providers[].models[]`, non-sensitive custom headers in `providers[].customHeaders`, and safe custom body JSON in `providers[].customBody`.
 - `secrets/*.bin`: encrypted local secret blobs used by the desktop secret mechanism on Windows.
 
-`state.v1.json` must not contain API keys, access tokens, refresh tokens, `Authorization` header values, `x-api-key` values, or service account private keys.
+`state.v1.json` must not contain API keys, access tokens, refresh tokens, credential-bearing `Authorization` header values, `x-api-key` values, cookies, passwords, or service account private keys. Custom request config is intentionally limited to non-sensitive headers and safe JSON object fields.
 
-Provider import/export currently uses export document version 2 for multi-model provider metadata. Version 2 exports `providers[].models[]` with non-sensitive `modelId` and `displayName` values only. Version 1 single-model provider exports are still accepted by the import preview and confirm endpoints.
+Provider import/export currently uses export document version 3 for multi-model provider metadata plus safe advanced request config. Version 3 exports `providers[].models[]`, safe `customHeaders[]`, and safe `customBody`; it still excludes API keys, `secretRef`, internal IDs, credential headers, tokens, cookies, DPAPI blobs, and local secret-store files. Version 1 single-model and version 2 multi-model provider exports are still accepted by the import preview and confirm endpoints.
+
+Test Connection and Streaming Chat now use the same OpenAI-compatible request builder. Test Connection always forces `max_tokens=1`; Streaming Chat can preserve allowed custom body fields such as `max_tokens` while RikkaDesk continues to control `model`, `messages`, and `stream`.
 
 ## Not Implemented
 
@@ -210,7 +213,7 @@ Build outputs:
 - Provider Settings can manage multiple models under one provider.
 - Set as current model updates the model selector for a specific provider model.
 - Favorite model updates work from the model selector.
-- Provider import/export v2 round-trips multiple models without exporting secrets, and v1 imports remain compatible.
+- Provider import/export v3 round-trips multiple models and safe advanced request config without exporting secrets, and v1/v2 imports remain compatible.
 - Sending a text message produces either a streaming OpenAI-compatible response or the mock fallback.
 - `pnpm run desktop:build` produces MSI and NSIS installers.
 
@@ -220,6 +223,6 @@ Recommended next steps:
 
 - Keep the mock fallback as a protocol safety net while hardening the real provider path.
 - Verify unsigned Windows installer behavior with local beta testers.
-- Keep `rikkadesk-v0.1.0-beta.9` as the current feature-stable private beta tag once Phase 8 is validated.
+- Keep `rikkadesk-v0.1.0-beta.10` as the current feature-stable private beta tag once Phase 9B is validated.
 - Decide whether a future public prerelease should use `0.1.0` or a beta label in release notes/artifact naming.
 - Keep P2/P3 features deferred until provider settings, persistence, and streaming behavior are stable.

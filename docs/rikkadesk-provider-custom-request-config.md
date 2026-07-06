@@ -2,7 +2,28 @@
 
 Review date: 2026-07-06
 
-This document defines the Phase 9B design for provider-level custom request headers and custom request body fields. It is a design and schema draft only. Phase 9B P1 does not enable the feature, does not change `schemaVersion`, and does not modify backend, UI, Tauri, or Android code.
+This document defines the Phase 9B design for provider-level custom request headers and custom request body fields. It began as a design and schema draft; as of Phase 9B P4, the backend schema, shared request builder, Provider Settings Advanced UI, `customBody: null` clear behavior, and provider import/export v3 support are implemented on the Phase 9B branch.
+
+## Implementation Status
+
+Implemented through Phase 9B P4:
+
+- `schemaVersion: 4` provider state with `customHeaders` and `customBody`.
+- Backend validation for non-sensitive custom headers and safe custom body JSON.
+- Shared OpenAI-compatible request builder for Test Connection and Streaming Chat.
+- Test Connection forces `max_tokens=1`.
+- Streaming Chat preserves allowed custom body fields such as `max_tokens`.
+- Provider Settings Advanced request config UI for custom headers/body.
+- `customBody: null` clears saved custom body while omitted `customBody` preserves existing config.
+- Provider import/export version 3 with safe `customHeaders` and `customBody`.
+- Import compatibility for provider export versions 1 and 2.
+
+Not changed:
+
+- Tauri configuration.
+- Android `app` module.
+- Provider-specific protocols.
+- File, attachment, search, MCP, tools, multimodal, or Workspace support.
 
 ## Background
 
@@ -11,18 +32,18 @@ RikkaDesk currently supports:
 - OpenAI-compatible providers.
 - Multiple providers.
 - Multiple models under one provider.
-- Local provider state with `schemaVersion: 3`.
+- Local provider state with `schemaVersion: 4`.
 - Provider Settings.
 - Per-model Set as current.
 - Per-model Test Connection.
-- Provider import/export version 2.
+- Provider import/export version 3 with v1/v2 import compatibility.
 - SecretStore / Windows DPAPI storage for API keys.
 - Long OpenAI-compatible streaming chat through background generation.
 
-RikkaDesk does not yet support:
+RikkaDesk now supports:
 
-- Custom provider headers.
-- Custom provider request body fields.
+- Non-sensitive custom provider headers.
+- Safe custom provider request body fields.
 - An Advanced request config section in Provider Settings.
 - Advanced compatibility options for relay services, enterprise gateways, and local OpenAI-compatible servers.
 
@@ -32,10 +53,10 @@ The goal of Phase 9B is to improve OpenAI-compatible provider interoperability w
 
 Current backend provider state:
 
-- `DesktopProviderConfig`: `id`, `type`, `enabled`, `name`, `baseUrl`, `models[]`, `secretRef`.
+- `DesktopProviderConfig`: `id`, `type`, `enabled`, `name`, `baseUrl`, `models[]`, `secretRef`, `customHeaders`, `customBody`.
 - `DesktopProviderModelConfig`: `id`, `modelId`, `displayName`.
-- `OpenAiChatConfig`: `baseUrl`, `modelId`, `apiKey`.
-- `OpenAiChatCompletionRequest`: `model`, `messages`, `stream`, `max_tokens`.
+- `OpenAiChatConfig`: `baseUrl`, `modelId`, `apiKey`, `customHeaders`, `customBody`.
+- OpenAI-compatible request bodies are built as safe JSON objects that keep RikkaDesk in control of `model`, `messages`, and `stream`.
 - Test Connection and streaming both add the Authorization header with `bearer_auth(apiKey)`.
 - Test Connection keeps a 60 second timeout.
 - Streaming requests do not use a total request timeout.
@@ -45,7 +66,7 @@ Current frontend provider settings:
 - Provider Settings shows a provider list.
 - Each provider can contain multiple model rows.
 - Saved model rows support Set current and Test.
-- There is no Advanced request config section.
+- Advanced request config supports non-sensitive custom headers and safe custom body JSON.
 
 ## Goals
 
@@ -70,7 +91,7 @@ Phase 9B should not support:
 
 ## Schema V4 Draft
 
-If Phase 9B persists custom request config, it should upgrade local state from `schemaVersion: 3` to `schemaVersion: 4`.
+Phase 9B persists custom request config by upgrading local state from `schemaVersion: 3` to `schemaVersion: 4`.
 
 The state filename remains:
 
@@ -319,7 +340,7 @@ POST /api/desktop/providers/{id}/advanced-request-config
 
 Current provider export version is 2 and supports `providers[].models[]`.
 
-If Phase 9B exports advanced request config, provider export should become version 3 and imports should remain compatible with versions 1 and 2.
+Phase 9B exports advanced request config through provider export version 3 while keeping imports compatible with versions 1 and 2.
 
 Version 3 provider export fields:
 
