@@ -12,6 +12,7 @@ import { useOptionalWorkbench } from "~/components/workbench/workbench-context";
 import { useSettingsStore } from "~/stores";
 import { CodeBlock } from "./code-block";
 import "katex/dist/katex.min.css";
+import "katex/dist/contrib/mhchem.mjs";
 import "./markdown.css";
 import "streamdown/styles.css";
 
