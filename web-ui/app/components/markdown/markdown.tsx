@@ -5,7 +5,6 @@ import { cjk } from "@streamdown/cjk";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
-import rehypeRaw from "rehype-raw";
 import { cn } from "~/lib/utils";
 import { getCodePreviewLanguage } from "~/components/workbench/code-preview-language";
 import { useOptionalWorkbench } from "~/components/workbench/workbench-context";
@@ -76,6 +75,38 @@ function getNodeText(node: React.ReactNode): string {
   return "";
 }
 
+function safeLinkHref(href: string | undefined): string | null {
+  const value = href?.trim();
+  if (!value) return null;
+
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol === "http:" || parsed.protocol === "https:" || parsed.protocol === "mailto:") {
+      return value;
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
+}
+
+function safeImageSrc(src: string | undefined): string | null {
+  const value = src?.trim();
+  if (!value) return null;
+
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+      return value;
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
+}
+
 export default function Markdown({
   content,
   className,
@@ -112,7 +143,7 @@ export default function Markdown({
     <div className={cn("markdown", className)}>
       <Streamdown
         remarkPlugins={[remarkGfm, remarkMath]}
-        rehypePlugins={[rehypeKatex, rehypeRaw]}
+        rehypePlugins={[rehypeKatex]}
         plugins={{ cjk: cjk }}
         animated={{ animation: "fadeIn", sep: 'word', duration: 150 }}
         isAnimating={isAnimating}
@@ -149,8 +180,9 @@ export default function Markdown({
               </code>
             );
           },
-          a: ({ href, children, ...props }) => {
+          a: ({ href, children }) => {
             const childText = getNodeText(children).trim();
+            const safeHref = safeLinkHref(href);
 
             // Citation format: [citation,domain](id)
             if (childText.startsWith("citation,")) {
@@ -169,26 +201,50 @@ export default function Markdown({
                 );
               }
 
-              if (href) {
+              if (safeHref) {
                 return (
                   <a
                     className="citation-badge"
-                    href={href}
+                    href={safeHref}
                     target="_blank"
                     rel="noopener noreferrer"
                     title={domain}
-                    {...props}
                   >
                     {domain}
                   </a>
                 );
               }
+
+              return (
+                <span className="citation-badge" title={domain}>
+                  {domain}
+                </span>
+              );
+            }
+
+            if (!safeHref) {
+              return <span>{children}</span>;
             }
 
             return (
-              <a href={href} target="_blank" rel="noopener noreferrer" {...props}>
+              <a href={safeHref} target="_blank" rel="noopener noreferrer">
                 {children}
               </a>
+            );
+          },
+          img: ({ src, alt, title }) => {
+            const safeSrc = safeImageSrc(typeof src === "string" ? src : undefined);
+            if (!safeSrc) {
+              return alt ? <span>{alt}</span> : null;
+            }
+
+            return (
+              <img
+                src={safeSrc}
+                alt={alt ?? ""}
+                title={typeof title === "string" ? title : undefined}
+                loading="lazy"
+              />
             );
           },
         }}
