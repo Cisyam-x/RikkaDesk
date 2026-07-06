@@ -111,6 +111,8 @@ interface ProviderExportItem {
   baseUrl: string;
   hasSecret: boolean;
   models: ProviderExportModel[];
+  customHeaders?: DesktopProviderCustomHeaderConfig[];
+  customBody?: unknown | null;
 }
 
 interface ProviderExportDocument {
@@ -124,7 +126,22 @@ interface ProviderImportPreviewResponse {
   status: string;
   importableCount: number;
   notice: string;
-  providers: ProviderExportItem[];
+  providers: ProviderImportPreviewItem[];
+}
+
+interface ProviderImportAdvancedSummary {
+  customHeaderCount: number;
+  customBodyPresent: boolean;
+}
+
+interface ProviderImportPreviewItem {
+  type: typeof PROVIDER_TYPE;
+  enabled: boolean;
+  name: string;
+  baseUrl: string;
+  hasSecret: boolean;
+  models: ProviderExportModel[];
+  advancedConfig: ProviderImportAdvancedSummary;
 }
 
 interface ProviderImportConfirmItem {
@@ -135,6 +152,7 @@ interface ProviderImportConfirmItem {
   baseUrl: string;
   hasSecret: boolean;
   models: Array<ProviderExportModel & { id: string }>;
+  advancedConfig?: ProviderImportAdvancedSummary;
 }
 
 interface ProviderImportConfirmResponse {
@@ -1443,6 +1461,25 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
                       {provider.hasSecret
                         ? t("provider_settings.yes")
                         : t("provider_settings.no")}
+                    </div>
+                  </div>
+                  <div className="mt-3 rounded-md bg-muted/40 px-2 py-1.5 text-xs">
+                    <div className="font-medium text-muted-foreground">
+                      {t("provider_settings.import_advanced_config")}
+                    </div>
+                    <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1">
+                      <span>
+                        {t("provider_settings.import_custom_header_count", {
+                          count: provider.advancedConfig.customHeaderCount,
+                        })}
+                      </span>
+                      <span>
+                        {t("provider_settings.import_custom_body_present", {
+                          value: provider.advancedConfig.customBodyPresent
+                            ? t("provider_settings.yes")
+                            : t("provider_settings.no"),
+                        })}
+                      </span>
                     </div>
                   </div>
                   <div className="mt-3 space-y-1.5">

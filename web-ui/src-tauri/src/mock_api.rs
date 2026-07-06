@@ -55,7 +55,8 @@ const SECRET_SERVICE_NAME: &str = "RikkaDesk";
 const OPENAI_COMPATIBLE_PROVIDER_TYPE: &str = "openai-compatible";
 const PROVIDER_SECRET_REF_PREFIX: &str = "rikkadesk:provider:";
 const OPENAI_TEST_TIMEOUT_SECS: u64 = 60;
-const PROVIDER_IMPORT_EXPORT_VERSION: u32 = 2;
+const PROVIDER_IMPORT_EXPORT_VERSION: u32 = 3;
+const PREVIOUS_PROVIDER_IMPORT_EXPORT_VERSION: u32 = 2;
 const LEGACY_PROVIDER_IMPORT_EXPORT_VERSION: u32 = 1;
 const PROVIDER_IMPORT_MAX_ITEMS: usize = 50;
 const PROVIDER_IMPORT_MAX_NAME_LEN: usize = 120;
@@ -536,6 +537,8 @@ struct ValidatedProviderImportItem {
     base_url: String,
     models: Vec<ValidatedProviderImportModel>,
     has_secret: bool,
+    custom_headers: Vec<DesktopProviderCustomHeaderConfig>,
+    custom_body: Option<Value>,
 }
 
 #[derive(Clone)]
@@ -554,6 +557,20 @@ struct ProviderExportModel {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ProviderExportItem {
+    #[serde(rename = "type")]
+    provider_type: String,
+    enabled: bool,
+    name: String,
+    base_url: String,
+    has_secret: bool,
+    models: Vec<ProviderExportModel>,
+    custom_headers: Vec<DesktopProviderCustomHeaderConfig>,
+    custom_body: Option<Value>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProviderExportItemV2 {
     #[serde(rename = "type")]
     provider_type: String,
     enabled: bool,
@@ -602,6 +619,16 @@ struct ProviderExportDocumentV2 {
     version: u32,
     app: String,
     exported_at: String,
+    providers: Vec<ProviderExportItemV2>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[allow(dead_code)]
+struct ProviderExportDocumentV3 {
+    version: u32,
+    app: String,
+    exported_at: String,
     providers: Vec<ProviderExportItem>,
 }
 
@@ -611,7 +638,27 @@ struct ProviderImportPreviewResponse {
     status: &'static str,
     importable_count: usize,
     notice: &'static str,
-    providers: Vec<ProviderExportItem>,
+    providers: Vec<ProviderImportPreviewItem>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderImportPreviewItem {
+    #[serde(rename = "type")]
+    provider_type: String,
+    enabled: bool,
+    name: String,
+    base_url: String,
+    has_secret: bool,
+    models: Vec<ProviderExportModel>,
+    advanced_config: ProviderImportAdvancedSummary,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderImportAdvancedSummary {
+    custom_header_count: usize,
+    custom_body_present: bool,
 }
 
 #[derive(Serialize)]
@@ -633,6 +680,7 @@ struct ProviderImportConfirmItem {
     base_url: String,
     has_secret: bool,
     models: Vec<ProviderImportConfirmModel>,
+    advanced_config: ProviderImportAdvancedSummary,
 }
 
 #[derive(Serialize)]
@@ -1179,10 +1227,11 @@ async fn confirm_desktop_provider_import(
             base_url: provider.base_url.clone(),
             models,
             legacy_model: None,
-            custom_headers: Vec::new(),
-            custom_body: None,
+            custom_headers: provider.custom_headers.clone(),
+            custom_body: provider.custom_body.clone(),
         };
 
+        let advanced_config = provider_import_advanced_summary(&provider);
         imported.push(ProviderImportConfirmItem {
             id,
             provider_type: provider.provider_type,
@@ -1191,6 +1240,7 @@ async fn confirm_desktop_provider_import(
             base_url: provider.base_url,
             has_secret: false,
             models: imported_models,
+            advanced_config,
         });
         imported_configs.push(config);
     }
@@ -2032,6 +2082,19 @@ async fn provider_export_items(
                         return Err("Provider has no models".to_string());
                     }
 
+                    let custom_headers = validate_custom_headers(&provider.custom_headers)
+                        .map_err(|_| {
+                            "Provider custom request config is not safe to export".to_string()
+                        })?;
+                    let custom_body = provider
+                        .custom_body
+                        .as_ref()
+                        .map(validate_custom_body_value)
+                        .transpose()
+                        .map_err(|_| {
+                            "Provider custom request config is not safe to export".to_string()
+                        })?;
+
                     Ok(ProviderExportItem {
                         provider_type: provider.provider_type.clone(),
                         enabled: provider.enabled,
@@ -2046,6 +2109,8 @@ async fn provider_export_items(
                                 display_name: model.display_name.clone(),
                             })
                             .collect(),
+                        custom_headers,
+                        custom_body,
                     })
                 })
         })
@@ -2074,10 +2139,15 @@ fn validate_provider_import_document(
                 .map_err(|_| bad_request_response("Invalid provider import document"))?;
             validate_provider_import_document_v1(&document)
         }
-        PROVIDER_IMPORT_EXPORT_VERSION => {
+        PREVIOUS_PROVIDER_IMPORT_EXPORT_VERSION => {
             let document = serde_json::from_value::<ProviderExportDocumentV2>(document.clone())
                 .map_err(|_| bad_request_response("Invalid provider import document"))?;
             validate_provider_import_document_v2(&document)
+        }
+        PROVIDER_IMPORT_EXPORT_VERSION => {
+            let document = serde_json::from_value::<ProviderExportDocumentV3>(document.clone())
+                .map_err(|_| bad_request_response("Invalid provider import document"))?;
+            validate_provider_import_document_v3(&document)
         }
         _ => Err(bad_request_response(
             "Unsupported provider import document version",
@@ -2107,7 +2177,7 @@ fn validate_provider_import_document_v1(
 fn validate_provider_import_document_v2(
     document: &ProviderExportDocumentV2,
 ) -> Result<Vec<ValidatedProviderImportItem>, Response> {
-    if document.version != PROVIDER_IMPORT_EXPORT_VERSION {
+    if document.version != PREVIOUS_PROVIDER_IMPORT_EXPORT_VERSION {
         return Err(bad_request_response(
             "Unsupported provider import document version",
         ));
@@ -2120,6 +2190,25 @@ fn validate_provider_import_document_v2(
         .iter()
         .enumerate()
         .map(|(index, provider)| validate_provider_import_item_v2(index + 1, provider))
+        .collect()
+}
+
+fn validate_provider_import_document_v3(
+    document: &ProviderExportDocumentV3,
+) -> Result<Vec<ValidatedProviderImportItem>, Response> {
+    if document.version != PROVIDER_IMPORT_EXPORT_VERSION {
+        return Err(bad_request_response(
+            "Unsupported provider import document version",
+        ));
+    }
+
+    validate_provider_import_count(document.providers.len())?;
+
+    document
+        .providers
+        .iter()
+        .enumerate()
+        .map(|(index, provider)| validate_provider_import_item_v3(index + 1, provider))
         .collect()
 }
 
@@ -2148,10 +2237,29 @@ fn validate_provider_import_item_v1(
         &provider.base_url,
         provider.has_secret,
         &models,
+        &[],
+        None,
     )
 }
 
 fn validate_provider_import_item_v2(
+    position: usize,
+    provider: &ProviderExportItemV2,
+) -> Result<ValidatedProviderImportItem, Response> {
+    validate_provider_import_item(
+        position,
+        &provider.provider_type,
+        provider.enabled,
+        &provider.name,
+        &provider.base_url,
+        provider.has_secret,
+        &provider.models,
+        &[],
+        None,
+    )
+}
+
+fn validate_provider_import_item_v3(
     position: usize,
     provider: &ProviderExportItem,
 ) -> Result<ValidatedProviderImportItem, Response> {
@@ -2163,6 +2271,8 @@ fn validate_provider_import_item_v2(
         &provider.base_url,
         provider.has_secret,
         &provider.models,
+        &provider.custom_headers,
+        provider.custom_body.as_ref(),
     )
 }
 
@@ -2174,6 +2284,8 @@ fn validate_provider_import_item(
     base_url: &str,
     has_secret: bool,
     models: &[ProviderExportModel],
+    custom_headers: &[DesktopProviderCustomHeaderConfig],
+    custom_body: Option<&Value>,
 ) -> Result<ValidatedProviderImportItem, Response> {
     let provider_type = provider_type.trim();
     if provider_type != OPENAI_COMPATIBLE_PROVIDER_TYPE {
@@ -2212,6 +2324,17 @@ fn validate_provider_import_item(
     };
 
     let models = validate_provider_import_models(position, models)?;
+    let custom_headers = validate_custom_headers(custom_headers).map_err(|_| {
+        bad_request_response(&format!(
+            "Provider {position} custom headers are not allowed"
+        ))
+    })?;
+    let custom_body = custom_body
+        .map(validate_custom_body_value)
+        .transpose()
+        .map_err(|_| {
+            bad_request_response(&format!("Provider {position} custom body is invalid"))
+        })?;
 
     Ok(ValidatedProviderImportItem {
         provider_type: OPENAI_COMPATIBLE_PROVIDER_TYPE.to_string(),
@@ -2220,6 +2343,8 @@ fn validate_provider_import_item(
         base_url: base_url.to_string(),
         models,
         has_secret,
+        custom_headers,
+        custom_body,
     })
 }
 
@@ -2280,8 +2405,10 @@ fn validate_provider_import_models(
     Ok(validated)
 }
 
-fn provider_import_preview_item(provider: &ValidatedProviderImportItem) -> ProviderExportItem {
-    ProviderExportItem {
+fn provider_import_preview_item(
+    provider: &ValidatedProviderImportItem,
+) -> ProviderImportPreviewItem {
+    ProviderImportPreviewItem {
         provider_type: provider.provider_type.clone(),
         enabled: provider.enabled,
         name: provider.name.clone(),
@@ -2295,6 +2422,16 @@ fn provider_import_preview_item(provider: &ValidatedProviderImportItem) -> Provi
                 display_name: model.display_name.clone(),
             })
             .collect(),
+        advanced_config: provider_import_advanced_summary(provider),
+    }
+}
+
+fn provider_import_advanced_summary(
+    provider: &ValidatedProviderImportItem,
+) -> ProviderImportAdvancedSummary {
+    ProviderImportAdvancedSummary {
+        custom_header_count: provider.custom_headers.len(),
+        custom_body_present: provider.custom_body.is_some(),
     }
 }
 
