@@ -4,7 +4,7 @@ RikkaDesk is an unofficial desktop derivative / experiment based on RikkaHub. Th
 
 Do not paste real API keys into documentation, commit messages, terminal transcripts, screenshots, or issue comments.
 
-Current feature-stable private beta tag: `rikkadesk-v0.1.0-beta.9`.
+Current feature-stable private beta tag: `rikkadesk-v0.1.0-beta.10`.
 
 ## Current Beta Scope
 
@@ -15,7 +15,8 @@ Included:
 - JSON persistence for settings, conversations, messages, provider config, and id sequence.
 - Desktop Provider Settings UI for OpenAI-compatible provider management.
 - Provider list, add/edit/delete provider, multiple models per provider, favorite model updates, Set as current model, and Test Connection.
-- Safe provider import/export v2 for multi-model provider metadata, with v1 import compatibility.
+- Advanced request config for non-sensitive provider custom headers and safe custom body JSON.
+- Safe provider import/export v3 for multi-model provider metadata and safe advanced request config, with v1/v2 import compatibility.
 - Secret references in JSON and encrypted local secret blobs for API keys.
 - OpenAI-compatible text chat with streaming responses.
 - Mock fallback when a real provider is not configured or cannot be used.
@@ -114,9 +115,11 @@ Important files:
 
 ## `state.v1.json`
 
-`state.v1.json` stores non-sensitive local state for the desktop prototype. The filename remains `state.v1.json` even though the JSON payload may contain `schemaVersion: 3`.
+`state.v1.json` stores non-sensitive local state for the desktop prototype. The filename remains `state.v1.json` even though the JSON payload may contain `schemaVersion: 4`.
 
 Phase 8 upgrades provider state from `provider.model` to `provider.models[]`. Old beta.8 or earlier builds should not be started against a schema v3 state file; they may treat the state as unsupported and create a corrupt backup or default state. Back up app data before testing schema migration or moving between beta builds.
+
+Phase 9B upgrades provider state to `schemaVersion: 4` with `providers[].customHeaders` and `providers[].customBody`. Old beta.9 or earlier builds should not be started against a schema v4 state file; they may not understand the provider shape. Back up app data before testing schema migration or moving between beta builds.
 
 It may contain:
 
@@ -127,6 +130,8 @@ It may contain:
 - provider id, name, type, enabled flag
 - baseUrl
 - model ids and displayNames under `providers[].models[]`
+- non-sensitive custom headers under `providers[].customHeaders`
+- safe custom body JSON under `providers[].customBody`
 - assistant chatModelId
 - secretRef
 - savedAt
@@ -199,6 +204,31 @@ Deleting a provider should remove its local secret and clear related favorite mo
 4. With a valid local provider configuration, confirm a success toast appears.
 5. With an invalid Base URL, Model ID, or local key, confirm a safe failure toast appears.
 6. Confirm the failure message does not include the API key, Authorization header, `x-api-key`, full request headers, or full request body.
+
+## Test Advanced Request Config
+
+1. Open Provider Settings and select or create an OpenAI-compatible provider.
+2. Confirm the Advanced request config section is collapsed by default.
+3. Add safe custom headers such as `OpenAI-Beta: assistants=v2` and `x-gateway-route: beta`.
+4. Save, close, and reopen Provider Settings. Confirm the safe headers remain.
+5. Clear the custom headers, save, close, and reopen. Confirm the header list stays empty.
+6. Add safe custom body JSON such as:
+
+```json
+{
+  "temperature": 0.7,
+  "top_p": 0.9,
+  "max_tokens": 123
+}
+```
+
+7. Use `Format JSON`, save, close, and reopen. Confirm the safe body remains formatted and persisted.
+8. Use `Clear JSON`, save, close, and reopen. Confirm the custom body is empty.
+9. Confirm sensitive headers are rejected, including `Authorization`, `x-api-key`, `api-key`, `cookie`, and `proxy-authorization`.
+10. Confirm sensitive custom body keys or values are rejected, including `apiKey`, `authorization`, `token`, `password`, `secret`, `credential`, `bearer`, and obvious key-like strings.
+11. Confirm Test Connection uses the safe custom config but forces `max_tokens=1`.
+12. Confirm Streaming Chat uses the same safe request builder and preserves allowed custom body fields such as `max_tokens`.
+13. Confirm safe errors do not echo full custom header values or full custom body JSON.
 
 ## Test Real OpenAI-Compatible Streaming Chat
 
@@ -307,13 +337,16 @@ Checklist:
 - Confirm deleting a provider removes its local secret.
 - Add two models under one provider and confirm both appear in the model selector.
 - Delete one model and confirm current/favorite fallback behavior is safe.
+- Add safe Advanced request config custom headers/body, then save, reopen, clear, and confirm persistence behavior.
+- Confirm sensitive custom headers/body are rejected.
 - Favorite and unfavorite a provider model from the model selector.
 - Use Set as current model from Provider Settings.
 - Run Test Connection for a specific model with both a valid test endpoint and an intentionally invalid endpoint when available.
-- Export providers and confirm the JSON is version 2 with `providers[].models[]`.
-- Import a version 2 provider export with multiple models and confirm imported providers have `hasSecret: false`.
+- Export providers and confirm the JSON is version 3 with `providers[].models[]`, safe `customHeaders[]`, and safe `customBody`.
+- Import a version 3 provider export with multiple models and safe advanced config, then confirm imported providers have `hasSecret: false`.
+- Import a version 2 provider export with multiple models and confirm imported providers have `hasSecret: false` and no advanced config.
 - Import an older version 1 provider export and confirm it imports as a single model.
-- Confirm exports exclude API keys, `secretRef`, tokens, Authorization headers, DPAPI blobs, local secret-store files, and model internal ids.
+- Confirm exports exclude API keys, `secretRef`, tokens, Authorization headers, `x-api-key`, cookies, DPAPI blobs, local secret-store files, and model internal ids.
 - Send a text message.
 - Restart RikkaDesk.
 - Confirm the conversation remains.

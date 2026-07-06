@@ -13,7 +13,8 @@ Current Provider Settings covers:
 - Non-sensitive provider configuration saved in local JSON state.
 - API key storage through the desktop secret store.
 - Per-model Set as current model and Test Connection actions.
-- Safe provider import/export v2 with v1 import compatibility.
+- Advanced request config for non-sensitive custom headers and safe custom body JSON.
+- Safe provider import/export v3 with v1/v2 import compatibility.
 - Real text chat through the existing OpenAI-compatible path.
 - Streaming text response verification.
 
@@ -45,6 +46,8 @@ Recommended fields:
 | Base URL | `https://api.openai.com/v1` | API root URL is preferred. |
 | Model ID | `gpt-4o-mini` | Use a model supported by the configured endpoint. Add more model rows for the same provider when needed. |
 | Display Name | `gpt-4o-mini` | Optional per model; defaults to Model ID if blank. |
+| Custom Headers | `OpenAI-Beta: assistants=v2` | Optional Advanced request config. Use only non-sensitive headers. |
+| Custom Body JSON | `{ "temperature": 0.7 }` | Optional Advanced request config. Must be a JSON object and must not contain credentials. |
 | API Key | entered locally in the password field | Never echoed after save. |
 
 The backend also accepts a full chat completions endpoint, for example `https://example.test/v1/chat/completions`, but the API root form is easier to read and less error-prone.
@@ -62,6 +65,22 @@ The backend also accepts a full chat completions endpoint, for example `https://
 If the API key field is left blank, the UI saves only the non-sensitive provider configuration. Existing saved secrets are kept.
 
 `Clear API Key` deletes the secret from the desktop secret store and changes the visible status to `hasSecret: false`. It must not modify chat history.
+
+## Advanced Request Config
+
+The Advanced request config section is for OpenAI-compatible gateways that require non-sensitive custom request fields. It is collapsed by default so normal users can leave it alone.
+
+Allowed examples:
+
+- `OpenAI-Beta: assistants=v2`
+- `x-gateway-route: beta`
+- Custom body JSON such as `{ "temperature": 0.7, "top_p": 0.9, "max_tokens": 123 }`
+
+Do not put API keys, tokens, passwords, `Authorization`, `x-api-key`, cookies, or other credentials in custom headers or custom body JSON. API keys belong only in the API Key field and are saved through the desktop SecretStore / DPAPI path.
+
+UI validation is a convenience layer only. The Rust backend is the final safety boundary and must reject sensitive header names, sensitive values, reserved body fields such as `model`, `messages`, or `stream`, non-object custom body JSON, and oversized custom body payloads.
+
+Test Connection and Streaming Chat share the same safe OpenAI-compatible request builder. Test Connection forces `max_tokens=1`; Streaming Chat may preserve allowed custom body fields such as `max_tokens`.
 
 ## Confirm Model Availability
 
@@ -201,6 +220,15 @@ Expected response shape:
         "displayName": "gpt-4o-mini Fast"
       }
     ],
+    "customHeaders": [
+      {
+        "name": "OpenAI-Beta",
+        "value": "assistants=v2"
+      }
+    ],
+    "customBody": {
+      "temperature": 0.7
+    },
     "secretRef": "rikkadesk.provider.rikkadesk-openai-compatible.api-key",
     "hasSecret": true
   }
@@ -223,17 +251,22 @@ The `model` field remains for older UI compatibility and mirrors the first entry
 - Model selector shows multiple models from the same provider.
 - Set as current model works from a specific model row.
 - Test Connection works from a specific model row.
-- Provider export produces version 2 JSON with `providers[].models[]`.
+- Advanced request config saves safe custom headers and safe custom body JSON.
+- Advanced request config can be cleared and remains cleared after reopening.
+- Sensitive custom headers/body are rejected by UI/backend validation.
+- Provider export produces version 3 JSON with `providers[].models[]`, safe `customHeaders[]`, and safe `customBody`.
 - Provider import preview shows every model row.
+- Provider import preview shows advanced config summary without header values or full custom body JSON.
 - Provider import confirm creates imported providers with `hasSecret: false`.
 - Version 1 provider exports can still be imported as a single model.
+- Version 2 provider exports can still be imported as multi-model providers with empty advanced config.
 - A text-only message can be sent with the configured model selected.
 - Real provider response streams into the assistant message.
 - Restart keeps provider config, chat history, and `hasSecret` state.
 - Repository search finds no plaintext key fragment.
 - App data search finds no plaintext key fragment.
 - `state.v1.json` contains only `secretRef`, not secret values.
-- Provider exports contain no API keys, `secretRef`, tokens, Authorization headers, DPAPI blobs, local secret-store files, provider IDs, or internal model IDs.
+- Provider exports contain no API keys, `secretRef`, tokens, Authorization headers, `x-api-key`, cookies, DPAPI blobs, local secret-store files, provider IDs, or internal model IDs.
 - Error messages do not include secret values or sensitive headers.
 
 ## Troubleshooting Notes

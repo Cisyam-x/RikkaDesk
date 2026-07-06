@@ -13,13 +13,14 @@ import {
 } from "~/components/ui/dialog";
 
 const RIKKADESK_VERSION = "0.1.0";
-const RIKKADESK_FEATURE_TAG = "rikkadesk-v0.1.0-beta.9";
+const RIKKADESK_FEATURE_TAG = "rikkadesk-v0.1.0-beta.10";
 
 const SUPPORT_KEYS = [
   "openai_streaming",
   "conversation_management",
   "provider_settings",
   "provider_multi_model",
+  "provider_advanced_request_config",
   "test_connection",
   "provider_import_export",
 ] as const;

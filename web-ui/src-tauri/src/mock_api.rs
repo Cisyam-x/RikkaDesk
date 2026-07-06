@@ -24,8 +24,9 @@ use axum::{
     Json, Router,
 };
 use chrono::Utc;
+use reqwest::header::{HeaderName as ReqwestHeaderName, HeaderValue as ReqwestHeaderValue};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use tokio::{
     fs,
     net::TcpListener,
@@ -44,7 +45,8 @@ const PREFERRED_ADDR: &str = "127.0.0.1:8080";
 const PERSIST_DIR_NAME: &str = "mock-api";
 const STATE_FILE_NAME: &str = "state.v1.json";
 const STATE_TMP_FILE_NAME: &str = "state.v1.json.tmp";
-const STATE_SCHEMA_VERSION: u32 = 3;
+const STATE_SCHEMA_VERSION: u32 = 4;
+const MULTI_MODEL_STATE_SCHEMA_VERSION: u32 = 3;
 const PREVIOUS_STATE_SCHEMA_VERSION: u32 = 2;
 const LEGACY_STATE_SCHEMA_VERSION: u32 = 1;
 const SECRETS_DIR_NAME: &str = "secrets";
@@ -53,7 +55,8 @@ const SECRET_SERVICE_NAME: &str = "RikkaDesk";
 const OPENAI_COMPATIBLE_PROVIDER_TYPE: &str = "openai-compatible";
 const PROVIDER_SECRET_REF_PREFIX: &str = "rikkadesk:provider:";
 const OPENAI_TEST_TIMEOUT_SECS: u64 = 60;
-const PROVIDER_IMPORT_EXPORT_VERSION: u32 = 2;
+const PROVIDER_IMPORT_EXPORT_VERSION: u32 = 3;
+const PREVIOUS_PROVIDER_IMPORT_EXPORT_VERSION: u32 = 2;
 const LEGACY_PROVIDER_IMPORT_EXPORT_VERSION: u32 = 1;
 const PROVIDER_IMPORT_MAX_ITEMS: usize = 50;
 const PROVIDER_IMPORT_MAX_NAME_LEN: usize = 120;
@@ -61,6 +64,10 @@ const PROVIDER_IMPORT_MAX_DISPLAY_NAME_LEN: usize = 160;
 const PROVIDER_IMPORT_MAX_MODEL_ID_LEN: usize = 200;
 const PROVIDER_IMPORT_MAX_BASE_URL_LEN: usize = 512;
 const PROVIDER_MODEL_MAX_ITEMS: usize = 50;
+const PROVIDER_CUSTOM_HEADER_MAX_ITEMS: usize = 32;
+const PROVIDER_CUSTOM_HEADER_MAX_NAME_LEN: usize = 128;
+const PROVIDER_CUSTOM_HEADER_MAX_VALUE_LEN: usize = 1024;
+const PROVIDER_CUSTOM_BODY_MAX_BYTES: usize = 16 * 1024;
 const MOCK_ASSISTANT_ID: &str = "mock-assistant";
 const MOCK_MODEL_ID: &str = "mock-chat";
 const MOCK_PROVIDER_ID: &str = "mock-provider";
@@ -346,6 +353,10 @@ struct DesktopProviderConfig {
     #[serde(default, rename = "model", skip_serializing)]
     legacy_model: Option<DesktopProviderModelConfig>,
     secret_ref: String,
+    #[serde(default)]
+    custom_headers: Vec<DesktopProviderCustomHeaderConfig>,
+    #[serde(default)]
+    custom_body: Option<Value>,
 }
 
 impl DesktopProviderConfig {
@@ -408,6 +419,37 @@ struct DesktopProviderModelConfig {
     display_name: String,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopProviderCustomHeaderConfig {
+    name: String,
+    value: String,
+}
+
+#[derive(Clone)]
+enum CustomBodyUpdate {
+    Missing,
+    Clear,
+    Set(Value),
+}
+
+impl Default for CustomBodyUpdate {
+    fn default() -> Self {
+        Self::Missing
+    }
+}
+
+fn deserialize_custom_body_update<'de, D>(deserializer: D) -> Result<CustomBodyUpdate, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(value) => CustomBodyUpdate::Set(value),
+        None => CustomBodyUpdate::Clear,
+    })
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UpsertDesktopProviderRequest {
@@ -421,6 +463,9 @@ struct UpsertDesktopProviderRequest {
     model_id: Option<String>,
     display_name: Option<String>,
     api_key: Option<String>,
+    custom_headers: Option<Vec<DesktopProviderCustomHeaderConfig>>,
+    #[serde(default, deserialize_with = "deserialize_custom_body_update")]
+    custom_body: CustomBodyUpdate,
 }
 
 #[derive(Deserialize)]
@@ -457,6 +502,8 @@ struct DesktopProviderResponse {
     models: Vec<DesktopProviderModelConfig>,
     secret_ref: String,
     has_secret: bool,
+    custom_headers: Vec<DesktopProviderCustomHeaderConfig>,
+    custom_body: Option<Value>,
 }
 
 impl DesktopProviderResponse {
@@ -476,6 +523,8 @@ impl DesktopProviderResponse {
             models: config.models.clone(),
             secret_ref: config.secret_ref.clone(),
             has_secret,
+            custom_headers: config.custom_headers.clone(),
+            custom_body: config.custom_body.clone(),
         })
     }
 }
@@ -488,6 +537,8 @@ struct ValidatedProviderImportItem {
     base_url: String,
     models: Vec<ValidatedProviderImportModel>,
     has_secret: bool,
+    custom_headers: Vec<DesktopProviderCustomHeaderConfig>,
+    custom_body: Option<Value>,
 }
 
 #[derive(Clone)]
@@ -506,6 +557,20 @@ struct ProviderExportModel {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ProviderExportItem {
+    #[serde(rename = "type")]
+    provider_type: String,
+    enabled: bool,
+    name: String,
+    base_url: String,
+    has_secret: bool,
+    models: Vec<ProviderExportModel>,
+    custom_headers: Vec<DesktopProviderCustomHeaderConfig>,
+    custom_body: Option<Value>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProviderExportItemV2 {
     #[serde(rename = "type")]
     provider_type: String,
     enabled: bool,
@@ -554,6 +619,16 @@ struct ProviderExportDocumentV2 {
     version: u32,
     app: String,
     exported_at: String,
+    providers: Vec<ProviderExportItemV2>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[allow(dead_code)]
+struct ProviderExportDocumentV3 {
+    version: u32,
+    app: String,
+    exported_at: String,
     providers: Vec<ProviderExportItem>,
 }
 
@@ -563,7 +638,27 @@ struct ProviderImportPreviewResponse {
     status: &'static str,
     importable_count: usize,
     notice: &'static str,
-    providers: Vec<ProviderExportItem>,
+    providers: Vec<ProviderImportPreviewItem>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderImportPreviewItem {
+    #[serde(rename = "type")]
+    provider_type: String,
+    enabled: bool,
+    name: String,
+    base_url: String,
+    has_secret: bool,
+    models: Vec<ProviderExportModel>,
+    advanced_config: ProviderImportAdvancedSummary,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderImportAdvancedSummary {
+    custom_header_count: usize,
+    custom_body_present: bool,
 }
 
 #[derive(Serialize)]
@@ -585,6 +680,7 @@ struct ProviderImportConfirmItem {
     base_url: String,
     has_secret: bool,
     models: Vec<ProviderImportConfirmModel>,
+    advanced_config: ProviderImportAdvancedSummary,
 }
 
 #[derive(Serialize)]
@@ -599,21 +695,20 @@ struct OpenAiChatConfig {
     base_url: String,
     model_id: String,
     api_key: String,
-}
-
-#[derive(Serialize)]
-struct OpenAiChatCompletionRequest {
-    model: String,
-    messages: Vec<OpenAiChatMessage>,
-    stream: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_tokens: Option<u32>,
+    custom_headers: Vec<DesktopProviderCustomHeaderConfig>,
+    custom_body: Option<Value>,
 }
 
 #[derive(Clone, Serialize)]
 struct OpenAiChatMessage {
     role: String,
     content: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenAiRequestKind {
+    TestConnection,
+    StreamingChat,
 }
 
 #[derive(Deserialize)]
@@ -951,8 +1046,17 @@ async fn load_persisted_state(persistence: &MockPersistence) -> PersistedMockSta
             ensure_current_model_exists(&mut persisted.settings);
             persisted
         }
+        Ok(persisted) if persisted.schema_version == MULTI_MODEL_STATE_SCHEMA_VERSION => {
+            let mut migrated = migrate_v3_to_v4(persisted);
+            sync_settings_with_desktop_providers(&mut migrated.settings, &migrated.providers);
+            ensure_current_model_exists(&mut migrated.settings);
+            if let Err(error) = persistence.save(&migrated).await {
+                eprintln!("RikkaDesk mock API failed to save migrated state: {error}");
+            }
+            migrated
+        }
         Ok(persisted) if persisted.schema_version == PREVIOUS_STATE_SCHEMA_VERSION => {
-            let mut migrated = migrate_v2_to_v3(persisted);
+            let mut migrated = migrate_v2_to_v4(persisted);
             sync_settings_with_desktop_providers(&mut migrated.settings, &migrated.providers);
             ensure_current_model_exists(&mut migrated.settings);
             if let Err(error) = persistence.save(&migrated).await {
@@ -961,7 +1065,7 @@ async fn load_persisted_state(persistence: &MockPersistence) -> PersistedMockSta
             migrated
         }
         Ok(persisted) if persisted.schema_version == LEGACY_STATE_SCHEMA_VERSION => {
-            let mut migrated = migrate_v1_to_v3(persisted);
+            let mut migrated = migrate_v1_to_v4(persisted);
             sync_settings_with_desktop_providers(&mut migrated.settings, &migrated.providers);
             ensure_current_model_exists(&mut migrated.settings);
             if let Err(error) = persistence.save(&migrated).await {
@@ -1123,8 +1227,11 @@ async fn confirm_desktop_provider_import(
             base_url: provider.base_url.clone(),
             models,
             legacy_model: None,
+            custom_headers: provider.custom_headers.clone(),
+            custom_body: provider.custom_body.clone(),
         };
 
+        let advanced_config = provider_import_advanced_summary(&provider);
         imported.push(ProviderImportConfirmItem {
             id,
             provider_type: provider.provider_type,
@@ -1133,6 +1240,7 @@ async fn confirm_desktop_provider_import(
             base_url: provider.base_url,
             has_secret: false,
             models: imported_models,
+            advanced_config,
         });
         imported_configs.push(config);
     }
@@ -1974,6 +2082,19 @@ async fn provider_export_items(
                         return Err("Provider has no models".to_string());
                     }
 
+                    let custom_headers = validate_custom_headers(&provider.custom_headers)
+                        .map_err(|_| {
+                            "Provider custom request config is not safe to export".to_string()
+                        })?;
+                    let custom_body = provider
+                        .custom_body
+                        .as_ref()
+                        .map(validate_custom_body_value)
+                        .transpose()
+                        .map_err(|_| {
+                            "Provider custom request config is not safe to export".to_string()
+                        })?;
+
                     Ok(ProviderExportItem {
                         provider_type: provider.provider_type.clone(),
                         enabled: provider.enabled,
@@ -1988,6 +2109,8 @@ async fn provider_export_items(
                                 display_name: model.display_name.clone(),
                             })
                             .collect(),
+                        custom_headers,
+                        custom_body,
                     })
                 })
         })
@@ -2016,10 +2139,15 @@ fn validate_provider_import_document(
                 .map_err(|_| bad_request_response("Invalid provider import document"))?;
             validate_provider_import_document_v1(&document)
         }
-        PROVIDER_IMPORT_EXPORT_VERSION => {
+        PREVIOUS_PROVIDER_IMPORT_EXPORT_VERSION => {
             let document = serde_json::from_value::<ProviderExportDocumentV2>(document.clone())
                 .map_err(|_| bad_request_response("Invalid provider import document"))?;
             validate_provider_import_document_v2(&document)
+        }
+        PROVIDER_IMPORT_EXPORT_VERSION => {
+            let document = serde_json::from_value::<ProviderExportDocumentV3>(document.clone())
+                .map_err(|_| bad_request_response("Invalid provider import document"))?;
+            validate_provider_import_document_v3(&document)
         }
         _ => Err(bad_request_response(
             "Unsupported provider import document version",
@@ -2049,7 +2177,7 @@ fn validate_provider_import_document_v1(
 fn validate_provider_import_document_v2(
     document: &ProviderExportDocumentV2,
 ) -> Result<Vec<ValidatedProviderImportItem>, Response> {
-    if document.version != PROVIDER_IMPORT_EXPORT_VERSION {
+    if document.version != PREVIOUS_PROVIDER_IMPORT_EXPORT_VERSION {
         return Err(bad_request_response(
             "Unsupported provider import document version",
         ));
@@ -2062,6 +2190,25 @@ fn validate_provider_import_document_v2(
         .iter()
         .enumerate()
         .map(|(index, provider)| validate_provider_import_item_v2(index + 1, provider))
+        .collect()
+}
+
+fn validate_provider_import_document_v3(
+    document: &ProviderExportDocumentV3,
+) -> Result<Vec<ValidatedProviderImportItem>, Response> {
+    if document.version != PROVIDER_IMPORT_EXPORT_VERSION {
+        return Err(bad_request_response(
+            "Unsupported provider import document version",
+        ));
+    }
+
+    validate_provider_import_count(document.providers.len())?;
+
+    document
+        .providers
+        .iter()
+        .enumerate()
+        .map(|(index, provider)| validate_provider_import_item_v3(index + 1, provider))
         .collect()
 }
 
@@ -2090,10 +2237,29 @@ fn validate_provider_import_item_v1(
         &provider.base_url,
         provider.has_secret,
         &models,
+        &[],
+        None,
     )
 }
 
 fn validate_provider_import_item_v2(
+    position: usize,
+    provider: &ProviderExportItemV2,
+) -> Result<ValidatedProviderImportItem, Response> {
+    validate_provider_import_item(
+        position,
+        &provider.provider_type,
+        provider.enabled,
+        &provider.name,
+        &provider.base_url,
+        provider.has_secret,
+        &provider.models,
+        &[],
+        None,
+    )
+}
+
+fn validate_provider_import_item_v3(
     position: usize,
     provider: &ProviderExportItem,
 ) -> Result<ValidatedProviderImportItem, Response> {
@@ -2105,6 +2271,8 @@ fn validate_provider_import_item_v2(
         &provider.base_url,
         provider.has_secret,
         &provider.models,
+        &provider.custom_headers,
+        provider.custom_body.as_ref(),
     )
 }
 
@@ -2116,6 +2284,8 @@ fn validate_provider_import_item(
     base_url: &str,
     has_secret: bool,
     models: &[ProviderExportModel],
+    custom_headers: &[DesktopProviderCustomHeaderConfig],
+    custom_body: Option<&Value>,
 ) -> Result<ValidatedProviderImportItem, Response> {
     let provider_type = provider_type.trim();
     if provider_type != OPENAI_COMPATIBLE_PROVIDER_TYPE {
@@ -2154,6 +2324,17 @@ fn validate_provider_import_item(
     };
 
     let models = validate_provider_import_models(position, models)?;
+    let custom_headers = validate_custom_headers(custom_headers).map_err(|_| {
+        bad_request_response(&format!(
+            "Provider {position} custom headers are not allowed"
+        ))
+    })?;
+    let custom_body = custom_body
+        .map(validate_custom_body_value)
+        .transpose()
+        .map_err(|_| {
+            bad_request_response(&format!("Provider {position} custom body is invalid"))
+        })?;
 
     Ok(ValidatedProviderImportItem {
         provider_type: OPENAI_COMPATIBLE_PROVIDER_TYPE.to_string(),
@@ -2162,6 +2343,8 @@ fn validate_provider_import_item(
         base_url: base_url.to_string(),
         models,
         has_secret,
+        custom_headers,
+        custom_body,
     })
 }
 
@@ -2222,8 +2405,10 @@ fn validate_provider_import_models(
     Ok(validated)
 }
 
-fn provider_import_preview_item(provider: &ValidatedProviderImportItem) -> ProviderExportItem {
-    ProviderExportItem {
+fn provider_import_preview_item(
+    provider: &ValidatedProviderImportItem,
+) -> ProviderImportPreviewItem {
+    ProviderImportPreviewItem {
         provider_type: provider.provider_type.clone(),
         enabled: provider.enabled,
         name: provider.name.clone(),
@@ -2237,6 +2422,16 @@ fn provider_import_preview_item(provider: &ValidatedProviderImportItem) -> Provi
                 display_name: model.display_name.clone(),
             })
             .collect(),
+        advanced_config: provider_import_advanced_summary(provider),
+    }
+}
+
+fn provider_import_advanced_summary(
+    provider: &ValidatedProviderImportItem,
+) -> ProviderImportAdvancedSummary {
+    ProviderImportAdvancedSummary {
+        custom_header_count: provider.custom_headers.len(),
+        custom_body_present: provider.custom_body.is_some(),
     }
 }
 
@@ -2436,13 +2631,15 @@ async fn resolve_openai_chat_config(
                         provider.base_url.clone(),
                         model.model_id.clone(),
                         provider.secret_ref.clone(),
+                        provider.custom_headers.clone(),
+                        provider.custom_body.clone(),
                     )
                 })
             })
         })
     };
 
-    let Some((base_url, model_id, secret_ref)) = config else {
+    let Some((base_url, model_id, secret_ref, custom_headers, custom_body)) = config else {
         return Ok(None);
     };
 
@@ -2464,6 +2661,8 @@ async fn resolve_openai_chat_config(
         base_url: base_url.to_string(),
         model_id: model_id.to_string(),
         api_key,
+        custom_headers,
+        custom_body,
     }))
 }
 
@@ -2517,29 +2716,79 @@ async fn resolve_openai_chat_config_for_provider(
         base_url: base_url.to_string(),
         model_id: model_id.to_string(),
         api_key,
+        custom_headers: provider.custom_headers.clone(),
+        custom_body: provider.custom_body.clone(),
     }))
+}
+
+fn build_openai_chat_request_body(
+    config: &OpenAiChatConfig,
+    messages: Vec<OpenAiChatMessage>,
+    stream: bool,
+    kind: OpenAiRequestKind,
+) -> Result<Value, String> {
+    let mut body = if let Some(custom_body) = config.custom_body.as_ref() {
+        let validated = validate_custom_body_value(custom_body)?;
+        validated
+            .as_object()
+            .cloned()
+            .ok_or_else(|| "Custom body must be a JSON object".to_string())?
+    } else {
+        Map::new()
+    };
+
+    body.insert("model".to_string(), json!(config.model_id.clone()));
+    body.insert(
+        "messages".to_string(),
+        serde_json::to_value(messages).map_err(|_| "Failed to build request body".to_string())?,
+    );
+    body.insert("stream".to_string(), json!(stream));
+
+    if kind == OpenAiRequestKind::TestConnection {
+        body.insert("max_tokens".to_string(), json!(1));
+    }
+
+    Ok(Value::Object(body))
+}
+
+fn apply_openai_custom_headers(
+    builder: reqwest::RequestBuilder,
+    headers: &[DesktopProviderCustomHeaderConfig],
+) -> Result<reqwest::RequestBuilder, String> {
+    let headers = validate_custom_headers(headers)?;
+    let mut builder = builder;
+    for header in headers {
+        let name = ReqwestHeaderName::from_bytes(header.name.as_bytes())
+            .map_err(|_| "Custom header name is invalid".to_string())?;
+        let value = ReqwestHeaderValue::from_str(&header.value)
+            .map_err(|_| "Custom header value is invalid".to_string())?;
+        builder = builder.header(name, value);
+    }
+    Ok(builder)
 }
 
 async fn test_openai_compatible_chat_connection(
     state: &Arc<MockApiState>,
     config: &OpenAiChatConfig,
 ) -> Result<(), String> {
-    let request = OpenAiChatCompletionRequest {
-        model: config.model_id.clone(),
-        messages: vec![OpenAiChatMessage {
+    let body = build_openai_chat_request_body(
+        config,
+        vec![OpenAiChatMessage {
             role: "user".to_string(),
             content: "ping".to_string(),
         }],
-        stream: false,
-        max_tokens: Some(1),
-    };
+        false,
+        OpenAiRequestKind::TestConnection,
+    )?;
 
-    let response = state
+    let request = state
         .http_client
         .post(openai_chat_completions_url(&config.base_url))
-        .timeout(Duration::from_secs(OPENAI_TEST_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(OPENAI_TEST_TIMEOUT_SECS));
+    let request = apply_openai_custom_headers(request, &config.custom_headers)?;
+    let response = request
         .bearer_auth(&config.api_key)
-        .json(&request)
+        .json(&body)
         .send()
         .await
         .map_err(safe_reqwest_error)?;
@@ -2596,18 +2845,16 @@ async fn stream_openai_compatible_chat(
     config: &OpenAiChatConfig,
     messages: Vec<OpenAiChatMessage>,
 ) -> Result<(), String> {
-    let request = OpenAiChatCompletionRequest {
-        model: config.model_id.clone(),
-        messages,
-        stream: true,
-        max_tokens: None,
-    };
+    let body =
+        build_openai_chat_request_body(config, messages, true, OpenAiRequestKind::StreamingChat)?;
 
-    let mut response = state
+    let request = state
         .http_client
-        .post(openai_chat_completions_url(&config.base_url))
+        .post(openai_chat_completions_url(&config.base_url));
+    let request = apply_openai_custom_headers(request, &config.custom_headers)?;
+    let mut response = request
         .bearer_auth(&config.api_key)
-        .json(&request)
+        .json(&body)
         .send()
         .await
         .map_err(safe_reqwest_error)?;
@@ -2886,6 +3133,25 @@ async fn build_desktop_provider(
         })
         .unwrap_or_default();
 
+    let custom_headers = if let Some(headers) = payload.custom_headers.as_ref() {
+        validate_custom_headers(headers).map_err(|message| bad_request_response(&message))?
+    } else {
+        existing
+            .as_ref()
+            .map(|provider| provider.custom_headers.clone())
+            .unwrap_or_default()
+    };
+
+    let custom_body = match &payload.custom_body {
+        CustomBodyUpdate::Set(value) => Some(
+            validate_custom_body_value(value).map_err(|message| bad_request_response(&message))?,
+        ),
+        CustomBodyUpdate::Clear => None,
+        CustomBodyUpdate::Missing => existing
+            .as_ref()
+            .and_then(|provider| provider.custom_body.clone()),
+    };
+
     let provider = DesktopProviderConfig {
         secret_ref: existing
             .as_ref()
@@ -2901,6 +3167,8 @@ async fn build_desktop_provider(
         base_url,
         models,
         legacy_model: None,
+        custom_headers,
+        custom_body,
     };
 
     let api_key = payload
@@ -3063,6 +3331,174 @@ fn build_models_from_singular_request(
 
     Ok(models)
 }
+
+fn validate_custom_headers(
+    headers: &[DesktopProviderCustomHeaderConfig],
+) -> Result<Vec<DesktopProviderCustomHeaderConfig>, String> {
+    if headers.len() > PROVIDER_CUSTOM_HEADER_MAX_ITEMS {
+        return Err("Custom header list is too large".to_string());
+    }
+
+    headers
+        .iter()
+        .map(|header| {
+            let name = header.name.trim();
+            let value = header.value.trim();
+            if name.is_empty() {
+                return Err("Custom header name is required".to_string());
+            }
+            if value.is_empty() {
+                return Err("Custom header value is required".to_string());
+            }
+            if field_is_too_long(name, PROVIDER_CUSTOM_HEADER_MAX_NAME_LEN) {
+                return Err("Custom header name is too long".to_string());
+            }
+            if field_is_too_long(value, PROVIDER_CUSTOM_HEADER_MAX_VALUE_LEN) {
+                return Err("Custom header value is too long".to_string());
+            }
+            if is_forbidden_custom_header_name(name)
+                || contains_sensitive_custom_text(name)
+                || contains_sensitive_custom_text(value)
+            {
+                return Err("Custom header is not allowed".to_string());
+            }
+
+            ReqwestHeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| "Custom header name is invalid".to_string())?;
+            ReqwestHeaderValue::from_str(value)
+                .map_err(|_| "Custom header value is invalid".to_string())?;
+
+            Ok(DesktopProviderCustomHeaderConfig {
+                name: name.to_string(),
+                value: value.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn is_forbidden_custom_header_name(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "x-api-key"
+            | "api-key"
+            | "apikey"
+            | "api_key"
+            | "cookie"
+            | "set-cookie"
+            | "authentication"
+            | "x-auth-token"
+            | "x-access-token"
+    )
+}
+
+fn contains_sensitive_custom_text(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    [
+        "bearer",
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "credential",
+        "api key",
+        "sk-",
+        "refresh_token",
+        "access_token",
+    ]
+    .iter()
+    .any(|term| lower.contains(term))
+}
+
+fn validate_custom_body_value(value: &Value) -> Result<Value, String> {
+    let serialized = serde_json::to_vec(value).map_err(|_| "Custom body is invalid".to_string())?;
+    if serialized.len() > PROVIDER_CUSTOM_BODY_MAX_BYTES {
+        return Err("Custom body is too large".to_string());
+    }
+
+    let object = value
+        .as_object()
+        .ok_or_else(|| "Custom body must be a JSON object".to_string())?;
+
+    for key in object.keys() {
+        if is_reserved_custom_body_key(key) {
+            return Err("Custom body contains reserved fields".to_string());
+        }
+        if is_sensitive_custom_body_key(key) {
+            return Err("Custom body contains sensitive fields".to_string());
+        }
+    }
+
+    scan_custom_body_for_sensitive_values(value)?;
+    Ok(Value::Object(object.clone()))
+}
+
+fn is_reserved_custom_body_key(key: &str) -> bool {
+    matches!(
+        key.trim().to_ascii_lowercase().as_str(),
+        "model" | "messages" | "stream"
+    )
+}
+
+fn is_sensitive_custom_body_key(key: &str) -> bool {
+    let lower = key.trim().to_ascii_lowercase();
+    if lower == "max_tokens" {
+        return false;
+    }
+
+    matches!(
+        lower.as_str(),
+        "apikey"
+            | "api_key"
+            | "authorization"
+            | "x-api-key"
+            | "token"
+            | "access_token"
+            | "accesstoken"
+            | "refresh_token"
+            | "refreshtoken"
+            | "password"
+            | "secret"
+            | "credential"
+    ) || [
+        "bearer",
+        "token",
+        "password",
+        "passwd",
+        "secret",
+        "credential",
+        "api key",
+        "sk-",
+    ]
+    .iter()
+    .any(|term| lower.contains(term))
+}
+
+fn scan_custom_body_for_sensitive_values(value: &Value) -> Result<(), String> {
+    match value {
+        Value::Object(object) => {
+            for (key, nested) in object {
+                if is_sensitive_custom_body_key(key) {
+                    return Err("Custom body contains sensitive fields".to_string());
+                }
+                scan_custom_body_for_sensitive_values(nested)?;
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                scan_custom_body_for_sensitive_values(item)?;
+            }
+        }
+        Value::String(text) if contains_sensitive_custom_text(text) => {
+            return Err("Custom body contains sensitive values".to_string());
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
 fn bad_request_response(message: &str) -> Response {
     (
         StatusCode::BAD_REQUEST,
@@ -3229,14 +3665,21 @@ fn default_persisted_state() -> PersistedMockState {
     }
 }
 
-fn migrate_v1_to_v3(mut persisted: PersistedMockState) -> PersistedMockState {
+fn migrate_v1_to_v4(mut persisted: PersistedMockState) -> PersistedMockState {
     persisted.schema_version = STATE_SCHEMA_VERSION;
     persisted.saved_at = now_millis();
     persisted.providers = Vec::new();
     persisted
 }
 
-fn migrate_v2_to_v3(mut persisted: PersistedMockState) -> PersistedMockState {
+fn migrate_v2_to_v4(mut persisted: PersistedMockState) -> PersistedMockState {
+    persisted.schema_version = STATE_SCHEMA_VERSION;
+    persisted.saved_at = now_millis();
+    normalize_desktop_providers(&mut persisted.providers);
+    persisted
+}
+
+fn migrate_v3_to_v4(mut persisted: PersistedMockState) -> PersistedMockState {
     persisted.schema_version = STATE_SCHEMA_VERSION;
     persisted.saved_at = now_millis();
     normalize_desktop_providers(&mut persisted.providers);
