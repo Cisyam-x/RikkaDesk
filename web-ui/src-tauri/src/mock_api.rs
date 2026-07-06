@@ -14,7 +14,7 @@ use std::{
 
 use async_stream::stream;
 use axum::{
-    extract::{rejection::JsonRejection, Path, Query, State},
+    extract::{rejection::JsonRejection, DefaultBodyLimit, Multipart, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -45,11 +45,18 @@ const PREFERRED_ADDR: &str = "127.0.0.1:8080";
 const PERSIST_DIR_NAME: &str = "mock-api";
 const STATE_FILE_NAME: &str = "state.v1.json";
 const STATE_TMP_FILE_NAME: &str = "state.v1.json.tmp";
-const STATE_SCHEMA_VERSION: u32 = 4;
+const STATE_SCHEMA_VERSION: u32 = 5;
+const FILE_METADATA_STATE_SCHEMA_VERSION: u32 = 4;
 const MULTI_MODEL_STATE_SCHEMA_VERSION: u32 = 3;
 const PREVIOUS_STATE_SCHEMA_VERSION: u32 = 2;
 const LEGACY_STATE_SCHEMA_VERSION: u32 = 1;
 const SECRETS_DIR_NAME: &str = "secrets";
+const FILES_DIR_NAME: &str = "files";
+const FILE_BLOBS_DIR_NAME: &str = "blobs";
+const FILE_UPLOAD_MAX_ITEMS: usize = 5;
+const FILE_UPLOAD_MAX_BYTES: usize = 20 * 1024 * 1024;
+const FILE_UPLOAD_TOTAL_MAX_BYTES: usize = FILE_UPLOAD_MAX_ITEMS * FILE_UPLOAD_MAX_BYTES;
+const FILE_DISPLAY_NAME_MAX_CHARS: usize = 160;
 #[cfg(not(windows))]
 const SECRET_SERVICE_NAME: &str = "RikkaDesk";
 const OPENAI_COMPATIBLE_PROVIDER_TYPE: &str = "openai-compatible";
@@ -309,6 +316,16 @@ impl MockPersistence {
         &self.state_path
     }
 
+    fn file_blobs_dir(&self) -> PathBuf {
+        self.state_dir
+            .join(FILES_DIR_NAME)
+            .join(FILE_BLOBS_DIR_NAME)
+    }
+
+    fn file_blob_path(&self, storage_key: &str) -> Option<PathBuf> {
+        is_safe_storage_key(storage_key).then(|| self.file_blobs_dir().join(storage_key))
+    }
+
     async fn save(&self, persisted: &PersistedMockState) -> PersistenceResult<()> {
         fs::create_dir_all(&self.state_dir).await?;
 
@@ -337,6 +354,31 @@ struct PersistedMockState {
     conversations: HashMap<String, ConversationDto>,
     #[serde(default)]
     providers: Vec<DesktopProviderConfig>,
+    #[serde(default)]
+    files: Vec<ManagedFileMetadata>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedFileMetadata {
+    id: u64,
+    storage_key: String,
+    display_name: String,
+    mime: String,
+    size_bytes: u64,
+    sha256: Option<String>,
+    kind: String,
+    relative_path: String,
+    created_at: String,
+    updated_at: String,
+    source: String,
+    deleted_at: Option<String>,
+}
+
+impl ManagedFileMetadata {
+    fn url(&self) -> String {
+        format!("/api/files/path/{}", self.id)
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -504,6 +546,70 @@ struct DesktopProviderResponse {
     has_secret: bool,
     custom_headers: Vec<DesktopProviderCustomHeaderConfig>,
     custom_body: Option<Value>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UploadFilesResponse {
+    files: Vec<UploadedFileResponse>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UploadedFileResponse {
+    id: u64,
+    file_name: String,
+    mime: String,
+    size_bytes: u64,
+    size: u64,
+    url: String,
+}
+
+impl UploadedFileResponse {
+    fn from_metadata(metadata: &ManagedFileMetadata) -> Self {
+        Self {
+            id: metadata.id,
+            file_name: metadata.display_name.clone(),
+            mime: metadata.mime.clone(),
+            size_bytes: metadata.size_bytes,
+            size: metadata.size_bytes,
+            url: metadata.url(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedFileResponse {
+    id: u64,
+    file_name: String,
+    mime: String,
+    size_bytes: u64,
+    size: u64,
+    kind: String,
+    created_at: String,
+    updated_at: String,
+    source: String,
+    deleted_at: Option<String>,
+    url: String,
+}
+
+impl ManagedFileResponse {
+    fn from_metadata(metadata: &ManagedFileMetadata) -> Self {
+        Self {
+            id: metadata.id,
+            file_name: metadata.display_name.clone(),
+            mime: metadata.mime.clone(),
+            size_bytes: metadata.size_bytes,
+            size: metadata.size_bytes,
+            kind: metadata.kind.clone(),
+            created_at: metadata.created_at.clone(),
+            updated_at: metadata.updated_at.clone(),
+            source: metadata.source.clone(),
+            deleted_at: metadata.deleted_at.clone(),
+            url: metadata.url(),
+        }
+    }
 }
 
 impl DesktopProviderResponse {
@@ -868,6 +974,7 @@ struct MockApiState {
     settings: RwLock<Value>,
     conversations: RwLock<HashMap<String, ConversationDto>>,
     providers: RwLock<Vec<DesktopProviderConfig>>,
+    files: RwLock<Vec<ManagedFileMetadata>>,
     generating_flags: RwLock<HashSet<String>>,
     conversation_txs: RwLock<HashMap<String, broadcast::Sender<SsePayload>>>,
     settings_tx: broadcast::Sender<SsePayload>,
@@ -886,6 +993,7 @@ impl MockApiState {
         let initial_id_seq = persisted
             .id_seq
             .max(max_persisted_id_seq(&persisted.conversations))
+            .max(max_persisted_file_id(&persisted.files))
             .max(1);
         let (settings_tx, _) = broadcast::channel(64);
         let (list_tx, _) = broadcast::channel(64);
@@ -899,6 +1007,7 @@ impl MockApiState {
             settings: RwLock::new(persisted.settings),
             conversations: RwLock::new(persisted.conversations),
             providers: RwLock::new(persisted.providers),
+            files: RwLock::new(persisted.files),
             generating_flags: RwLock::new(HashSet::new()),
             conversation_txs: RwLock::new(HashMap::new()),
             settings_tx,
@@ -916,6 +1025,10 @@ impl MockApiState {
         let id = self.id_seq.fetch_add(1, Ordering::Relaxed) + 1;
         format!("{prefix}-{id}")
     }
+
+    fn next_file_id(&self) -> u64 {
+        self.id_seq.fetch_add(1, Ordering::Relaxed) + 1
+    }
 }
 
 pub async fn start(app_data_dir: PathBuf) -> Result<MockApiHandle, Box<dyn std::error::Error>> {
@@ -932,6 +1045,9 @@ pub async fn start(app_data_dir: PathBuf) -> Result<MockApiHandle, Box<dyn std::
         .route("/api/conversations/paged", get(conversations_paged))
         .route("/api/conversations/stream", get(conversations_stream))
         .route("/api/ai-icon", get(ai_icon))
+        .route("/api/files/upload", post(upload_files))
+        .route("/api/files/path/{id}", get(file_path))
+        .route("/api/files/{id}", get(file_metadata).delete(delete_file))
         .route(
             "/api/desktop/providers",
             get(desktop_providers).post(upsert_desktop_provider),
@@ -992,6 +1108,9 @@ pub async fn start(app_data_dir: PathBuf) -> Result<MockApiHandle, Box<dyn std::
             post(update_favorite_models),
         )
         .fallback(not_implemented)
+        .layer(DefaultBodyLimit::max(
+            FILE_UPLOAD_TOTAL_MAX_BYTES + 1024 * 1024,
+        ))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
@@ -1046,8 +1165,17 @@ async fn load_persisted_state(persistence: &MockPersistence) -> PersistedMockSta
             ensure_current_model_exists(&mut persisted.settings);
             persisted
         }
+        Ok(persisted) if persisted.schema_version == FILE_METADATA_STATE_SCHEMA_VERSION => {
+            let mut migrated = migrate_v4_to_v5(persisted);
+            sync_settings_with_desktop_providers(&mut migrated.settings, &migrated.providers);
+            ensure_current_model_exists(&mut migrated.settings);
+            if let Err(error) = persistence.save(&migrated).await {
+                eprintln!("RikkaDesk mock API failed to save migrated state: {error}");
+            }
+            migrated
+        }
         Ok(persisted) if persisted.schema_version == MULTI_MODEL_STATE_SCHEMA_VERSION => {
-            let mut migrated = migrate_v3_to_v4(persisted);
+            let mut migrated = migrate_v3_to_v5(persisted);
             sync_settings_with_desktop_providers(&mut migrated.settings, &migrated.providers);
             ensure_current_model_exists(&mut migrated.settings);
             if let Err(error) = persistence.save(&migrated).await {
@@ -1056,7 +1184,7 @@ async fn load_persisted_state(persistence: &MockPersistence) -> PersistedMockSta
             migrated
         }
         Ok(persisted) if persisted.schema_version == PREVIOUS_STATE_SCHEMA_VERSION => {
-            let mut migrated = migrate_v2_to_v4(persisted);
+            let mut migrated = migrate_v2_to_v5(persisted);
             sync_settings_with_desktop_providers(&mut migrated.settings, &migrated.providers);
             ensure_current_model_exists(&mut migrated.settings);
             if let Err(error) = persistence.save(&migrated).await {
@@ -1065,7 +1193,7 @@ async fn load_persisted_state(persistence: &MockPersistence) -> PersistedMockSta
             migrated
         }
         Ok(persisted) if persisted.schema_version == LEGACY_STATE_SCHEMA_VERSION => {
-            let mut migrated = migrate_v1_to_v4(persisted);
+            let mut migrated = migrate_v1_to_v5(persisted);
             sync_settings_with_desktop_providers(&mut migrated.settings, &migrated.providers);
             ensure_current_model_exists(&mut migrated.settings);
             if let Err(error) = persistence.save(&migrated).await {
@@ -1119,10 +1247,12 @@ async fn persist_mock_state(state: &Arc<MockApiState>) {
     let settings = state.settings.read().await.clone();
     let conversations = state.conversations.read().await.clone();
     let providers = state.providers.read().await.clone();
+    let files = state.files.read().await.clone();
     let id_seq = state
         .id_seq
         .load(Ordering::Relaxed)
         .max(max_persisted_id_seq(&conversations))
+        .max(max_persisted_file_id(&files))
         .max(1);
 
     let persisted = PersistedMockState {
@@ -1132,6 +1262,7 @@ async fn persist_mock_state(state: &Arc<MockApiState>) {
         settings,
         conversations,
         providers,
+        files,
     };
 
     if let Err(error) = state.persistence.save(&persisted).await {
@@ -2050,6 +2181,248 @@ async fn not_implemented() -> impl IntoResponse {
             "code": 404,
         })),
     )
+}
+
+struct PreparedFileUpload {
+    metadata: ManagedFileMetadata,
+    bytes: Vec<u8>,
+}
+
+async fn upload_files(
+    State(state): State<Arc<MockApiState>>,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    let mut prepared = Vec::new();
+    let mut total_bytes = 0usize;
+
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(_) => return bad_request_response("Invalid file upload"),
+        };
+
+        if field.name() != Some("files") {
+            continue;
+        }
+
+        if prepared.len() >= FILE_UPLOAD_MAX_ITEMS {
+            return bad_request_response("Too many files");
+        }
+
+        let display_name = sanitize_upload_file_name(field.file_name());
+        let bytes = match field.bytes().await {
+            Ok(bytes) => bytes,
+            Err(_) => return bad_request_response("Invalid file upload"),
+        };
+        let size = bytes.len();
+
+        if size > FILE_UPLOAD_MAX_BYTES {
+            return bad_request_response("File is too large");
+        }
+
+        total_bytes = match total_bytes.checked_add(size) {
+            Some(total_bytes) => total_bytes,
+            None => return bad_request_response("Upload is too large"),
+        };
+        if total_bytes > FILE_UPLOAD_TOTAL_MAX_BYTES {
+            return bad_request_response("Upload is too large");
+        }
+
+        let mime = match detect_safe_upload_mime(&bytes, &display_name) {
+            Ok(mime) => mime,
+            Err(message) => return bad_request_response(message),
+        };
+        let kind = upload_kind_for_mime(mime);
+        let id = state.next_file_id();
+        let storage_key = storage_key_for_file(id);
+        let now = now_iso();
+        let metadata = ManagedFileMetadata {
+            id,
+            storage_key: storage_key.clone(),
+            display_name,
+            mime: mime.to_string(),
+            size_bytes: size as u64,
+            sha256: None,
+            kind: kind.to_string(),
+            relative_path: format!("{FILES_DIR_NAME}/{FILE_BLOBS_DIR_NAME}/{storage_key}"),
+            created_at: now.clone(),
+            updated_at: now,
+            source: "upload".to_string(),
+            deleted_at: None,
+        };
+
+        prepared.push(PreparedFileUpload {
+            metadata,
+            bytes: bytes.to_vec(),
+        });
+    }
+
+    if prepared.is_empty() {
+        return bad_request_response("No files were uploaded");
+    }
+
+    if save_prepared_file_uploads(&state, &prepared).await.is_err() {
+        return internal_error_response("File upload failed");
+    }
+
+    let uploaded = {
+        let mut files = state.files.write().await;
+        let uploaded = prepared
+            .iter()
+            .map(|upload| UploadedFileResponse::from_metadata(&upload.metadata))
+            .collect::<Vec<_>>();
+        files.extend(prepared.into_iter().map(|upload| upload.metadata));
+        uploaded
+    };
+
+    persist_mock_state(&state).await;
+
+    Json(UploadFilesResponse { files: uploaded }).into_response()
+}
+
+async fn file_metadata(
+    State(state): State<Arc<MockApiState>>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    let metadata = {
+        let files = state.files.read().await;
+        files
+            .iter()
+            .find(|file| file.id == id && file.deleted_at.is_none())
+            .cloned()
+    };
+
+    match metadata {
+        Some(metadata) => Json(ManagedFileResponse::from_metadata(&metadata)).into_response(),
+        None => not_found_response("File not found"),
+    }
+}
+
+async fn file_path(
+    State(state): State<Arc<MockApiState>>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    let metadata = {
+        let files = state.files.read().await;
+        files
+            .iter()
+            .find(|file| file.id == id && file.deleted_at.is_none())
+            .cloned()
+    };
+
+    let Some(metadata) = metadata else {
+        return not_found_response("File not found");
+    };
+
+    let Some(path) = state.persistence.file_blob_path(&metadata.storage_key) else {
+        return internal_error_response("File is unavailable");
+    };
+
+    let bytes = match fs::read(path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return not_found_response("File not found")
+        }
+        Err(_) => return internal_error_response("File is unavailable"),
+    };
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(&metadata.mime)
+            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+    );
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    if !metadata.mime.starts_with("image/") {
+        let file_name = safe_header_file_name(&metadata.display_name);
+        if let Ok(value) = HeaderValue::from_str(&format!("attachment; filename=\"{file_name}\"")) {
+            headers.insert(header::CONTENT_DISPOSITION, value);
+        }
+    }
+
+    (headers, bytes).into_response()
+}
+
+async fn delete_file(
+    State(state): State<Arc<MockApiState>>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    let metadata = {
+        let files = state.files.read().await;
+        files
+            .iter()
+            .find(|file| file.id == id && file.deleted_at.is_none())
+            .cloned()
+    };
+
+    let Some(metadata) = metadata else {
+        return not_found_response("File not found");
+    };
+
+    if let Some(path) = state.persistence.file_blob_path(&metadata.storage_key) {
+        match fs::remove_file(path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return internal_error_response("File delete failed"),
+        }
+    }
+
+    {
+        let now = now_iso();
+        let mut files = state.files.write().await;
+        if let Some(file) = files.iter_mut().find(|file| file.id == id) {
+            file.deleted_at = Some(now.clone());
+            file.updated_at = now;
+        }
+    }
+
+    persist_mock_state(&state).await;
+
+    Json(json!({ "status": "deleted" })).into_response()
+}
+
+async fn save_prepared_file_uploads(
+    state: &Arc<MockApiState>,
+    uploads: &[PreparedFileUpload],
+) -> Result<(), ()> {
+    let blobs_dir = state.persistence.file_blobs_dir();
+    fs::create_dir_all(&blobs_dir).await.map_err(|_| ())?;
+
+    let mut written = Vec::new();
+    for upload in uploads {
+        let Some(path) = state
+            .persistence
+            .file_blob_path(&upload.metadata.storage_key)
+        else {
+            cleanup_uploaded_blobs(written).await;
+            return Err(());
+        };
+        let tmp_path = path.with_extension("tmp");
+        if fs::write(&tmp_path, &upload.bytes).await.is_err() {
+            let _ = fs::remove_file(&tmp_path).await;
+            cleanup_uploaded_blobs(written).await;
+            return Err(());
+        }
+        if fs::rename(&tmp_path, &path).await.is_err() {
+            let _ = fs::remove_file(&tmp_path).await;
+            cleanup_uploaded_blobs(written).await;
+            return Err(());
+        }
+        written.push(path);
+    }
+
+    Ok(())
+}
+
+async fn cleanup_uploaded_blobs(paths: Vec<PathBuf>) {
+    for path in paths {
+        let _ = fs::remove_file(path).await;
+    }
 }
 
 async fn desktop_provider_responses(
@@ -3662,27 +4035,39 @@ fn default_persisted_state() -> PersistedMockState {
         settings: default_settings(),
         conversations,
         providers: Vec::new(),
+        files: Vec::new(),
     }
 }
 
-fn migrate_v1_to_v4(mut persisted: PersistedMockState) -> PersistedMockState {
+fn migrate_v1_to_v5(mut persisted: PersistedMockState) -> PersistedMockState {
     persisted.schema_version = STATE_SCHEMA_VERSION;
     persisted.saved_at = now_millis();
     persisted.providers = Vec::new();
+    persisted.files = Vec::new();
     persisted
 }
 
-fn migrate_v2_to_v4(mut persisted: PersistedMockState) -> PersistedMockState {
+fn migrate_v2_to_v5(mut persisted: PersistedMockState) -> PersistedMockState {
     persisted.schema_version = STATE_SCHEMA_VERSION;
     persisted.saved_at = now_millis();
     normalize_desktop_providers(&mut persisted.providers);
+    persisted.files = Vec::new();
     persisted
 }
 
-fn migrate_v3_to_v4(mut persisted: PersistedMockState) -> PersistedMockState {
+fn migrate_v3_to_v5(mut persisted: PersistedMockState) -> PersistedMockState {
     persisted.schema_version = STATE_SCHEMA_VERSION;
     persisted.saved_at = now_millis();
     normalize_desktop_providers(&mut persisted.providers);
+    persisted.files = Vec::new();
+    persisted
+}
+
+fn migrate_v4_to_v5(mut persisted: PersistedMockState) -> PersistedMockState {
+    persisted.schema_version = STATE_SCHEMA_VERSION;
+    persisted.saved_at = now_millis();
+    normalize_desktop_providers(&mut persisted.providers);
+    persisted.files = Vec::new();
     persisted
 }
 
@@ -3884,6 +4269,169 @@ fn is_safe_config_id(id: &str) -> bool {
         && id
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':'))
+}
+
+fn is_safe_storage_key(storage_key: &str) -> bool {
+    !storage_key.is_empty()
+        && storage_key.len() <= 128
+        && storage_key
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+}
+
+fn storage_key_for_file(id: u64) -> String {
+    format!("file-{id}-{}", now_millis())
+}
+
+fn sanitize_upload_file_name(file_name: Option<&str>) -> String {
+    let file_name = file_name
+        .unwrap_or("upload.bin")
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("upload.bin");
+    let mut sanitized = file_name
+        .chars()
+        .filter(|ch| {
+            !ch.is_control() && !matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+        })
+        .collect::<String>()
+        .trim()
+        .to_string();
+
+    if sanitized.is_empty() {
+        sanitized = "upload.bin".to_string();
+    }
+
+    truncate_chars(&sanitized, FILE_DISPLAY_NAME_MAX_CHARS)
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
+fn safe_header_file_name(file_name: &str) -> String {
+    let value = sanitize_upload_file_name(Some(file_name));
+    let sanitized = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii() && !ch.is_control() && !matches!(ch, '"' | '\\') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "download.bin".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn detect_safe_upload_mime(bytes: &[u8], display_name: &str) -> Result<&'static str, &'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return Ok("image/png");
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Ok("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Ok("image/gif");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Ok("image/webp");
+    }
+    if bytes.starts_with(b"%PDF-") {
+        return Ok("application/pdf");
+    }
+    if is_utf8_plain_text(bytes) {
+        if is_dangerous_text_upload(bytes, display_name) {
+            return Err("File type is not supported");
+        }
+        return Ok("text/plain");
+    }
+
+    Err("File type is not supported")
+}
+
+fn is_utf8_plain_text(bytes: &[u8]) -> bool {
+    !bytes.contains(&0) && std::str::from_utf8(bytes).is_ok()
+}
+
+fn is_dangerous_text_upload(bytes: &[u8], display_name: &str) -> bool {
+    if has_dangerous_upload_extension(display_name) {
+        return true;
+    }
+
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return true;
+    };
+    let lower = text
+        .trim_start_matches('\u{feff}')
+        .trim_start()
+        .chars()
+        .take(1024)
+        .collect::<String>()
+        .to_ascii_lowercase();
+
+    lower.starts_with("<svg")
+        || lower.starts_with("<!doctype html")
+        || lower.starts_with("<html")
+        || lower.starts_with("<script")
+        || lower.contains("<script")
+        || lower.contains("<svg")
+        || lower.contains("<iframe")
+        || lower.contains("<object")
+        || lower.contains("<embed")
+}
+
+fn has_dangerous_upload_extension(display_name: &str) -> bool {
+    let extension = display_name
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase());
+    matches!(
+        extension.as_deref(),
+        Some(
+            "svg"
+                | "html"
+                | "htm"
+                | "js"
+                | "mjs"
+                | "cjs"
+                | "jsx"
+                | "ts"
+                | "tsx"
+                | "vbs"
+                | "ps1"
+                | "bat"
+                | "cmd"
+                | "sh"
+                | "exe"
+                | "dll"
+                | "msi"
+                | "zip"
+                | "rar"
+                | "7z"
+                | "doc"
+                | "docx"
+                | "xls"
+                | "xlsx"
+                | "ppt"
+                | "pptx"
+        )
+    )
+}
+
+fn upload_kind_for_mime(mime: &str) -> &'static str {
+    if mime.starts_with("image/") {
+        "image"
+    } else {
+        "document"
+    }
+}
+
+fn max_persisted_file_id(files: &[ManagedFileMetadata]) -> u64 {
+    files.iter().map(|file| file.id).max().unwrap_or(1)
 }
 
 fn max_persisted_id_seq(conversations: &HashMap<String, ConversationDto>) -> u64 {
