@@ -25,7 +25,8 @@ RikkaDesk is an unofficial desktop derivative / experiment based on RikkaHub. Th
 - Phase 6B P3 complete: Provider import/export safety design was documented.
 - Phase 7 complete: safe Provider import/export was implemented for non-sensitive provider metadata.
 - Phase 8 complete: Provider state, APIs, and Provider Settings support multiple models per provider.
-- Phase 9B current: Provider Settings supports advanced non-sensitive custom headers/body, shared OpenAI-compatible request building, and provider import/export v3.
+- Phase 9B complete: Provider Settings supports advanced non-sensitive custom headers/body, shared OpenAI-compatible request building, and provider import/export v3.
+- Phase 9C current: Markdown rendering has table/code overflow polish, mhchem chemistry support, message Markdown raw HTML hardening, and Workbench preview sandbox hardening.
 
 ## Current Architecture
 
@@ -140,6 +141,22 @@ Provider import/export currently uses export document version 3 for multi-model 
 
 Test Connection and Streaming Chat now use the same OpenAI-compatible request builder. Test Connection always forces `max_tokens=1`; Streaming Chat can preserve allowed custom body fields such as `max_tokens` while RikkaDesk continues to control `model`, `messages`, and `stream`.
 
+## Markdown Rendering And Workbench Preview
+
+Message Markdown now keeps the existing Streamdown, GFM, math, KaTeX, and CodeBlock path, but RikkaDesk no longer explicitly enables `rehypeRaw` in the message Markdown plugin list.
+
+Current rendering notes:
+
+- Wide GFM tables scroll inside message content instead of expanding the app viewport.
+- KaTeX mhchem is enabled through `katex/dist/contrib/mhchem.mjs`.
+- Unsafe Markdown link schemes such as `javascript:`, `data:`, `file:`, and `blob:` are blocked by default.
+- Normal `http:`, `https:`, and `mailto:` links keep `target="_blank"` and `rel="noopener noreferrer"`.
+- Unsafe Markdown image sources are blocked by default.
+- Mermaid in normal message Markdown remains disabled/deferred.
+- Workbench Mermaid preview uses `securityLevel: "strict"`.
+- Workbench Mermaid preview runs in an iframe sandbox without `allow-same-origin`.
+- Workbench Mermaid still uses a remote CDN and remains a residual risk to revisit before any public release.
+
 ## Not Implemented
 
 The current prototype intentionally does not implement:
@@ -214,6 +231,10 @@ Build outputs:
 - Set as current model updates the model selector for a specific provider model.
 - Favorite model updates work from the model selector.
 - Provider import/export v3 round-trips multiple models and safe advanced request config without exporting secrets, and v1/v2 imports remain compatible.
+- Wide Markdown tables scroll inside message content.
+- Inline math, block math, and mhchem chemistry formulas render.
+- Unsafe message Markdown link schemes and image sources are blocked.
+- Workbench preview iframe sandbox settings match the Markdown rendering plan.
 - Sending a text message produces either a streaming OpenAI-compatible response or the mock fallback.
 - `pnpm run desktop:build` produces MSI and NSIS installers.
 
@@ -223,6 +244,6 @@ Recommended next steps:
 
 - Keep the mock fallback as a protocol safety net while hardening the real provider path.
 - Verify unsigned Windows installer behavior with local beta testers.
-- Keep `rikkadesk-v0.1.0-beta.10` as the current feature-stable private beta tag once Phase 9B is validated.
+- Keep `rikkadesk-v0.1.0-beta.11` as the current feature-stable private beta tag once Phase 9C is validated.
 - Decide whether a future public prerelease should use `0.1.0` or a beta label in release notes/artifact naming.
 - Keep P2/P3 features deferred until provider settings, persistence, and streaming behavior are stable.

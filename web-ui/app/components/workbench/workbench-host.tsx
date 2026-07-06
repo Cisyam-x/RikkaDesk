@@ -25,6 +25,14 @@ function readStringField(payload: Record<string, unknown>, key: string): string 
   return typeof value === "string" ? value : "";
 }
 
+function previewSandbox(normalizedLanguage: string | null): string {
+  if (normalizedLanguage === "mermaid") {
+    return "allow-scripts";
+  }
+
+  return "";
+}
+
 function CodePreviewPanel({ panel }: { panel: WorkbenchPanel }) {
   const { t } = useTranslation();
   const [mode, setMode] = React.useState<"preview" | "source">("preview");
@@ -104,7 +112,7 @@ function CodePreviewPanel({ panel }: { panel: WorkbenchPanel }) {
 
       mermaid.initialize({
         startOnLoad: false,
-        securityLevel: "loose",
+        securityLevel: "strict",
       });
 
       try {
@@ -162,7 +170,7 @@ function CodePreviewPanel({ panel }: { panel: WorkbenchPanel }) {
           ) : (
             <iframe
               title={panel.title}
-              sandbox="allow-scripts allow-same-origin"
+              sandbox={previewSandbox(normalizedLanguage)}
               srcDoc={iframeDoc}
               className="h-full w-full border-0"
             />
