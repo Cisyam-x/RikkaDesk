@@ -2,7 +2,7 @@
 
 /* Markdown Styles - shadcn inspired */
 .markdown {
-  @apply text-foreground leading-7;
+  @apply min-w-0 max-w-full text-foreground leading-7 break-words;
 }
 
 .markdown > * + * {
@@ -109,23 +109,23 @@
 
 /* Code Block with Header */
 .markdown .code-block {
-  @apply my-4 rounded-lg border border-border overflow-hidden;
+  @apply my-4 max-w-full rounded-lg border border-border overflow-hidden;
 }
 
 .code-block-header {
-  @apply flex items-center justify-between px-3 py-0.5 bg-muted/50 border-b border-border;
+  @apply flex flex-wrap items-center justify-between gap-2 px-3 py-1 bg-muted/50 border-b border-border;
 }
 
 .code-block-language {
-  @apply text-xs text-muted-foreground;
+  @apply min-w-0 truncate text-xs text-muted-foreground;
 }
 
 .code-block-copy {
-  @apply flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors px-1.5 py-0.5 rounded hover:bg-muted;
+  @apply flex items-center gap-1 whitespace-nowrap text-xs text-muted-foreground hover:text-foreground transition-colors px-1.5 py-0.5 rounded hover:bg-muted;
 }
 
 .code-block-actions {
-  @apply flex items-center gap-1;
+  @apply flex shrink-0 flex-wrap items-center justify-end gap-1;
 }
 
 .code-block-copy:active {
@@ -134,7 +134,7 @@
 
 /* Code Block body */
 .markdown .code-block-content {
-  @apply overflow-x-auto;
+  @apply max-w-full overflow-x-auto;
 }
 
 .markdown .code-block-content pre {
@@ -147,7 +147,7 @@
 
 /* Legacy Code - Block (fallback) */
 .markdown pre {
-  @apply my-4 rounded-lg border border-border p-4 overflow-x-auto;
+  @apply my-4 max-w-full rounded-lg border border-border p-4 overflow-x-auto;
 }
 
 .markdown pre code {
@@ -156,7 +156,9 @@
 
 /* Tables (GFM) */
 .markdown table {
-  @apply my-4 w-full border-collapse overflow-hidden rounded-lg border border-border;
+  @apply my-4 block w-full max-w-full overflow-x-auto rounded-lg border border-border;
+  border-collapse: separate;
+  border-spacing: 0;
 }
 
 .markdown thead {
@@ -164,11 +166,11 @@
 }
 
 .markdown th {
-  @apply border border-border px-4 py-2 text-left font-semibold;
+  @apply min-w-32 max-w-96 border border-border px-4 py-2 text-left align-top font-semibold break-words;
 }
 
 .markdown td {
-  @apply border border-border px-4 py-2;
+  @apply min-w-32 max-w-96 border border-border px-4 py-2 align-top break-words;
 }
 
 .markdown tr:nth-child(even) {
