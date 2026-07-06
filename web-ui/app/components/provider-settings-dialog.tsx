@@ -17,17 +17,67 @@ import {
 import { useCurrentAssistant } from "~/hooks/use-current-assistant";
 import { Input } from "~/components/ui/input";
 import { ScrollArea } from "~/components/ui/scroll-area";
+import { Textarea } from "~/components/ui/textarea";
 import api, { ApiError } from "~/services/api";
 import { cn } from "~/lib/utils";
 
 const DEFAULT_PROVIDER_NAME = "OpenAI Compatible";
 const PROVIDER_TYPE = "openai-compatible";
 const PROVIDER_IMPORT_MAX_FILE_BYTES = 512 * 1024;
+const PROVIDER_CUSTOM_BODY_MAX_BYTES = 16 * 1024;
+
+const FORBIDDEN_CUSTOM_HEADER_NAMES = new Set([
+  "authorization",
+  "proxy-authorization",
+  "x-api-key",
+  "api-key",
+  "apikey",
+  "api_key",
+  "cookie",
+  "set-cookie",
+  "authentication",
+  "x-auth-token",
+  "x-access-token",
+]);
+
+const SENSITIVE_CUSTOM_TEXT_TERMS = [
+  "bearer",
+  "token",
+  "secret",
+  "password",
+  "passwd",
+  "credential",
+  "api key",
+  "sk-",
+  "refresh_token",
+  "access_token",
+];
+
+const RESERVED_CUSTOM_BODY_KEYS = new Set(["model", "messages", "stream"]);
+const SENSITIVE_CUSTOM_BODY_KEYS = new Set([
+  "apikey",
+  "api_key",
+  "authorization",
+  "x-api-key",
+  "token",
+  "access_token",
+  "accesstoken",
+  "refresh_token",
+  "refreshtoken",
+  "password",
+  "secret",
+  "credential",
+]);
 
 interface DesktopProviderModelConfig {
   id: string;
   modelId: string;
   displayName: string;
+}
+
+interface DesktopProviderCustomHeaderConfig {
+  name: string;
+  value: string;
 }
 
 interface DesktopProviderResponse {
@@ -40,6 +90,8 @@ interface DesktopProviderResponse {
   models?: DesktopProviderModelConfig[];
   secretRef: string;
   hasSecret: boolean;
+  customHeaders?: DesktopProviderCustomHeaderConfig[];
+  customBody?: unknown | null;
 }
 
 interface DesktopProviderTestResponse {
@@ -98,11 +150,19 @@ interface ProviderModelFormState {
   displayName: string;
 }
 
+interface ProviderCustomHeaderFormState {
+  localId: string;
+  name: string;
+  value: string;
+}
+
 interface ProviderFormState {
   id: string;
   name: string;
   baseUrl: string;
   models: ProviderModelFormState[];
+  customHeaders: ProviderCustomHeaderFormState[];
+  customBodyText: string;
   apiKey: string;
   hasSecret: boolean;
 }
@@ -120,11 +180,23 @@ function createModelLocalId(): string {
   return `model-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function createHeaderLocalId(): string {
+  return `header-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
 function emptyModelForm(): ProviderModelFormState {
   return {
     localId: createModelLocalId(),
     modelId: "",
     displayName: "",
+  };
+}
+
+function emptyHeaderForm(): ProviderCustomHeaderFormState {
+  return {
+    localId: createHeaderLocalId(),
+    name: "",
+    value: "",
   };
 }
 
@@ -134,9 +206,20 @@ function emptyForm(id = createProviderId()): ProviderFormState {
     name: DEFAULT_PROVIDER_NAME,
     baseUrl: "",
     models: [emptyModelForm()],
+    customHeaders: [],
+    customBodyText: "",
     apiKey: "",
     hasSecret: false,
   };
+}
+
+function customBodyTextFromProvider(value: unknown | null | undefined): string {
+  if (value === null || value === undefined) return "";
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return "";
+  }
 }
 
 function formFromProvider(provider: DesktopProviderResponse): ProviderFormState {
@@ -154,9 +237,108 @@ function formFromProvider(provider: DesktopProviderResponse): ProviderFormState 
       modelId: model.modelId,
       displayName: model.displayName || model.modelId,
     })),
+    customHeaders: (provider.customHeaders ?? []).map((header) => ({
+      localId: createHeaderLocalId(),
+      name: header.name,
+      value: header.value,
+    })),
+    customBodyText: customBodyTextFromProvider(provider.customBody),
     apiKey: "",
     hasSecret: provider.hasSecret,
   };
+}
+
+function containsSensitiveCustomText(value: string): boolean {
+  const lower = value.toLowerCase();
+  return SENSITIVE_CUSTOM_TEXT_TERMS.some((term) => lower.includes(term));
+}
+
+function validateCustomHeaders(
+  headers: ProviderCustomHeaderFormState[],
+  t: (key: string) => string,
+): DesktopProviderCustomHeaderConfig[] | null {
+  const sanitized: DesktopProviderCustomHeaderConfig[] = [];
+  for (const header of headers) {
+    const name = header.name.trim();
+    const value = header.value.trim();
+    if (!name && !value) continue;
+    if (!name || !value) {
+      return null;
+    }
+
+    const lowerName = name.toLowerCase();
+    if (
+      FORBIDDEN_CUSTOM_HEADER_NAMES.has(lowerName)
+      || containsSensitiveCustomText(name)
+      || containsSensitiveCustomText(value)
+    ) {
+      throw new Error(t("provider_settings.custom_header_sensitive"));
+    }
+
+    sanitized.push({ name, value });
+  }
+
+  return sanitized;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isSensitiveCustomBodyKey(key: string): boolean {
+  const lower = key.toLowerCase();
+  if (lower === "max_tokens") return false;
+  return SENSITIVE_CUSTOM_BODY_KEYS.has(lower)
+    || SENSITIVE_CUSTOM_TEXT_TERMS.some((term) => lower.includes(term));
+}
+
+function scanCustomBody(value: unknown): boolean {
+  if (Array.isArray(value)) {
+    return value.some((item) => scanCustomBody(item));
+  }
+  if (isPlainObject(value)) {
+    return Object.entries(value).some(([key, nested]) =>
+      isSensitiveCustomBodyKey(key) || scanCustomBody(nested)
+    );
+  }
+  return typeof value === "string" && containsSensitiveCustomText(value);
+}
+
+function customBodySize(value: unknown): number {
+  return new TextEncoder().encode(JSON.stringify(value)).length;
+}
+
+function parseCustomBodyText(text: string, t: (key: string) => string): unknown | null {
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    throw new Error(t("provider_settings.custom_body_invalid_json"));
+  }
+
+  if (!isPlainObject(parsed)) {
+    throw new Error(t("provider_settings.custom_body_must_be_object"));
+  }
+
+  for (const key of Object.keys(parsed)) {
+    const lower = key.toLowerCase();
+    if (RESERVED_CUSTOM_BODY_KEYS.has(lower) || isSensitiveCustomBodyKey(key)) {
+      throw new Error(t("provider_settings.custom_body_reserved"));
+    }
+  }
+
+  if (scanCustomBody(parsed)) {
+    throw new Error(t("provider_settings.custom_body_reserved"));
+  }
+
+  if (customBodySize(parsed) > PROVIDER_CUSTOM_BODY_MAX_BYTES) {
+    throw new Error(t("provider_settings.custom_body_too_large"));
+  }
+
+  return parsed;
 }
 
 function safeErrorMessage(error: unknown, fallback: string): string {
@@ -285,7 +467,10 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
   }, [loadProviders, open]);
 
   const updateForm = React.useCallback(
-    (field: Exclude<keyof ProviderFormState, "models">, value: string | boolean) => {
+    (
+      field: Exclude<keyof ProviderFormState, "models" | "customHeaders">,
+      value: string | boolean,
+    ) => {
       setForm((current) => ({
         ...current,
         [field]: value,
@@ -305,6 +490,56 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
         model.localId === localId ? { ...model, [field]: value } : model
       ),
     }));
+  }, []);
+
+  const updateCustomHeader = React.useCallback((
+    localId: string,
+    field: "name" | "value",
+    value: string,
+  ) => {
+    setForm((current) => ({
+      ...current,
+      customHeaders: current.customHeaders.map((header) =>
+        header.localId === localId ? { ...header, [field]: value } : header
+      ),
+    }));
+  }, []);
+
+  const handleAddCustomHeader = React.useCallback(() => {
+    setForm((current) => ({
+      ...current,
+      customHeaders: [...current.customHeaders, emptyHeaderForm()],
+    }));
+    setError(null);
+  }, []);
+
+  const handleDeleteCustomHeader = React.useCallback((localId: string) => {
+    setForm((current) => ({
+      ...current,
+      customHeaders: current.customHeaders.filter((header) => header.localId !== localId),
+    }));
+    setError(null);
+  }, []);
+
+  const handleFormatCustomBody = React.useCallback(() => {
+    try {
+      const parsed = parseCustomBodyText(form.customBodyText, t);
+      setForm((current) => ({
+        ...current,
+        customBodyText: parsed ? JSON.stringify(parsed, null, 2) : "",
+      }));
+      setError(null);
+    } catch (formatError) {
+      setError(safeErrorMessage(formatError, t("provider_settings.custom_body_invalid_json")));
+    }
+  }, [form.customBodyText, t]);
+
+  const handleClearCustomBody = React.useCallback(() => {
+    setForm((current) => ({
+      ...current,
+      customBodyText: "",
+    }));
+    setError(null);
   }, []);
 
   const handleAddModel = React.useCallback(() => {
@@ -371,6 +606,27 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
       });
     }
 
+    let customHeaders: DesktopProviderCustomHeaderConfig[];
+    try {
+      const maybeCustomHeaders = validateCustomHeaders(form.customHeaders, t);
+      if (maybeCustomHeaders === null) {
+        setError(t("provider_settings.custom_header_incomplete"));
+        return;
+      }
+      customHeaders = maybeCustomHeaders;
+    } catch (validationError) {
+      setError(safeErrorMessage(validationError, t("provider_settings.custom_header_sensitive")));
+      return;
+    }
+
+    let customBody: unknown | null;
+    try {
+      customBody = parseCustomBodyText(form.customBodyText, t);
+    } catch (validationError) {
+      setError(safeErrorMessage(validationError, t("provider_settings.custom_body_invalid_json")));
+      return;
+    }
+
     setSaving(true);
     setError(null);
     try {
@@ -381,6 +637,8 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
         name,
         baseUrl,
         models,
+        customHeaders,
+        customBody,
       });
 
       if (apiKey) {
@@ -891,6 +1149,141 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
                   })}
                 </div>
               </div>
+
+              <details className="group rounded-md border">
+                <summary className="flex cursor-pointer list-none items-start justify-between gap-3 px-3 py-3 transition hover:bg-muted/40">
+                  <div>
+                    <div className="text-sm font-medium">
+                      {t("provider_settings.advanced_request_config")}
+                    </div>
+                    <div className="mt-1 text-xs text-muted-foreground">
+                      {t("provider_settings.advanced_request_config_description")}
+                    </div>
+                  </div>
+                  <Badge variant="outline" className="shrink-0">
+                    {form.customHeaders.length > 0 || form.customBodyText.trim()
+                      ? t("provider_settings.configured")
+                      : t("provider_settings.optional")}
+                  </Badge>
+                </summary>
+
+                <div className="space-y-4 border-t p-3">
+                  <div className="space-y-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+                    <p>{t("provider_settings.advanced_request_config_warning")}</p>
+                    <p>{t("provider_settings.advanced_export_note")}</p>
+                  </div>
+
+                  <div className="space-y-3 rounded-md border p-3">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-medium">
+                          {t("provider_settings.custom_headers")}
+                        </div>
+                        <div className="mt-1 text-xs text-muted-foreground">
+                          {t("provider_settings.custom_headers_description")}
+                        </div>
+                      </div>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={handleAddCustomHeader}
+                        disabled={busy}
+                      >
+                        <Plus className="size-4" />
+                        {t("provider_settings.add_header")}
+                      </Button>
+                    </div>
+
+                    {form.customHeaders.length === 0 ? (
+                      <div className="rounded-md border border-dashed px-3 py-4 text-sm text-muted-foreground">
+                        {t("provider_settings.no_custom_headers")}
+                      </div>
+                    ) : (
+                      <div className="space-y-2">
+                        {form.customHeaders.map((header) => (
+                          <div
+                            key={header.localId}
+                            className="grid gap-2 rounded-md border bg-muted/20 p-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)_auto]"
+                          >
+                            <Input
+                              value={header.name}
+                              onChange={(event) =>
+                                updateCustomHeader(header.localId, "name", event.target.value)}
+                              placeholder={t("provider_settings.header_name")}
+                              autoComplete="off"
+                              spellCheck={false}
+                              disabled={busy}
+                            />
+                            <Input
+                              value={header.value}
+                              onChange={(event) =>
+                                updateCustomHeader(header.localId, "value", event.target.value)}
+                              placeholder={t("provider_settings.header_value")}
+                              autoComplete="off"
+                              spellCheck={false}
+                              disabled={busy}
+                            />
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="icon"
+                              className="sm:size-9"
+                              onClick={() => handleDeleteCustomHeader(header.localId)}
+                              disabled={busy}
+                              title={t("provider_settings.delete_header")}
+                            >
+                              <Trash2 className="size-4" />
+                            </Button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="space-y-3 rounded-md border p-3">
+                    <div>
+                      <div className="text-sm font-medium">
+                        {t("provider_settings.custom_body_json")}
+                      </div>
+                      <div className="mt-1 text-xs text-muted-foreground">
+                        {t("provider_settings.custom_body_description")}
+                      </div>
+                    </div>
+
+                    <Textarea
+                      value={form.customBodyText}
+                      onChange={(event) => updateForm("customBodyText", event.target.value)}
+                      placeholder={`{\n  "temperature": 0.7,\n  "top_p": 0.9\n}`}
+                      className="min-h-40 font-mono text-xs"
+                      autoComplete="off"
+                      spellCheck={false}
+                      disabled={busy}
+                    />
+
+                    <div className="flex flex-wrap gap-2">
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={handleFormatCustomBody}
+                        disabled={busy || !form.customBodyText.trim()}
+                      >
+                        {t("provider_settings.format_json")}
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={handleClearCustomBody}
+                        disabled={busy || !form.customBodyText.trim()}
+                      >
+                        {t("provider_settings.clear_json")}
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+              </details>
 
               <label className="space-y-1.5 text-sm font-medium">
                 <span>{t("provider_settings.api_key")}</span>
