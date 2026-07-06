@@ -7,7 +7,7 @@ This document records the Phase 9C Markdown rendering audit and the fixture chec
 Current recommended private beta tag:
 
 ```text
-rikkadesk-v0.1.0-beta.10
+rikkadesk-v0.1.0-beta.11
 ```
 
 ## Current Rendering Path

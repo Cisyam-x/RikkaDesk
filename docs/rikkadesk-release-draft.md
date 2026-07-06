@@ -1,11 +1,11 @@
-# RikkaDesk 0.1.0 Beta 10 Release Draft
+# RikkaDesk 0.1.0 Beta 11 Release Draft
 
 This document is a private release draft for RikkaDesk. Do not publish a public GitHub Release from this phase.
 
 ## Release Title Suggestion
 
 ```text
-RikkaDesk 0.1.0 Beta 10 - Private Windows Desktop Candidate
+RikkaDesk 0.1.0 Beta 11 - Private Windows Desktop Candidate
 ```
 
 ## Tag Suggestion
@@ -13,10 +13,10 @@ RikkaDesk 0.1.0 Beta 10 - Private Windows Desktop Candidate
 Current feature-stable private beta tag:
 
 ```text
-rikkadesk-v0.1.0-beta.10
+rikkadesk-v0.1.0-beta.11
 ```
 
-The `beta/0.1.0` branch should use this tag after Phase 9B Provider Advanced request config testing is accepted. Do not publish a public GitHub Release from this draft.
+The `beta/0.1.0` branch should use this tag after Phase 9C Markdown rendering and Workbench preview hardening testing is accepted. Do not publish a public GitHub Release from this draft.
 
 ## Version Strategy
 
@@ -28,7 +28,7 @@ Current version files:
 Recommendation:
 
 - Keep the internal package version as `0.1.0` for this private beta line.
-- Use `RikkaDesk 0.1.0 Beta 10` in release notes and private tester instructions.
+- Use `RikkaDesk 0.1.0 Beta 11` in release notes and private tester instructions.
 - Keep beta labels in Git tags and release notes unless the Windows bundler version strategy is explicitly changed later.
 - Do not publish a public prerelease until installer signing, support scope, and license obligations are reviewed.
 
@@ -71,6 +71,20 @@ This beta includes:
 - Secret reference design where JSON stores `secretRef`, not the API key.
 - Windows encrypted local secret blobs under app data.
 - Safe provider import/export v3 for multi-model metadata and safe advanced request config, with v1/v2 import compatibility.
+- Markdown table overflow polish for wide GFM tables inside message content.
+- Markdown/code block overflow and header layout polish.
+- KaTeX mhchem support for chemistry formulas.
+- Message Markdown raw HTML hardening:
+  - explicit `rehypeRaw` is no longer enabled in the RikkaDesk Markdown plugin list
+  - unsafe link schemes are blocked by default
+  - unsafe image sources are blocked by default
+  - normal `http:`, `https:`, and `mailto:` links keep safe target/rel attributes
+- Workbench preview sandbox hardening:
+  - HTML and SVG iframe sandbox values are empty
+  - Mermaid iframe sandbox is `allow-scripts`
+  - Workbench preview iframe no longer uses `allow-same-origin`
+  - Workbench Mermaid uses `securityLevel: "strict"`
+- Mermaid rendering in normal message Markdown remains disabled/deferred.
 - Windows MSI and NSIS installer artifacts.
 
 This beta is intended for local/private validation only.
@@ -132,6 +146,8 @@ Expected result:
 - No files, attachments, images, audio, tools, MCP, search, Workspace, forks, or multimodal provider calls.
 - One provider can contain multiple text models, but per-model secrets, per-model Base URLs, provider-specific protocols, tools, and multimodal abilities are not implemented.
 - Provider import/export supports non-sensitive provider metadata only; imported providers require API keys to be entered again.
+- Mermaid in normal message Markdown remains disabled/deferred.
+- Workbench Mermaid preview still loads Mermaid from a remote CDN and should be revisited before public release.
 - Stop/cancel may not abort the underlying provider HTTP request immediately.
 - JSON state is a beta persistence mechanism, not a final database design.
 - Installers are unsigned.
@@ -177,6 +193,13 @@ Before sharing any private beta installer:
 - Confirm provider export writes version 3 JSON with `providers[].models[]`, safe `customHeaders[]`, and safe `customBody`.
 - Confirm provider import works for version 3 advanced exports, version 2 multi-model exports, and older version 1 single-model exports.
 - Confirm provider exports do not include API keys, `secretRef`, tokens, Authorization headers, `x-api-key`, cookies, DPAPI blobs, local secret-store files, or internal model ids.
+- Confirm wide Markdown tables scroll inside the message content area.
+- Confirm code block copy, download, and preview actions still work.
+- Confirm inline math, block math, and mhchem chemistry formulas render.
+- Confirm unsafe Markdown link schemes and unsafe image sources are blocked.
+- Confirm the Markdown XSS fixture does not execute in message bubbles.
+- Confirm Workbench HTML/SVG preview sandbox values are empty.
+- Confirm Workbench Mermaid preview uses `allow-scripts`, does not use `allow-same-origin`, and runs with `securityLevel: "strict"`.
 - Confirm `hasSecret: true` only after a local key is saved.
 - Send a text-only test message.
 - Confirm streaming text appears when a real provider is configured.
@@ -194,7 +217,7 @@ Recommended private beta flow:
 1. Develop in phase branches.
 2. Merge accepted phase PRs into `beta/0.1.0`.
 3. Create private beta tags only for feature-stable checkpoints.
-4. Keep `rikkadesk-v0.1.0-beta.10` as the current feature-stable beta tag once Phase 9B is validated.
+4. Keep `rikkadesk-v0.1.0-beta.11` as the current feature-stable beta tag once Phase 9C is validated.
 5. Do not publish a public GitHub Release until signing, support scope, and license obligations are reviewed.
 
 Do not force-push `main`, `master`, or `beta/0.1.0`.

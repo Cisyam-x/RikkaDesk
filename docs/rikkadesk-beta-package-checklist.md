@@ -4,7 +4,7 @@ RikkaDesk is an unofficial desktop derivative / experiment based on RikkaHub. Th
 
 Do not paste real API keys into documentation, commit messages, terminal transcripts, screenshots, or issue comments.
 
-Current feature-stable private beta tag: `rikkadesk-v0.1.0-beta.10`.
+Current feature-stable private beta tag: `rikkadesk-v0.1.0-beta.11`.
 
 ## Current Beta Scope
 
@@ -231,6 +231,14 @@ Deleting a provider should remove its local secret and clear related favorite mo
 13. Confirm safe errors do not echo full custom header values or full custom body JSON.
 
 ## Test Markdown And Workbench Rendering Security
+
+Markdown table/code/math rendering:
+
+- Confirm a wide Markdown table scrolls horizontally inside a narrow message area instead of expanding the app viewport.
+- Confirm code block copy, download, and preview actions still work after overflow polish.
+- Confirm inline math and block math still render.
+- Confirm mhchem chemistry fixtures such as `\ce{H2O}` render.
+- Confirm invalid chemistry does not crash the message renderer.
 
 Markdown raw HTML hardening:
 

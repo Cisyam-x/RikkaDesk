@@ -6,9 +6,26 @@ This changelog tracks the RikkaDesk desktop work in this fork. It does not repla
 
 ## 0.1.0 Private Beta Line
 
-The current feature-stable private beta tag is planned as `rikkadesk-v0.1.0-beta.10`. The `beta/0.1.0` branch may contain later documentation or feature work after that tag.
+The current feature-stable private beta tag is planned as `rikkadesk-v0.1.0-beta.11`. The `beta/0.1.0` branch may contain later documentation or feature work after that tag.
 
 This beta line is not a public GitHub Release.
+
+### `rikkadesk-v0.1.0-beta.11` - Markdown Rendering Hardening
+
+Changed:
+
+- Polish Markdown table overflow so wide GFM tables scroll inside message content.
+- Improve Markdown/code block overflow and header layout.
+- Enable KaTeX mhchem support for chemistry formulas such as `\ce{H2O}`.
+- Harden message Markdown raw HTML handling by removing explicit `rehypeRaw`.
+- Add safe link handling for message Markdown.
+- Add safe image source handling for message Markdown.
+- Block unsafe link schemes such as `javascript:`, `data:`, `file:`, and `blob:`.
+- Keep normal `http:`, `https:`, and `mailto:` links with safe `target` / `rel` attributes.
+- Narrow the Workbench preview iframe sandbox.
+- Change Workbench Mermaid `securityLevel` from `loose` to `strict`.
+- Keep Mermaid rendering in normal message Markdown disabled/deferred.
+- Document residual risk: Workbench Mermaid still uses a remote CDN and should be revisited before public release.
 
 ### `rikkadesk-v0.1.0-beta.10` - Provider Advanced Request Config
 
@@ -149,7 +166,8 @@ The `beta/0.1.0` branch included these follow-up updates after the beta.4 featur
 - Long streaming timeout hotfix, tagged as `rikkadesk-v0.1.0-beta.7`.
 - Beta release copy hotfix, tagged as `rikkadesk-v0.1.0-beta.8`.
 - Provider multi-model state, UI, and import/export v2 work, tagged or planned as `rikkadesk-v0.1.0-beta.9`.
-- Provider advanced request config and import/export v3 work, planned as `rikkadesk-v0.1.0-beta.10`.
+- Provider advanced request config and import/export v3 work, tagged as `rikkadesk-v0.1.0-beta.10`.
+- Markdown rendering polish, mhchem support, raw HTML hardening, and Workbench preview sandbox hardening, planned as `rikkadesk-v0.1.0-beta.11`.
 
 ## Security
 

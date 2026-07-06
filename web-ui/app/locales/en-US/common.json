@@ -194,7 +194,12 @@
       "provider_multi_model": "Provider Settings with multiple models",
       "provider_advanced_request_config": "Advanced provider request config with custom headers/body",
       "test_connection": "Test Connection",
-      "provider_import_export": "Safe provider import/export"
+      "provider_import_export": "Safe provider import/export",
+      "markdown_rendering_polish": "Markdown rendering polish",
+      "markdown_table_overflow": "Markdown table overflow",
+      "mhchem_chemistry": "mhchem chemistry formulas",
+      "markdown_link_image_hardening": "Hardened Markdown links/images",
+      "workbench_preview_sandbox": "Workbench preview sandbox hardening"
     },
     "unsupported_title": "Not supported",
     "unsupported": {

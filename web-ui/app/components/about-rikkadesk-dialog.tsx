@@ -13,7 +13,7 @@ import {
 } from "~/components/ui/dialog";
 
 const RIKKADESK_VERSION = "0.1.0";
-const RIKKADESK_FEATURE_TAG = "rikkadesk-v0.1.0-beta.10";
+const RIKKADESK_FEATURE_TAG = "rikkadesk-v0.1.0-beta.11";
 
 const SUPPORT_KEYS = [
   "openai_streaming",
@@ -23,6 +23,11 @@ const SUPPORT_KEYS = [
   "provider_advanced_request_config",
   "test_connection",
   "provider_import_export",
+  "markdown_rendering_polish",
+  "markdown_table_overflow",
+  "mhchem_chemistry",
+  "markdown_link_image_hardening",
+  "workbench_preview_sandbox",
 ] as const;
 
 const UNSUPPORTED_KEYS = [
