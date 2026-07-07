@@ -50,6 +50,28 @@ However, the current desktop backend is still text-only:
 
 Conclusion: current RikkaDesk has a frontend attachment UI shell plus message part type/rendering shell, backed by a text-only desktop mock API. It is not a complete file, attachment, or multimodal feature.
 
+## Implementation Status
+
+Phase 10 P2 implemented the local desktop mock API file skeleton:
+
+- `POST /api/files/upload`
+- `GET /api/files/{id}`
+- `GET /api/files/path/{id}`
+- `DELETE /api/files/{id}`
+
+The local mock state is now `schemaVersion: 5` and stores managed file metadata only. File blobs are stored under the app data file store. Provider calls remain text-only, and no attachment content, base64 payload, local absolute path, OCR text, or provider request body is stored in `state.v1.json`.
+
+Phase 10 P3 aligned the inherited upload UI with the P2 skeleton:
+
+- Image picker accepts PNG, JPEG, WEBP, and GIF only.
+- Document picker accepts plain text and PDF only.
+- Frontend detection rejects SVG, HTML, script-like text, audio, video, Office documents, archives, executables, and unknown binaries before upload when possible.
+- Successful uploads render as attachment chips with file metadata.
+- PDF and text files remain document chips only; there is no inline PDF, Office, HTML, or SVG preview.
+- Raster images may render as image attachments, but they are not sent to a provider for image understanding.
+- Attachment deletion calls the local `DELETE /api/files/{id}` skeleton for draft attachments.
+- Multimodal provider calls, OCR, PDF/Office parsing, Workspace, MCP/tools, and search remain deferred.
+
 ## Phase 10 Goals And Non-Goals
 
 Long-term Phase 10 goals:

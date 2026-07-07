@@ -60,7 +60,16 @@ export interface ChatInputProps {
   className?: string;
 }
 
-const IMAGE_UPLOAD_ACCEPT = "image/*";
+const IMAGE_UPLOAD_ACCEPT = "image/png,image/jpeg,image/webp,image/gif";
+const DOCUMENT_UPLOAD_ACCEPT = "text/plain,application/pdf,.txt,.pdf";
+const ALLOWED_IMAGE_MIMES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/webp",
+  "image/gif",
+]);
+const ALLOWED_DOCUMENT_MIMES = new Set(["text/plain", "application/pdf"]);
+const TEXT_DETECTION_BYTES = 4096;
 
 async function detectUploadFile(
   file: globalThis.File,
@@ -68,60 +77,129 @@ async function detectUploadFile(
   const buffer = await file.slice(0, 4100).arrayBuffer();
   const detected = await fileTypeFromBuffer(buffer);
 
-  // 无法识别 magic bytes → 文本文件 → 允许，强制 text/plain 防止 OS MIME 映射污染（如 .ts → video/mp2t）
-  if (!detected) return { allowed: true, mimeType: "text/plain" };
-
-  // 识别为图片 / 视频 / 音频 → 允许，使用 magic bytes 检测到的 MIME
-  if (
-    detected.mime.startsWith("image/") ||
-    detected.mime.startsWith("video/") ||
-    detected.mime.startsWith("audio/")
-  ) {
+  if (detected && ALLOWED_IMAGE_MIMES.has(detected.mime)) {
     return { allowed: true, mimeType: detected.mime };
   }
 
-  // 允许常见文档格式
-  const ALLOWED_DOCUMENT_MIMES = new Set([
-    "application/pdf",
-    "application/msword",
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    "application/vnd.ms-excel",
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    "application/vnd.ms-powerpoint",
-    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-  ]);
-  if (ALLOWED_DOCUMENT_MIMES.has(detected.mime)) {
+  if (detected && ALLOWED_DOCUMENT_MIMES.has(detected.mime)) {
     return { allowed: true, mimeType: detected.mime };
   }
 
-  // 其他可识别的二进制格式（exe、zip 等）→ 拒绝
-  return { allowed: false, mimeType: detected.mime };
+  if (detected) {
+    return { allowed: false, mimeType: detected.mime };
+  }
+
+  if (await isSafeTextUpload(file)) {
+    return { allowed: true, mimeType: "text/plain" };
+  }
+
+  return { allowed: false, mimeType: file.type || "application/octet-stream" };
+}
+
+async function isSafeTextUpload(file: globalThis.File): Promise<boolean> {
+  if (hasBlockedUploadExtension(file.name)) {
+    return false;
+  }
+
+  const sample = await file.slice(0, TEXT_DETECTION_BYTES).arrayBuffer();
+  const bytes = new Uint8Array(sample);
+  if (bytes.includes(0)) {
+    return false;
+  }
+
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let text: string;
+  try {
+    text = decoder.decode(bytes);
+  } catch {
+    return false;
+  }
+
+  const normalized = text
+    .replace(/^\uFEFF/, "")
+    .trimStart()
+    .slice(0, 1024)
+    .toLowerCase();
+
+  return !(
+    normalized.startsWith("<svg") ||
+    normalized.startsWith("<!doctype html") ||
+    normalized.startsWith("<html") ||
+    normalized.startsWith("<script") ||
+    normalized.includes("<script") ||
+    normalized.includes("<svg") ||
+    normalized.includes("<iframe") ||
+    normalized.includes("<object") ||
+    normalized.includes("<embed")
+  );
+}
+
+function hasBlockedUploadExtension(fileName: string): boolean {
+  const extension = fileName.split(".").pop()?.toLowerCase();
+  if (!extension || extension === fileName.toLowerCase()) {
+    return false;
+  }
+
+  return new Set([
+    "svg",
+    "html",
+    "htm",
+    "js",
+    "mjs",
+    "cjs",
+    "jsx",
+    "ts",
+    "tsx",
+    "vbs",
+    "ps1",
+    "bat",
+    "cmd",
+    "sh",
+    "exe",
+    "dll",
+    "msi",
+    "zip",
+    "rar",
+    "7z",
+    "doc",
+    "docx",
+    "xls",
+    "xlsx",
+    "ppt",
+    "pptx",
+  ]).has(extension);
+}
+
+function uploadFileSize(file: UploadFilesResponseDto["files"][number]): number | null {
+  const size = file.sizeBytes ?? file.size;
+  return typeof size === "number" && Number.isFinite(size) && size >= 0
+    ? size
+    : null;
+}
+
+function formatFileSize(size: number): string {
+  if (size < 1024) return `${size} B`;
+  const kb = size / 1024;
+  if (kb < 1024) return `${kb.toFixed(kb >= 10 ? 0 : 1)} KB`;
+  const mb = kb / 1024;
+  return `${mb.toFixed(mb >= 10 ? 0 : 1)} MB`;
 }
 
 function toMessagePart(
   file: UploadFilesResponseDto["files"][number],
 ): UIMessagePart {
+  const sizeBytes = uploadFileSize(file);
+  const metadata = {
+    fileId: file.id,
+    mime: file.mime,
+    ...(sizeBytes != null ? { sizeBytes } : {}),
+  };
+
   if (file.mime.startsWith("image/")) {
     return {
       type: "image",
       url: file.url,
-      metadata: { fileId: file.id },
-    };
-  }
-
-  if (file.mime.startsWith("video/")) {
-    return {
-      type: "video",
-      url: file.url,
-      metadata: { fileId: file.id },
-    };
-  }
-
-  if (file.mime.startsWith("audio/")) {
-    return {
-      type: "audio",
-      url: file.url,
-      metadata: { fileId: file.id },
+      metadata,
     };
   }
 
@@ -130,14 +208,14 @@ function toMessagePart(
     url: file.url,
     fileName: file.fileName,
     mime: file.mime,
-    metadata: { fileId: file.id },
+    metadata,
   };
 }
 
 function partLabel(part: UIMessagePart, t: (key: string) => string): string {
   switch (part.type) {
     case "document":
-      return part.fileName;
+      return part.fileName?.trim() || t("chat.attachment_file");
     case "image":
       return t("chat.attachment_image");
     case "video":
@@ -167,6 +245,13 @@ function partIcon(part: UIMessagePart) {
 function getPartFileId(part: UIMessagePart): number | null {
   const value = part.metadata?.fileId;
   return typeof value === "number" ? value : null;
+}
+
+function getPartSizeBytes(part: UIMessagePart): number | null {
+  const value = part.metadata?.sizeBytes;
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? value
+    : null;
 }
 
 function hasFilesInDataTransfer(dataTransfer: DataTransfer | null): boolean {
@@ -558,10 +643,11 @@ function ChatInputInner({
             <div className="flex flex-wrap gap-2 px-2 pt-1">
               {attachments.map((part, index) => {
                 const key = `${part.type}-${index}`;
+                const sizeBytes = getPartSizeBytes(part);
                 return (
                   <div
                     key={key}
-                    className="group inline-flex max-w-[220px] items-center gap-1 rounded-full border bg-background/80 px-2 py-1 text-xs"
+                    className="group inline-flex max-w-[260px] items-center gap-1 rounded-full border bg-background/80 px-2 py-1 text-xs"
                   >
                     {part.type === "image" ? (
                       <img
@@ -573,6 +659,11 @@ function ChatInputInner({
                       partIcon(part)
                     )}
                     <span className="truncate">{partLabel(part, t)}</span>
+                    {sizeBytes != null ? (
+                      <span className="shrink-0 text-muted-foreground">
+                        {formatFileSize(sizeBytes)}
+                      </span>
+                    ) : null}
                     <button
                       className="rounded p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground"
                       onClick={async () => {
@@ -631,6 +722,7 @@ function ChatInputInner({
               >
                 <input
                   ref={fileInputRef}
+                  accept={DOCUMENT_UPLOAD_ACCEPT}
                   className="hidden"
                   multiple
                   onChange={handleUploadInputChange}

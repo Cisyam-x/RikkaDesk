@@ -115,11 +115,13 @@ Important files:
 
 ## `state.v1.json`
 
-`state.v1.json` stores non-sensitive local state for the desktop prototype. The filename remains `state.v1.json` even though the JSON payload may contain `schemaVersion: 4`.
+`state.v1.json` stores non-sensitive local state for the desktop prototype. The filename remains `state.v1.json` even though the JSON payload may contain `schemaVersion: 5`.
 
 Phase 8 upgrades provider state from `provider.model` to `provider.models[]`. Old beta.8 or earlier builds should not be started against a schema v3 state file; they may treat the state as unsupported and create a corrupt backup or default state. Back up app data before testing schema migration or moving between beta builds.
 
 Phase 9B upgrades provider state to `schemaVersion: 4` with `providers[].customHeaders` and `providers[].customBody`. Old beta.9 or earlier builds should not be started against a schema v4 state file; they may not understand the provider shape. Back up app data before testing schema migration or moving between beta builds.
+
+Phase 10 upgrades local desktop state to `schemaVersion: 5` with managed file metadata for the mock API file skeleton. Old beta.11 or earlier builds should not be started against a schema v5 state file. Use synthetic app data for Phase 10 file tests, or back up and restore real app data before switching builds.
 
 It may contain:
 
@@ -132,6 +134,7 @@ It may contain:
 - model ids and displayNames under `providers[].models[]`
 - non-sensitive custom headers under `providers[].customHeaders`
 - safe custom body JSON under `providers[].customBody`
+- managed file metadata under `files[]`
 - assistant chatModelId
 - secretRef
 - savedAt
@@ -145,6 +148,10 @@ It must not contain:
 - `x-api-key` value
 - service account private key
 - any other sensitive credential
+- file content
+- base64 file payloads
+- original absolute upload paths
+- OCR text
 
 ## `mock-api/secrets/*.bin`
 
@@ -257,6 +264,23 @@ Workbench preview hardening:
 - Confirm Workbench preview iframe does not include `allow-same-origin`.
 - Confirm Mermaid preview uses `securityLevel: "strict"`.
 - Confirm remote Mermaid CDN residual risk is documented in `docs/rikkadesk-markdown-rendering-plan.md`.
+
+## Test Local Attachment Skeleton
+
+Use synthetic app data and synthetic fixture files only. Do not use real user files, real API keys, or existing `secrets/*.bin`.
+
+Phase 10 P3 smoke checks:
+
+- Confirm the image picker accepts only PNG, JPEG, WEBP, and GIF.
+- Confirm the document picker accepts only plain text and PDF.
+- Upload a synthetic `hello.txt` and confirm a document chip appears.
+- Upload a synthetic PNG and confirm an image attachment appears.
+- Upload a synthetic PDF and confirm it appears as a document chip only, with no inline PDF preview.
+- Confirm synthetic SVG and HTML files are rejected by the frontend or safely rejected by the backend.
+- Delete a draft attachment chip and confirm `DELETE /api/files/{id}` succeeds.
+- Send a text message with synthetic image/document attachments and confirm the user message keeps the attachment parts.
+- Confirm the mock assistant reply still works and provider requests remain text-only.
+- Confirm `state.v1.json` has `schemaVersion: 5`, contains file metadata, and does not contain file contents, base64 payloads, or original absolute upload paths.
 
 ## Test Real OpenAI-Compatible Streaming Chat
 

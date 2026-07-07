@@ -13,11 +13,11 @@ export function ImagePart({ url }: ImagePartProps) {
 
   if (!url) return null;
 
-  if (error) {
+  if (!imageUrl || error) {
     return (
       <div className="flex items-center gap-2 rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive">
         <ImageOff className="h-4 w-4" />
-        <span>Failed to load image: {resolveFileUrl(url)}</span>
+        <span>Image attachment is unavailable.</span>
       </div>
     );
   }
