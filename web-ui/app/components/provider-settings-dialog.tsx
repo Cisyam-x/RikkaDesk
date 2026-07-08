@@ -6,6 +6,7 @@ import { toast } from "sonner";
 
 import { Badge } from "~/components/ui/badge";
 import { Button } from "~/components/ui/button";
+import { Checkbox } from "~/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -25,6 +26,11 @@ const DEFAULT_PROVIDER_NAME = "OpenAI Compatible";
 const PROVIDER_TYPE = "openai-compatible";
 const PROVIDER_IMPORT_MAX_FILE_BYTES = 512 * 1024;
 const PROVIDER_CUSTOM_BODY_MAX_BYTES = 16 * 1024;
+const TEXT_MODALITY = "TEXT";
+const IMAGE_MODALITY = "IMAGE";
+
+type ProviderInputModality = typeof TEXT_MODALITY | typeof IMAGE_MODALITY;
+type ProviderOutputModality = typeof TEXT_MODALITY;
 
 const FORBIDDEN_CUSTOM_HEADER_NAMES = new Set([
   "authorization",
@@ -73,6 +79,8 @@ interface DesktopProviderModelConfig {
   id: string;
   modelId: string;
   displayName: string;
+  inputModalities?: ProviderInputModality[];
+  outputModalities?: ProviderOutputModality[];
 }
 
 interface DesktopProviderCustomHeaderConfig {
@@ -102,6 +110,8 @@ interface DesktopProviderTestResponse {
 interface ProviderExportModel {
   modelId: string;
   displayName: string;
+  inputModalities?: ProviderInputModality[];
+  outputModalities?: ProviderOutputModality[];
 }
 
 interface ProviderExportItem {
@@ -166,6 +176,8 @@ interface ProviderModelFormState {
   localId: string;
   modelId: string;
   displayName: string;
+  inputModalities: ProviderInputModality[];
+  outputModalities: ProviderOutputModality[];
 }
 
 interface ProviderCustomHeaderFormState {
@@ -207,7 +219,26 @@ function emptyModelForm(): ProviderModelFormState {
     localId: createModelLocalId(),
     modelId: "",
     displayName: "",
+    inputModalities: [TEXT_MODALITY],
+    outputModalities: [TEXT_MODALITY],
   };
+}
+
+function normalizeInputModalities(
+  modalities: ProviderInputModality[] | undefined,
+): ProviderInputModality[] {
+  const values = new Set(modalities ?? []);
+  const normalized: ProviderInputModality[] = [TEXT_MODALITY];
+  if (values.has(IMAGE_MODALITY)) {
+    normalized.push(IMAGE_MODALITY);
+  }
+  return normalized;
+}
+
+function normalizeOutputModalities(
+  modalities: ProviderOutputModality[] | undefined,
+): ProviderOutputModality[] {
+  return [TEXT_MODALITY];
 }
 
 function emptyHeaderForm(): ProviderCustomHeaderFormState {
@@ -254,6 +285,8 @@ function formFromProvider(provider: DesktopProviderResponse): ProviderFormState 
       localId: model.id || createModelLocalId(),
       modelId: model.modelId,
       displayName: model.displayName || model.modelId,
+      inputModalities: normalizeInputModalities(model.inputModalities),
+      outputModalities: normalizeOutputModalities(model.outputModalities),
     })),
     customHeaders: (provider.customHeaders ?? []).map((header) => ({
       localId: createHeaderLocalId(),
@@ -510,6 +543,22 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
     }));
   }, []);
 
+  const updateModelImageInput = React.useCallback((localId: string, enabled: boolean) => {
+    setForm((current) => ({
+      ...current,
+      models: current.models.map((model) => {
+        if (model.localId !== localId) return model;
+        return {
+          ...model,
+          inputModalities: enabled
+            ? [TEXT_MODALITY, IMAGE_MODALITY]
+            : [TEXT_MODALITY],
+          outputModalities: [TEXT_MODALITY],
+        };
+      }),
+    }));
+  }, []);
+
   const updateCustomHeader = React.useCallback((
     localId: string,
     field: "name" | "value",
@@ -621,6 +670,8 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
         id: model.id,
         modelId,
         displayName,
+        inputModalities: normalizeInputModalities(model.inputModalities),
+        outputModalities: normalizeOutputModalities(model.outputModalities),
       });
     }
 
@@ -1062,6 +1113,7 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
                     const isCurrent = Boolean(model.id && model.id === currentModelId);
                     const isSettingThisModel = settingCurrentModelId === model.localId;
                     const isTestingThisModel = testingModelId === model.localId;
+                    const imageInputEnabled = model.inputModalities.includes(IMAGE_MODALITY);
                     const canTestModel = Boolean(
                       selectedProvider
                       && form.hasSecret
@@ -1117,6 +1169,44 @@ export function ProviderSettingsDialog({ open, onOpenChange }: ProviderSettingsD
                               disabled={busy}
                             />
                           </label>
+                        </div>
+
+                        <div className="mt-3 rounded-md border bg-background/70 p-3">
+                          <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                            {t("provider_settings.input_capabilities")}
+                          </div>
+                          <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                            <label className="flex items-start gap-2 rounded-md border bg-muted/30 p-2 text-sm">
+                              <Checkbox checked disabled />
+                              <span>
+                                <span className="block font-medium">
+                                  {t("provider_settings.input_capability_text")}
+                                </span>
+                                <span className="block text-xs text-muted-foreground">
+                                  {t("provider_settings.input_capability_text_locked")}
+                                </span>
+                              </span>
+                            </label>
+                            <label className="flex items-start gap-2 rounded-md border bg-muted/30 p-2 text-sm">
+                              <Checkbox
+                                checked={imageInputEnabled}
+                                disabled={busy}
+                                onCheckedChange={(checked) =>
+                                  updateModelImageInput(model.localId, checked === true)}
+                              />
+                              <span>
+                                <span className="block font-medium">
+                                  {t("provider_settings.input_capability_image")}
+                                </span>
+                                <span className="block text-xs text-muted-foreground">
+                                  {t("provider_settings.input_capability_image_beta_note")}
+                                </span>
+                              </span>
+                            </label>
+                          </div>
+                          <div className="mt-2 text-xs text-muted-foreground">
+                            {t("provider_settings.output_capability_text")}
+                          </div>
                         </div>
 
                         <div className="mt-3 flex flex-wrap gap-2">

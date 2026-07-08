@@ -16,7 +16,7 @@ Included:
 - Desktop Provider Settings UI for OpenAI-compatible provider management.
 - Provider list, add/edit/delete provider, multiple models per provider, favorite model updates, Set as current model, and Test Connection.
 - Advanced request config for non-sensitive provider custom headers and safe custom body JSON.
-- Safe provider import/export v3 for multi-model provider metadata and safe advanced request config, with v1/v2 import compatibility.
+- Safe provider import/export v4 for multi-model provider metadata, model capabilities, and safe advanced request config, with v1/v2/v3 import compatibility.
 - Secret references in JSON and encrypted local secret blobs for API keys.
 - OpenAI-compatible text chat with streaming responses.
 - Mock fallback when a real provider is not configured or cannot be used.
@@ -115,13 +115,13 @@ Important files:
 
 ## `state.v1.json`
 
-`state.v1.json` stores non-sensitive local state for the desktop prototype. The filename remains `state.v1.json` even though the JSON payload may contain `schemaVersion: 5`.
+`state.v1.json` stores non-sensitive local state for the desktop prototype. The filename remains `state.v1.json` even though the JSON payload may contain `schemaVersion: 6`.
 
 Phase 8 upgrades provider state from `provider.model` to `provider.models[]`. Old beta.8 or earlier builds should not be started against a schema v3 state file; they may treat the state as unsupported and create a corrupt backup or default state. Back up app data before testing schema migration or moving between beta builds.
 
 Phase 9B upgrades provider state to `schemaVersion: 4` with `providers[].customHeaders` and `providers[].customBody`. Old beta.9 or earlier builds should not be started against a schema v4 state file; they may not understand the provider shape. Back up app data before testing schema migration or moving between beta builds.
 
-Phase 10 upgrades local desktop state to `schemaVersion: 5` with managed file metadata for the mock API file skeleton. Old beta.11 or earlier builds should not be started against a schema v5 state file. Use synthetic app data for Phase 10 file tests, or back up and restore real app data before switching builds.
+Phase 10 upgrades local desktop state to `schemaVersion: 5` with managed file metadata for the mock API file skeleton, then `schemaVersion: 6` with provider model capability metadata. Old beta.11 or earlier builds should not be started against schema v5/v6 state files. Use synthetic app data for Phase 10 file tests, or back up and restore real app data before switching builds.
 
 It may contain:
 
@@ -132,6 +132,7 @@ It may contain:
 - provider id, name, type, enabled flag
 - baseUrl
 - model ids and displayNames under `providers[].models[]`
+- model `inputModalities` and `outputModalities`
 - non-sensitive custom headers under `providers[].customHeaders`
 - safe custom body JSON under `providers[].customBody`
 - managed file metadata under `files[]`
@@ -292,6 +293,22 @@ Phase 10 P4 smoke checks:
 - Confirm SVG and HTML are not previewed as active images or documents.
 - Confirm safe document links point only to controlled `/api/files/path/{id}` URLs and keep `target="_blank"` plus `rel="noopener noreferrer"`.
 - Confirm no `dangerouslySetInnerHTML`, iframe, object, or embed is introduced for attachment message parts.
+
+Phase 10 P5a smoke checks:
+
+- Confirm migrating a synthetic schema v5 state writes `schemaVersion: 6`.
+- Confirm file metadata survives the v5 to v6 migration.
+- Confirm existing provider models default to `inputModalities: ["TEXT"]` and `outputModalities: ["TEXT"]`.
+- In Provider Settings, create one text-only model and one model with Image input enabled. Save, close, reopen, and confirm the capability metadata persists.
+- Confirm the model selector/settings payload includes the configured modalities.
+- Export providers and confirm version 4 includes `inputModalities` and `outputModalities` for each model while excluding API keys, `secretRef`, local file metadata, file blobs, base64 payloads, and app data paths.
+- Import a v3 provider export and confirm imported models default to TEXT/TEXT.
+- Import a v4 provider export and confirm IMAGE input metadata is preserved.
+- Select a text-only model, attach a synthetic PNG, and confirm send is blocked before `/messages`.
+- Select an image-capable model, attach a synthetic PNG, and confirm the message is saved locally with a local-only assistant notice.
+- Attach synthetic TXT/PDF documents and confirm they remain local-only.
+- Confirm backend `/messages` and `/regenerate` do not call real providers when any non-text message part is present.
+- Confirm `state.v1.json` does not contain file content, base64 payloads, original absolute upload paths, or provider request bodies.
 
 ## Test Real OpenAI-Compatible Streaming Chat
 

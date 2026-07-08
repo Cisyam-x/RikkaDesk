@@ -45,8 +45,9 @@ const PREFERRED_ADDR: &str = "127.0.0.1:8080";
 const PERSIST_DIR_NAME: &str = "mock-api";
 const STATE_FILE_NAME: &str = "state.v1.json";
 const STATE_TMP_FILE_NAME: &str = "state.v1.json.tmp";
-const STATE_SCHEMA_VERSION: u32 = 5;
-const FILE_METADATA_STATE_SCHEMA_VERSION: u32 = 4;
+const STATE_SCHEMA_VERSION: u32 = 6;
+const FILE_METADATA_STATE_SCHEMA_VERSION: u32 = 5;
+const CUSTOM_REQUEST_CONFIG_STATE_SCHEMA_VERSION: u32 = 4;
 const MULTI_MODEL_STATE_SCHEMA_VERSION: u32 = 3;
 const PREVIOUS_STATE_SCHEMA_VERSION: u32 = 2;
 const LEGACY_STATE_SCHEMA_VERSION: u32 = 1;
@@ -62,8 +63,9 @@ const SECRET_SERVICE_NAME: &str = "RikkaDesk";
 const OPENAI_COMPATIBLE_PROVIDER_TYPE: &str = "openai-compatible";
 const PROVIDER_SECRET_REF_PREFIX: &str = "rikkadesk:provider:";
 const OPENAI_TEST_TIMEOUT_SECS: u64 = 60;
-const PROVIDER_IMPORT_EXPORT_VERSION: u32 = 3;
-const PREVIOUS_PROVIDER_IMPORT_EXPORT_VERSION: u32 = 2;
+const PROVIDER_IMPORT_EXPORT_VERSION: u32 = 4;
+const CUSTOM_PROVIDER_IMPORT_EXPORT_VERSION: u32 = 3;
+const MULTI_MODEL_PROVIDER_IMPORT_EXPORT_VERSION: u32 = 2;
 const LEGACY_PROVIDER_IMPORT_EXPORT_VERSION: u32 = 1;
 const PROVIDER_IMPORT_MAX_ITEMS: usize = 50;
 const PROVIDER_IMPORT_MAX_NAME_LEN: usize = 120;
@@ -75,11 +77,15 @@ const PROVIDER_CUSTOM_HEADER_MAX_ITEMS: usize = 32;
 const PROVIDER_CUSTOM_HEADER_MAX_NAME_LEN: usize = 128;
 const PROVIDER_CUSTOM_HEADER_MAX_VALUE_LEN: usize = 1024;
 const PROVIDER_CUSTOM_BODY_MAX_BYTES: usize = 16 * 1024;
+const MODEL_MODALITY_TEXT: &str = "TEXT";
+const MODEL_MODALITY_IMAGE: &str = "IMAGE";
 const MOCK_ASSISTANT_ID: &str = "mock-assistant";
 const MOCK_MODEL_ID: &str = "mock-chat";
 const MOCK_PROVIDER_ID: &str = "mock-provider";
 const MOCK_WELCOME_CONVERSATION_ID: &str = "mock-welcome";
 const MOCK_REPLY_TEXT: &str = "这是 RikkaDesk Mock 后端返回的测试回复。";
+const LOCAL_ATTACHMENT_REPLY_TEXT: &str =
+    "附件已保存到本地会话。当前 beta 暂不支持将附件发送给模型服务。";
 
 #[derive(Clone)]
 pub struct MockApiHandle {
@@ -410,6 +416,10 @@ impl DesktopProviderConfig {
         } else {
             self.legacy_model = None;
         }
+
+        for model in &mut self.models {
+            model.normalize_modalities();
+        }
     }
 
     fn primary_model(&self) -> Option<&DesktopProviderModelConfig> {
@@ -434,8 +444,8 @@ impl DesktopProviderConfig {
                     "modelId": model.model_id,
                     "displayName": model.display_name,
                     "type": "CHAT",
-                    "inputModalities": ["TEXT"],
-                    "outputModalities": ["TEXT"],
+                    "inputModalities": model.input_modalities.clone(),
+                    "outputModalities": model.output_modalities.clone(),
                     "abilities": []
                 })
             })
@@ -459,6 +469,83 @@ struct DesktopProviderModelConfig {
     id: String,
     model_id: String,
     display_name: String,
+    #[serde(default = "default_input_modalities")]
+    input_modalities: Vec<String>,
+    #[serde(default = "default_output_modalities")]
+    output_modalities: Vec<String>,
+}
+
+impl DesktopProviderModelConfig {
+    fn normalize_modalities(&mut self) {
+        self.input_modalities = normalize_input_modalities(Some(&self.input_modalities))
+            .unwrap_or_else(|_| default_input_modalities());
+        self.output_modalities = normalize_output_modalities(Some(&self.output_modalities))
+            .unwrap_or_else(|_| default_output_modalities());
+    }
+}
+
+fn default_input_modalities() -> Vec<String> {
+    vec![MODEL_MODALITY_TEXT.to_string()]
+}
+
+fn default_output_modalities() -> Vec<String> {
+    vec![MODEL_MODALITY_TEXT.to_string()]
+}
+
+fn normalize_input_modalities(modalities: Option<&Vec<String>>) -> Result<Vec<String>, String> {
+    let Some(modalities) = modalities else {
+        return Ok(default_input_modalities());
+    };
+
+    if modalities.is_empty() {
+        return Err("Model input capabilities must include Text".to_string());
+    }
+
+    let mut has_text = false;
+    let mut has_image = false;
+    for modality in modalities {
+        let normalized = modality.trim().to_ascii_uppercase();
+        if normalized.is_empty() || normalized.len() > 32 {
+            return Err("Model input capability is invalid".to_string());
+        }
+        match normalized.as_str() {
+            MODEL_MODALITY_TEXT => has_text = true,
+            MODEL_MODALITY_IMAGE => has_image = true,
+            _ => return Err("Model input capability is not supported".to_string()),
+        }
+    }
+
+    if !has_text {
+        return Err("Model input capabilities must include Text".to_string());
+    }
+
+    let mut result = vec![MODEL_MODALITY_TEXT.to_string()];
+    if has_image {
+        result.push(MODEL_MODALITY_IMAGE.to_string());
+    }
+    Ok(result)
+}
+
+fn normalize_output_modalities(modalities: Option<&Vec<String>>) -> Result<Vec<String>, String> {
+    let Some(modalities) = modalities else {
+        return Ok(default_output_modalities());
+    };
+
+    if modalities.is_empty() {
+        return Err("Model output capabilities must include Text".to_string());
+    }
+
+    for modality in modalities {
+        let normalized = modality.trim().to_ascii_uppercase();
+        if normalized.is_empty() || normalized.len() > 32 {
+            return Err("Model output capability is invalid".to_string());
+        }
+        if normalized != MODEL_MODALITY_TEXT {
+            return Err("Model output capability is not supported".to_string());
+        }
+    }
+
+    Ok(default_output_modalities())
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -516,6 +603,8 @@ struct UpsertDesktopProviderModelRequest {
     id: Option<String>,
     model_id: String,
     display_name: Option<String>,
+    input_modalities: Option<Vec<String>>,
+    output_modalities: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -651,11 +740,22 @@ struct ValidatedProviderImportItem {
 struct ValidatedProviderImportModel {
     model_id: String,
     display_name: String,
+    input_modalities: Vec<String>,
+    output_modalities: Vec<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ProviderExportModel {
+    model_id: String,
+    display_name: String,
+    input_modalities: Vec<String>,
+    output_modalities: Vec<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProviderExportModelLegacy {
     model_id: String,
     display_name: String,
 }
@@ -683,7 +783,21 @@ struct ProviderExportItemV2 {
     name: String,
     base_url: String,
     has_secret: bool,
-    models: Vec<ProviderExportModel>,
+    models: Vec<ProviderExportModelLegacy>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProviderExportItemV3 {
+    #[serde(rename = "type")]
+    provider_type: String,
+    enabled: bool,
+    name: String,
+    base_url: String,
+    has_secret: bool,
+    models: Vec<ProviderExportModelLegacy>,
+    custom_headers: Vec<DesktopProviderCustomHeaderConfig>,
+    custom_body: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -699,7 +813,7 @@ struct ProviderExportItemV1 {
     has_secret: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ProviderExportDocument {
     version: u32,
@@ -735,7 +849,7 @@ struct ProviderExportDocumentV3 {
     version: u32,
     app: String,
     exported_at: String,
-    providers: Vec<ProviderExportItem>,
+    providers: Vec<ProviderExportItemV3>,
 }
 
 #[derive(Serialize)]
@@ -795,6 +909,8 @@ struct ProviderImportConfirmModel {
     id: String,
     model_id: String,
     display_name: String,
+    input_modalities: Vec<String>,
+    output_modalities: Vec<String>,
 }
 
 struct OpenAiChatConfig {
@@ -1166,7 +1282,16 @@ async fn load_persisted_state(persistence: &MockPersistence) -> PersistedMockSta
             persisted
         }
         Ok(persisted) if persisted.schema_version == FILE_METADATA_STATE_SCHEMA_VERSION => {
-            let mut migrated = migrate_v4_to_v5(persisted);
+            let mut migrated = migrate_v5_to_v6(persisted);
+            sync_settings_with_desktop_providers(&mut migrated.settings, &migrated.providers);
+            ensure_current_model_exists(&mut migrated.settings);
+            if let Err(error) = persistence.save(&migrated).await {
+                eprintln!("RikkaDesk mock API failed to save migrated state: {error}");
+            }
+            migrated
+        }
+        Ok(persisted) if persisted.schema_version == CUSTOM_REQUEST_CONFIG_STATE_SCHEMA_VERSION => {
+            let mut migrated = migrate_v4_to_v6(persisted);
             sync_settings_with_desktop_providers(&mut migrated.settings, &migrated.providers);
             ensure_current_model_exists(&mut migrated.settings);
             if let Err(error) = persistence.save(&migrated).await {
@@ -1175,7 +1300,7 @@ async fn load_persisted_state(persistence: &MockPersistence) -> PersistedMockSta
             migrated
         }
         Ok(persisted) if persisted.schema_version == MULTI_MODEL_STATE_SCHEMA_VERSION => {
-            let mut migrated = migrate_v3_to_v5(persisted);
+            let mut migrated = migrate_v3_to_v6(persisted);
             sync_settings_with_desktop_providers(&mut migrated.settings, &migrated.providers);
             ensure_current_model_exists(&mut migrated.settings);
             if let Err(error) = persistence.save(&migrated).await {
@@ -1184,7 +1309,7 @@ async fn load_persisted_state(persistence: &MockPersistence) -> PersistedMockSta
             migrated
         }
         Ok(persisted) if persisted.schema_version == PREVIOUS_STATE_SCHEMA_VERSION => {
-            let mut migrated = migrate_v2_to_v5(persisted);
+            let mut migrated = migrate_v2_to_v6(persisted);
             sync_settings_with_desktop_providers(&mut migrated.settings, &migrated.providers);
             ensure_current_model_exists(&mut migrated.settings);
             if let Err(error) = persistence.save(&migrated).await {
@@ -1193,7 +1318,7 @@ async fn load_persisted_state(persistence: &MockPersistence) -> PersistedMockSta
             migrated
         }
         Ok(persisted) if persisted.schema_version == LEGACY_STATE_SCHEMA_VERSION => {
-            let mut migrated = migrate_v1_to_v5(persisted);
+            let mut migrated = migrate_v1_to_v6(persisted);
             sync_settings_with_desktop_providers(&mut migrated.settings, &migrated.providers);
             ensure_current_model_exists(&mut migrated.settings);
             if let Err(error) = persistence.save(&migrated).await {
@@ -1339,6 +1464,8 @@ async fn confirm_desktop_provider_import(
                 id: state.next_id("desktop-model"),
                 model_id: model.model_id.clone(),
                 display_name: model.display_name.clone(),
+                input_modalities: model.input_modalities.clone(),
+                output_modalities: model.output_modalities.clone(),
             })
             .collect::<Vec<_>>();
         let imported_models = models
@@ -1347,6 +1474,8 @@ async fn confirm_desktop_provider_import(
                 id: model.id.clone(),
                 model_id: model.model_id.clone(),
                 display_name: model.display_name.clone(),
+                input_modalities: model.input_modalities.clone(),
+                output_modalities: model.output_modalities.clone(),
             })
             .collect::<Vec<_>>();
         let config = DesktopProviderConfig {
@@ -1722,6 +1851,7 @@ async fn send_message(
     let model_id = current_model_id(&state, &assistant_id).await;
     let created_at = now_iso();
     let user_text = first_text_part(&payload.parts);
+    let user_has_non_text_parts = has_non_text_parts(&payload.parts);
 
     let updated_after_user_message = {
         let mut conversations = state.conversations.write().await;
@@ -1761,6 +1891,19 @@ async fn send_message(
     persist_mock_state(&state).await;
     broadcast_conversation_snapshot(&state, &updated_after_user_message).await;
     broadcast_list_invalidate(&state).await;
+
+    if user_has_non_text_parts {
+        append_assistant_reply(
+            &state,
+            &id,
+            &assistant_id,
+            &model_id,
+            LOCAL_ATTACHMENT_REPLY_TEXT.to_string(),
+            now,
+        )
+        .await;
+        return Json(json!({ "status": "accepted" }));
+    }
 
     let real_chat_config = if user_text.is_some() {
         match resolve_openai_chat_config(&state, &model_id).await {
@@ -1995,7 +2138,7 @@ async fn regenerate_message(
     let assistant_id = current_assistant_id(&state).await;
     let model_id = current_model_id(&state, &assistant_id).await;
 
-    let prepared = {
+    let (prepared, last_user_has_non_text_parts) = {
         let mut conversations = state.conversations.write().await;
         let Some(conversation) = conversations.get_mut(&id) else {
             return not_found_response("Conversation not found");
@@ -2039,7 +2182,8 @@ async fn regenerate_message(
             return bad_request_response("No user text message is available to regenerate from.");
         };
 
-        if text_from_parts(&last_user_message.parts).is_none() {
+        let last_user_has_non_text_parts = has_non_text_parts(&last_user_message.parts);
+        if !last_user_has_non_text_parts && text_from_parts(&last_user_message.parts).is_none() {
             return bad_request_response(
                 "Phase 6A currently supports regenerating text-only chat.",
             );
@@ -2047,12 +2191,25 @@ async fn regenerate_message(
 
         conversation.update_at = now_millis();
         conversation.is_generating = true;
-        conversation.clone()
+        (conversation.clone(), last_user_has_non_text_parts)
     };
 
     persist_mock_state(&state).await;
     broadcast_conversation_snapshot(&state, &prepared).await;
     broadcast_list_invalidate(&state).await;
+
+    if last_user_has_non_text_parts {
+        append_assistant_reply(
+            &state,
+            &id,
+            &assistant_id,
+            &model_id,
+            LOCAL_ATTACHMENT_REPLY_TEXT.to_string(),
+            now,
+        )
+        .await;
+        return Json(json!({ "status": "accepted" })).into_response();
+    }
 
     let real_chat_config = match resolve_openai_chat_config(&state, &model_id).await {
         Ok(config) => config,
@@ -2480,6 +2637,8 @@ async fn provider_export_items(
                             .map(|model| ProviderExportModel {
                                 model_id: model.model_id.clone(),
                                 display_name: model.display_name.clone(),
+                                input_modalities: model.input_modalities.clone(),
+                                output_modalities: model.output_modalities.clone(),
                             })
                             .collect(),
                         custom_headers,
@@ -2512,15 +2671,20 @@ fn validate_provider_import_document(
                 .map_err(|_| bad_request_response("Invalid provider import document"))?;
             validate_provider_import_document_v1(&document)
         }
-        PREVIOUS_PROVIDER_IMPORT_EXPORT_VERSION => {
+        MULTI_MODEL_PROVIDER_IMPORT_EXPORT_VERSION => {
             let document = serde_json::from_value::<ProviderExportDocumentV2>(document.clone())
                 .map_err(|_| bad_request_response("Invalid provider import document"))?;
             validate_provider_import_document_v2(&document)
         }
-        PROVIDER_IMPORT_EXPORT_VERSION => {
+        CUSTOM_PROVIDER_IMPORT_EXPORT_VERSION => {
             let document = serde_json::from_value::<ProviderExportDocumentV3>(document.clone())
                 .map_err(|_| bad_request_response("Invalid provider import document"))?;
             validate_provider_import_document_v3(&document)
+        }
+        PROVIDER_IMPORT_EXPORT_VERSION => {
+            let document = serde_json::from_value::<ProviderExportDocument>(document.clone())
+                .map_err(|_| bad_request_response("Invalid provider import document"))?;
+            validate_provider_import_document_v4(&document)
         }
         _ => Err(bad_request_response(
             "Unsupported provider import document version",
@@ -2550,7 +2714,7 @@ fn validate_provider_import_document_v1(
 fn validate_provider_import_document_v2(
     document: &ProviderExportDocumentV2,
 ) -> Result<Vec<ValidatedProviderImportItem>, Response> {
-    if document.version != PREVIOUS_PROVIDER_IMPORT_EXPORT_VERSION {
+    if document.version != MULTI_MODEL_PROVIDER_IMPORT_EXPORT_VERSION {
         return Err(bad_request_response(
             "Unsupported provider import document version",
         ));
@@ -2569,7 +2733,7 @@ fn validate_provider_import_document_v2(
 fn validate_provider_import_document_v3(
     document: &ProviderExportDocumentV3,
 ) -> Result<Vec<ValidatedProviderImportItem>, Response> {
-    if document.version != PROVIDER_IMPORT_EXPORT_VERSION {
+    if document.version != CUSTOM_PROVIDER_IMPORT_EXPORT_VERSION {
         return Err(bad_request_response(
             "Unsupported provider import document version",
         ));
@@ -2582,6 +2746,25 @@ fn validate_provider_import_document_v3(
         .iter()
         .enumerate()
         .map(|(index, provider)| validate_provider_import_item_v3(index + 1, provider))
+        .collect()
+}
+
+fn validate_provider_import_document_v4(
+    document: &ProviderExportDocument,
+) -> Result<Vec<ValidatedProviderImportItem>, Response> {
+    if document.version != PROVIDER_IMPORT_EXPORT_VERSION {
+        return Err(bad_request_response(
+            "Unsupported provider import document version",
+        ));
+    }
+
+    validate_provider_import_count(document.providers.len())?;
+
+    document
+        .providers
+        .iter()
+        .enumerate()
+        .map(|(index, provider)| validate_provider_import_item_v4(index + 1, provider))
         .collect()
 }
 
@@ -2601,6 +2784,8 @@ fn validate_provider_import_item_v1(
     let models = vec![ProviderExportModel {
         model_id: provider.model_id.clone(),
         display_name: provider.display_name.clone(),
+        input_modalities: default_input_modalities(),
+        output_modalities: default_output_modalities(),
     }];
     validate_provider_import_item(
         position,
@@ -2619,6 +2804,7 @@ fn validate_provider_import_item_v2(
     position: usize,
     provider: &ProviderExportItemV2,
 ) -> Result<ValidatedProviderImportItem, Response> {
+    let models = legacy_provider_export_models(&provider.models);
     validate_provider_import_item(
         position,
         &provider.provider_type,
@@ -2626,13 +2812,31 @@ fn validate_provider_import_item_v2(
         &provider.name,
         &provider.base_url,
         provider.has_secret,
-        &provider.models,
+        &models,
         &[],
         None,
     )
 }
 
 fn validate_provider_import_item_v3(
+    position: usize,
+    provider: &ProviderExportItemV3,
+) -> Result<ValidatedProviderImportItem, Response> {
+    let models = legacy_provider_export_models(&provider.models);
+    validate_provider_import_item(
+        position,
+        &provider.provider_type,
+        provider.enabled,
+        &provider.name,
+        &provider.base_url,
+        provider.has_secret,
+        &models,
+        &provider.custom_headers,
+        provider.custom_body.as_ref(),
+    )
+}
+
+fn validate_provider_import_item_v4(
     position: usize,
     provider: &ProviderExportItem,
 ) -> Result<ValidatedProviderImportItem, Response> {
@@ -2647,6 +2851,18 @@ fn validate_provider_import_item_v3(
         &provider.custom_headers,
         provider.custom_body.as_ref(),
     )
+}
+
+fn legacy_provider_export_models(models: &[ProviderExportModelLegacy]) -> Vec<ProviderExportModel> {
+    models
+        .iter()
+        .map(|model| ProviderExportModel {
+            model_id: model.model_id.clone(),
+            display_name: model.display_name.clone(),
+            input_modalities: default_input_modalities(),
+            output_modalities: default_output_modalities(),
+        })
+        .collect()
 }
 
 fn validate_provider_import_item(
@@ -2772,6 +2988,18 @@ fn validate_provider_import_models(
         validated.push(ValidatedProviderImportModel {
             model_id: model_id.to_string(),
             display_name: display_name.to_string(),
+            input_modalities: normalize_input_modalities(Some(&model.input_modalities))
+                .map_err(|_| {
+                    bad_request_response(&format!(
+                        "Provider {provider_position} model {model_position} input capabilities are invalid"
+                    ))
+                })?,
+            output_modalities: normalize_output_modalities(Some(&model.output_modalities))
+                .map_err(|_| {
+                    bad_request_response(&format!(
+                        "Provider {provider_position} model {model_position} output capabilities are invalid"
+                    ))
+                })?,
         });
     }
 
@@ -2793,6 +3021,8 @@ fn provider_import_preview_item(
             .map(|model| ProviderExportModel {
                 model_id: model.model_id.clone(),
                 display_name: model.display_name.clone(),
+                input_modalities: model.input_modalities.clone(),
+                output_modalities: model.output_modalities.clone(),
             })
             .collect(),
         advanced_config: provider_import_advanced_summary(provider),
@@ -3606,7 +3836,7 @@ fn build_models_from_multi_request(
             )));
         }
 
-        let record_id = request
+        let requested_record_id = request
             .id
             .as_deref()
             .map(str::trim)
@@ -3620,16 +3850,22 @@ fn build_models_from_multi_request(
                     )))
                 }
             })
-            .transpose()?
-            .or_else(|| {
-                existing.and_then(|provider| {
+            .transpose()?;
+
+        let existing_model = existing.and_then(|provider| {
+            requested_record_id
+                .as_ref()
+                .and_then(|record_id| provider.models.iter().find(|model| model.id == *record_id))
+                .or_else(|| {
                     provider
                         .models
                         .iter()
                         .find(|model| model.model_id == model_id)
-                        .map(|model| model.id.clone())
                 })
-            })
+        });
+
+        let record_id = requested_record_id
+            .or_else(|| existing_model.map(|model| model.id.clone()))
             .unwrap_or_else(|| state.next_id("desktop-model"));
 
         if !seen_record_ids.insert(record_id.clone()) {
@@ -3638,10 +3874,31 @@ fn build_models_from_multi_request(
             )));
         }
 
+        let input_modalities = if let Some(modalities) = request.input_modalities.as_ref() {
+            normalize_input_modalities(Some(modalities)).map_err(|message| {
+                bad_request_response(&format!("Provider model {position}: {message}"))
+            })?
+        } else {
+            existing_model
+                .map(|model| model.input_modalities.clone())
+                .unwrap_or_else(default_input_modalities)
+        };
+        let output_modalities = if let Some(modalities) = request.output_modalities.as_ref() {
+            normalize_output_modalities(Some(modalities)).map_err(|message| {
+                bad_request_response(&format!("Provider model {position}: {message}"))
+            })?
+        } else {
+            existing_model
+                .map(|model| model.output_modalities.clone())
+                .unwrap_or_else(default_output_modalities)
+        };
+
         models.push(DesktopProviderModelConfig {
             id: record_id,
             model_id: model_id.to_string(),
             display_name: display_name.to_string(),
+            input_modalities,
+            output_modalities,
         });
     }
 
@@ -3694,11 +3951,14 @@ fn build_models_from_singular_request(
         model.id = model_record_id;
         model.model_id = model_id;
         model.display_name = display_name;
+        model.normalize_modalities();
     } else {
         models.push(DesktopProviderModelConfig {
             id: model_record_id,
             model_id,
             display_name,
+            input_modalities: default_input_modalities(),
+            output_modalities: default_output_modalities(),
         });
     }
 
@@ -4039,7 +4299,7 @@ fn default_persisted_state() -> PersistedMockState {
     }
 }
 
-fn migrate_v1_to_v5(mut persisted: PersistedMockState) -> PersistedMockState {
+fn migrate_v1_to_v6(mut persisted: PersistedMockState) -> PersistedMockState {
     persisted.schema_version = STATE_SCHEMA_VERSION;
     persisted.saved_at = now_millis();
     persisted.providers = Vec::new();
@@ -4047,7 +4307,7 @@ fn migrate_v1_to_v5(mut persisted: PersistedMockState) -> PersistedMockState {
     persisted
 }
 
-fn migrate_v2_to_v5(mut persisted: PersistedMockState) -> PersistedMockState {
+fn migrate_v2_to_v6(mut persisted: PersistedMockState) -> PersistedMockState {
     persisted.schema_version = STATE_SCHEMA_VERSION;
     persisted.saved_at = now_millis();
     normalize_desktop_providers(&mut persisted.providers);
@@ -4055,7 +4315,7 @@ fn migrate_v2_to_v5(mut persisted: PersistedMockState) -> PersistedMockState {
     persisted
 }
 
-fn migrate_v3_to_v5(mut persisted: PersistedMockState) -> PersistedMockState {
+fn migrate_v3_to_v6(mut persisted: PersistedMockState) -> PersistedMockState {
     persisted.schema_version = STATE_SCHEMA_VERSION;
     persisted.saved_at = now_millis();
     normalize_desktop_providers(&mut persisted.providers);
@@ -4063,11 +4323,18 @@ fn migrate_v3_to_v5(mut persisted: PersistedMockState) -> PersistedMockState {
     persisted
 }
 
-fn migrate_v4_to_v5(mut persisted: PersistedMockState) -> PersistedMockState {
+fn migrate_v4_to_v6(mut persisted: PersistedMockState) -> PersistedMockState {
     persisted.schema_version = STATE_SCHEMA_VERSION;
     persisted.saved_at = now_millis();
     normalize_desktop_providers(&mut persisted.providers);
     persisted.files = Vec::new();
+    persisted
+}
+
+fn migrate_v5_to_v6(mut persisted: PersistedMockState) -> PersistedMockState {
+    persisted.schema_version = STATE_SCHEMA_VERSION;
+    persisted.saved_at = now_millis();
+    normalize_desktop_providers(&mut persisted.providers);
     persisted
 }
 
@@ -4599,6 +4866,12 @@ fn first_text_part(parts: &[Value]) -> Option<String> {
         .map(str::trim)
         .filter(|text| !text.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn has_non_text_parts(parts: &[Value]) -> bool {
+    parts
+        .iter()
+        .any(|part| part.get("type").and_then(Value::as_str) != Some("text"))
 }
 
 fn text_from_parts(parts: &[Value]) -> Option<String> {

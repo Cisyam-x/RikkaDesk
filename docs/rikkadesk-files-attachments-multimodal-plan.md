@@ -81,6 +81,17 @@ Phase 10 P4 hardened attachment message rendering:
 - Missing or deleted files render a safe unavailable state instead of breaking the message UI.
 - Multimodal provider calls remain deferred, and attachments are still not sent to OpenAI-compatible providers.
 
+Phase 10 P5a adds model capability metadata and attachment send gating:
+
+- The local mock state is now `schemaVersion: 6`.
+- Desktop provider models store `inputModalities` and `outputModalities`.
+- Existing and imported older provider models default to `inputModalities: ["TEXT"]` and `outputModalities: ["TEXT"]`.
+- Provider Settings can mark a model with optional `IMAGE` input metadata; `TEXT` input and `TEXT` output remain required.
+- Provider import/export is now version 4 and includes model modalities while still excluding API keys, `secretRef`, local file metadata, file blobs, base64 payloads, and app data paths.
+- `ChatInput` blocks image attachments when the selected model is text-only and explains that attachments remain local-only in this beta.
+- The backend guards `/messages` and `/regenerate` so any non-text message parts are saved locally and answered with a local-only attachment notice instead of calling a real provider.
+- OpenAI-compatible request bodies remain text-only; image input provider calls are still deferred to P6.
+
 ## Phase 10 Goals And Non-Goals
 
 Long-term Phase 10 goals:

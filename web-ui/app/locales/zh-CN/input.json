@@ -106,6 +106,8 @@
     "export_conversation": "导出会话为 Markdown",
     "export_conversation_with_reasoning": "导出会话为 Markdown（含推理过程）",
     "unsupported_file_skipped": "{{count}} 个文件因格式不支持已被跳过",
+    "image_attachment_text_only_model": "当前模型为纯文本模型。请移除图片附件，或在 Provider Settings 中为该模型启用图片输入能力。",
+    "attachments_local_only_beta": "当前 beta 中附件仅保存在本地会话，暂不会发送给模型服务。",
     "placeholder_ready": "输入消息...",
     "placeholder_not_ready": "请先选择会话",
     "send_hint_enter": "按 Enter 发送，Shift + Enter 换行",

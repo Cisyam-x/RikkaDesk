@@ -36,7 +36,12 @@ import { Textarea } from "~/components/ui/textarea";
 import { resolveFileUrl } from "~/lib/files";
 import { cn } from "~/lib/utils";
 import api from "~/services/api";
-import type { ConversationDto, UIMessagePart, UploadFilesResponseDto } from "~/types";
+import type {
+  ConversationDto,
+  ProviderModel,
+  UIMessagePart,
+  UploadFilesResponseDto,
+} from "~/types";
 
 export interface ChatInputProps {
   value: string;
@@ -254,6 +259,14 @@ function getPartSizeBytes(part: UIMessagePart): number | null {
     : null;
 }
 
+function hasImageAttachment(parts: UIMessagePart[]): boolean {
+  return parts.some((part) => part.type === "image");
+}
+
+function modelSupportsImageInput(model: ProviderModel | null): boolean {
+  return model?.inputModalities?.includes("IMAGE") ?? false;
+}
+
 function hasFilesInDataTransfer(dataTransfer: DataTransfer | null): boolean {
   if (!dataTransfer) return false;
   if (dataTransfer.files.length > 0) return true;
@@ -292,6 +305,18 @@ function ChatInputInner({
     (state) => state.settings?.displaySetting.pasteLongTextThreshold ?? 1000,
   );
   const { currentAssistant, settings } = useCurrentAssistant();
+
+  const selectedModel = React.useMemo<ProviderModel | null>(() => {
+    const selectedModelId = currentAssistant?.chatModelId ?? settings?.chatModelId;
+    if (!selectedModelId) return null;
+
+    for (const provider of settings?.providers ?? []) {
+      const match = provider.models.find((model) => model.id === selectedModelId);
+      if (match) return match;
+    }
+
+    return null;
+  }, [currentAssistant?.chatModelId, settings?.chatModelId, settings?.providers]);
 
   const quickMessages = React.useMemo(() => {
     const ids = currentAssistant?.quickMessageIds;
@@ -408,6 +433,17 @@ function ChatInputInner({
       }
 
       if (canSend) {
+        if (hasImageAttachment(attachments) && !modelSupportsImageInput(selectedModel)) {
+          const message = t("chat.image_attachment_text_only_model");
+          setError(message);
+          toast.error(message);
+          return;
+        }
+
+        if (attachments.length > 0) {
+          toast.info(t("chat.attachments_local_only_beta"));
+        }
+
         await onSend();
       }
     } catch (submitError) {
@@ -419,7 +455,7 @@ function ChatInputInner({
     } finally {
       setSubmitting(false);
     }
-  }, [actionDisabled, canSend, canStop, onSend, onStop, t]);
+  }, [actionDisabled, attachments, canSend, canStop, onSend, onStop, selectedModel, t]);
 
   const handleTextChange = React.useCallback(
     (event: React.ChangeEvent<HTMLTextAreaElement>) => {
