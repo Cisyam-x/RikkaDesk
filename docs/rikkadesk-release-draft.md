@@ -1,22 +1,28 @@
-# RikkaDesk beta.12 Candidate Release Draft
+# RikkaDesk beta.13 Hotfix Candidate Release Draft
 
 This document is a private beta candidate draft for RikkaDesk. Do not publish a public GitHub Release from this phase.
 
 ## Release Title Suggestion
 
 ```text
-RikkaDesk 0.1.0 Beta 12 - Private Windows Desktop Candidate
+RikkaDesk 0.1.0 Beta 13 - Private Windows Desktop Hotfix Candidate
 ```
 
 ## Tag Suggestion
 
-Current feature-stable private beta tag:
+Current pushed private beta tag:
 
 ```text
-rikkadesk-v0.1.0-beta.11
+rikkadesk-v0.1.0-beta.12
 ```
 
-The beta.12 tag is not created in this phase. The `rikkadesk-v0.1.0-beta.11` tag remains the current stable private tag while this draft records beta.12 candidate scope. Do not publish a public GitHub Release from this draft.
+Candidate hotfix tag, pending explicit confirmation:
+
+```text
+rikkadesk-v0.1.0-beta.13
+```
+
+The `rikkadesk-v0.1.0-beta.12` tag already exists and must not be moved, deleted, or overwritten. If accepted, beta.13 should be created as a new hotfix tag pointing at the reviewed hotfix commit. Do not publish a public GitHub Release from this draft.
 
 ## Version Strategy
 
@@ -28,7 +34,7 @@ Current version files:
 Recommendation:
 
 - Keep the internal package version as `0.1.0` for this private beta line.
-- Use `RikkaDesk 0.1.0 Beta 12 candidate` in draft notes and private tester instructions.
+- Use `RikkaDesk 0.1.0 Beta 13 hotfix candidate` in draft notes and private tester instructions.
 - Keep beta labels in Git tags and release notes unless the Windows bundler version strategy is explicitly changed later.
 - Do not publish a public prerelease until installer signing, support scope, and license obligations are reviewed.
 
@@ -43,6 +49,18 @@ Reasoning:
 RikkaDesk is an unofficial desktop derivative / experiment based on RikkaHub. This private beta candidate packages the existing `web-ui` into a Windows desktop app and adds a local desktop API layer for basic OpenAI-compatible text chat testing plus local attachment validation.
 
 This beta includes:
+
+Beta.13 hotfix delta over beta.12:
+
+- Fix local image attachment draft preview and sent-message rendering in Tauri production builds.
+- Resolve `/api/files/path/{id}` to the actual local mock API URL for managed image rendering.
+- Keep the hidden file picker input stably mounted so upload actions do not silently lose the input element.
+- Catch upload detection/upload failures and always reset the file input value so the same file can be selected again.
+- Keep real-provider image input disabled.
+- Keep the loopback-only capture path as the only implemented image-send prototype.
+- Keep local state at `schemaVersion: 6`.
+- Keep provider import/export at version 4.
+- Keep the app package version at `0.1.0`.
 
 - Tauri v2 Windows desktop shell.
 - Local Rust API bound to `127.0.0.1`.
@@ -128,6 +146,7 @@ Recommended artifact for manual beta testing:
 8. Use synthetic app data for Phase 10 attachment and loopback capture tests.
 9. Do not use real user files for attachment tests.
 10. Do not run a real-provider image input test from this draft.
+11. For beta.13 hotfix validation, include image attachment draft preview, sent-message rendering, repeated same-file selection, TEXT-only gating, and IMAGE-capable non-loopback safe-block checks.
 
 The installer is currently unsigned. Windows SmartScreen or unsigned publisher warnings are expected until signing is added.
 
@@ -166,6 +185,7 @@ Expected result:
 - Local attachments and safe attachment rendering are implemented for the desktop beta candidate.
 - Real-provider image input is not enabled by default.
 - The image capture prototype is loopback-only and intended for synthetic local testing.
+- Beta.13 does not broaden image sending beyond the loopback-only synthetic capture prototype.
 - No OCR, PDF/Office parsing, audio/video input, tools, MCP, search, Workspace, forks, or full multimodal provider calls.
 - One provider can contain multiple text models and model capability metadata, but per-model secrets, per-model Base URLs, provider-specific protocols, tools, and full multimodal abilities are not implemented.
 - Provider import/export supports non-sensitive provider metadata only; imported providers require API keys to be entered again.
@@ -247,7 +267,7 @@ Recommended private beta flow:
 1. Develop in phase branches.
 2. Merge accepted phase PRs into `beta/0.1.0`.
 3. Create private beta tags only for feature-stable checkpoints.
-4. Keep `rikkadesk-v0.1.0-beta.11` as the current feature-stable beta tag until beta.12 candidate verification is accepted and a separate tag step is requested.
+4. Keep `rikkadesk-v0.1.0-beta.12` unchanged. Create `rikkadesk-v0.1.0-beta.13` only after the beta.13 hotfix candidate is accepted and a separate tag step is requested.
 5. Do not publish a public GitHub Release until signing, support scope, and license obligations are reviewed.
 
 Do not force-push `main`, `master`, or `beta/0.1.0`.

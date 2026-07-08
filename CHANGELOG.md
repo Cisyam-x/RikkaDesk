@@ -6,11 +6,30 @@ This changelog tracks the RikkaDesk desktop work in this fork. It does not repla
 
 ## 0.1.0 Private Beta Line
 
-The current feature-stable private beta tag remains `rikkadesk-v0.1.0-beta.11`. The `beta/0.1.0` branch may contain later documentation or feature work after that tag.
+The current pushed private beta tag is `rikkadesk-v0.1.0-beta.12`. The `beta/0.1.0` branch may contain later documentation, feature work, or hotfix candidates after that tag.
 
 This beta line is not a public GitHub Release.
 
-### Unreleased / beta.12 candidate
+### Unreleased / beta.13 hotfix candidate
+
+Fixed:
+
+- Fix local image attachment draft preview and sent-message rendering in Tauri production builds.
+- Resolve managed file URLs from `/api/files/path/{id}` to the actual local mock API URL before image rendering.
+- Keep the hidden file picker input stably mounted so repeated upload attempts do not silently lose the file input.
+- Catch upload detection/upload errors and always reset the file input value, allowing the same file to be selected again after delete or failure.
+
+Unchanged:
+
+- Real-provider image input remains disabled.
+- The loopback-only capture path remains the only implemented image-send prototype.
+- Local state remains `schemaVersion: 6`.
+- Provider import/export remains version 4.
+- The app/package version remains `0.1.0`.
+- `rikkadesk-v0.1.0-beta.12` must not be moved; beta.13 should be a new hotfix tag if accepted.
+- This is not a public GitHub Release.
+
+### `rikkadesk-v0.1.0-beta.12` - Files, Attachments, And Loopback Image Capture Candidate
 
 Added:
 

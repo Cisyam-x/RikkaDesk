@@ -4,7 +4,9 @@ RikkaDesk is an unofficial desktop derivative / experiment based on RikkaHub. Th
 
 Do not paste real API keys into documentation, commit messages, terminal transcripts, screenshots, or issue comments.
 
-Current feature-stable private beta tag: `rikkadesk-v0.1.0-beta.11`.
+Current pushed private beta tag: `rikkadesk-v0.1.0-beta.12`.
+
+Current hotfix candidate tag, pending explicit confirmation: `rikkadesk-v0.1.0-beta.13`.
 
 ## Current Beta Scope
 
@@ -26,6 +28,7 @@ Included:
 - Safe image/document message rendering for managed file URLs.
 - Provider model capability metadata with TEXT and IMAGE input markers.
 - Loopback-only synthetic image capture prototype for one current-turn PNG/JPEG/WEBP image.
+- beta.13 hotfix candidate fixes for Tauri production local image attachment preview/rendering and file picker stability.
 
 Not included:
 
@@ -36,6 +39,26 @@ Not included:
 - OCR, PDF/Office parsing, audio/video input, tools, MCP, search, Workspace, forks, or release auto-updates.
 - SQLite, sync, multi-device backup, or production-grade migration tooling.
 - Any change to the upstream Android `app` module.
+
+## beta.13 Hotfix Candidate Scope
+
+The beta.13 hotfix candidate is a narrow follow-up to beta.12. The `rikkadesk-v0.1.0-beta.12` tag already exists and must not be moved, deleted, or overwritten.
+
+Fixed over beta.12:
+
+- Local image attachment draft preview and sent-message rendering in Tauri production builds.
+- Managed file URLs from `/api/files/path/{id}` resolve to the actual local mock API URL before image rendering.
+- The hidden file picker input remains stably mounted.
+- Upload detection/upload errors are caught and the file input value is always reset, so the same file can be selected again after delete or failure.
+
+Unchanged:
+
+- Real-provider image input remains disabled.
+- The loopback-only capture path remains the only implemented image-send prototype.
+- Local state remains `schemaVersion: 6`.
+- Provider import/export remains version 4.
+- The app/package version remains `0.1.0`.
+- This is not a public GitHub Release.
 
 ## Version Recommendation
 
@@ -387,6 +410,25 @@ Phase 10 P6.5 P0 manual gate checks:
 - Confirm the state/log check protocol excludes `mock-api/secrets/**`.
 - Confirm beta.12 notes do not claim real-provider image input is generally enabled.
 
+beta.13 hotfix live UI smoke checks:
+
+- Use clean synthetic app data; restore real app data after the smoke.
+- Confirm no real API key is used and no `mock-api/secrets/*.bin` file is read.
+- Confirm plain text mock chat still works.
+- Upload a synthetic PNG and confirm the draft chip image renders instead of showing a broken image.
+- Delete the draft PNG and select the same PNG again; confirm upload fires again and the draft chip renders.
+- Send the synthetic PNG with an IMAGE-capable non-loopback provider and confirm the confirmation dialog appears.
+- Continue the confirmation and confirm the backend returns the loopback-only safe block instead of sending to a real provider.
+- Confirm the sent user message renders the local image and does not show "Image unavailable" or "图片附件不可用".
+- Restart RikkaDesk, reopen the conversation, and confirm the local image still renders.
+- Upload/send synthetic JPEG and WEBP images and confirm they render locally with the loopback-only safe block.
+- Upload/send a synthetic GIF and confirm it remains local-only and does not trigger capture confirmation.
+- Upload/send synthetic TXT and PDF files and confirm they render as document chips only.
+- Select a TEXT-only model, attach a synthetic PNG, and confirm the frontend blocks send before `/messages`.
+- Try unsupported SVG and HTML files and confirm the UI shows a friendly unsupported-format error instead of silently doing nothing.
+- Confirm `state.v1.json` does not contain `base64`, `image_url`, `input_image`, provider request bodies, local absolute paths, or key/header values.
+- Confirm no beta.13 tag is created during preflight.
+
 ## Test Real OpenAI-Compatible Streaming Chat
 
 1. Configure Provider Settings with a real OpenAI-compatible endpoint and a local user-entered API key.
@@ -536,6 +578,7 @@ Before sharing a local beta installer:
 - Run `pnpm run desktop:build` from a clean working tree.
 - Keep hashes and artifact paths in the private beta notes.
 - Tell testers not to share logs containing prompts or local data.
+- For beta.13, verify `rikkadesk-v0.1.0-beta.12` still points to its original commit and create `rikkadesk-v0.1.0-beta.13` only after explicit confirmation.
 
 ## Known Limits
 
