@@ -365,6 +365,20 @@ Phase 10 P6.4 synthetic capture-server checks:
 - Confirm non-loopback provider Base URLs are rejected or local-only even after confirmation.
 - Confirm no real provider endpoint or real API key is used.
 
+Phase 10 P6.5 P0 manual gate checks:
+
+- Confirm `docs/rikkadesk-real-provider-image-manual-gate.md` exists.
+- Confirm real-provider image send is still not enabled in code.
+- Confirm loopback-only capture remains the only implemented image-send behavior.
+- Confirm no real-provider test was run.
+- Confirm no real API key appears in docs, logs, commits, or terminal output.
+- Confirm the manual gate requires a synthetic 1x1 PNG only.
+- Confirm the manual gate forbids real user images, documents, GIF, audio, video, regenerate, and historical image resend.
+- Confirm the manual gate does not allow a "do not ask again" option.
+- Confirm the future code gate requires explicit confirmation, IMAGE capability, exactly one PNG/JPEG/WEBP image, a 5 MB limit, and a manual enable gate.
+- Confirm the state/log check protocol excludes `mock-api/secrets/**`.
+- Confirm beta.12 notes do not claim real-provider image input is generally enabled.
+
 ## Test Real OpenAI-Compatible Streaming Chat
 
 1. Configure Provider Settings with a real OpenAI-compatible endpoint and a local user-entered API key.

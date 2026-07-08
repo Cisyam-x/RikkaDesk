@@ -98,6 +98,18 @@ Phase 10 P6.4 adds a loopback-only synthetic capture-server prototype:
 - P6.4 remains synthetic-only and does not include real-provider manual testing.
 - P6.5 optional real-provider manual gate remains future work.
 
+## P6.5 P0 Implementation Status
+
+Phase 10 P6.5 P0 adds the real-provider manual gate design only:
+
+- The manual gate is documented in `docs/rikkadesk-real-provider-image-manual-gate.md`.
+- No code changed.
+- No real-provider image send is enabled.
+- No real-provider test was run.
+- No real API key is required or used by Codex or automation.
+- Loopback-only capture remains the only implemented image-send path.
+- Future P6.5 P1 code must receive separate review before implementation.
+
 ## API Shape Options
 
 ### Option A: Chat Completions Content Array
@@ -614,14 +626,18 @@ Non-goals:
 
 Goal:
 
-- Only after capture-server tests pass, optionally test with a manually entered key and one synthetic PNG.
+- Define a manual gate for optional future real-provider testing with a manually entered key and one synthetic PNG.
 
 Rules:
 
+- Current code remains loopback-only.
+- Real-provider image send is not enabled by this phase.
 - Do not record the key.
 - Do not screenshot the key.
 - Do not print request body.
 - Do not print base64.
+- Do not allow "do not ask again".
+- Do not use real user images.
 - This step can be deferred to beta.13 or later.
 
 ### P6.6: Docs And Release Copy

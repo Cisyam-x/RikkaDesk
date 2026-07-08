@@ -130,6 +130,15 @@ Phase 10 P6.4 adds a loopback-only synthetic capture-server prototype:
 - Final synthetic smoke confirms no request-body, data URL, base64, local path, storage key, or API key leakage into state or logs.
 - Real-provider image input remains deferred to P6.5 or later.
 
+Phase 10 P6.5 P0 adds the real-provider image manual gate design:
+
+- The manual gate is documented in `docs/rikkadesk-real-provider-image-manual-gate.md`.
+- P6.5 P0 does not change code, schema, provider import/export, file APIs, or provider request builders.
+- No real-provider image test is run.
+- No real API key is used, read, printed, or documented.
+- Loopback-only capture remains the only implemented image-send path.
+- Future real-provider image sending requires a separate P6.5 P1 code review and an explicit manual gate.
+
 ## Phase 10 Goals And Non-Goals
 
 Long-term Phase 10 goals:
@@ -753,6 +762,7 @@ Current P6.1 design decision:
 - Send only the current turn image, never historical images.
 - Defer image regenerate support.
 - Use synthetic capture-server validation before optional manual real-provider testing.
+- Keep real-provider image testing behind a separate manual gate design and code review.
 
 ### P7: Docs / Release Copy / Beta Candidate
 
