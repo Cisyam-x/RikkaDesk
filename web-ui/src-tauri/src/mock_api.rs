@@ -927,6 +927,39 @@ struct OpenAiChatMessage {
     content: String,
 }
 
+#[allow(dead_code)]
+#[derive(Clone)]
+enum OpenAiCompatibleMessageContent {
+    Text(String),
+    Parts(Vec<OpenAiCompatibleContentPart>),
+}
+
+#[allow(dead_code)]
+#[derive(Clone)]
+enum OpenAiCompatibleContentPart {
+    Text(String),
+    ImageUrl {
+        data_url: String,
+        detail: OpenAiImageDetail,
+        file_id: u64,
+    },
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+enum OpenAiImageDetail {
+    Auto,
+    Low,
+    High,
+}
+
+#[allow(dead_code)]
+#[derive(Clone)]
+struct OpenAiCompatibleChatMessage {
+    role: String,
+    content: OpenAiCompatibleMessageContent,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OpenAiRequestKind {
     TestConnection,
@@ -3354,6 +3387,114 @@ fn build_openai_chat_request_body(
     Ok(Value::Object(body))
 }
 
+#[allow(dead_code)]
+fn build_openai_vision_chat_request_body(
+    config: &OpenAiChatConfig,
+    messages: Vec<OpenAiCompatibleChatMessage>,
+    stream: bool,
+    kind: OpenAiRequestKind,
+) -> Result<Value, String> {
+    let mut body = if let Some(custom_body) = config.custom_body.as_ref() {
+        let validated = validate_custom_body_value(custom_body)?;
+        validated
+            .as_object()
+            .cloned()
+            .ok_or_else(|| "Custom body must be a JSON object".to_string())?
+    } else {
+        Map::new()
+    };
+
+    let messages = messages
+        .iter()
+        .map(openai_compatible_message_to_value)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    body.insert("model".to_string(), json!(config.model_id.clone()));
+    body.insert("messages".to_string(), Value::Array(messages));
+    body.insert("stream".to_string(), json!(stream));
+
+    if kind == OpenAiRequestKind::TestConnection {
+        body.insert("max_tokens".to_string(), json!(1));
+    }
+
+    Ok(Value::Object(body))
+}
+
+#[allow(dead_code)]
+fn openai_compatible_message_to_value(
+    message: &OpenAiCompatibleChatMessage,
+) -> Result<Value, String> {
+    let content = match &message.content {
+        OpenAiCompatibleMessageContent::Text(text) => Value::String(text.clone()),
+        OpenAiCompatibleMessageContent::Parts(parts) => {
+            let parts = parts
+                .iter()
+                .map(openai_compatible_content_part_to_value)
+                .collect::<Result<Vec<_>, _>>()?;
+            Value::Array(parts)
+        }
+    };
+
+    Ok(json!({
+        "role": message.role.clone(),
+        "content": content,
+    }))
+}
+
+#[allow(dead_code)]
+fn openai_compatible_content_part_to_value(
+    part: &OpenAiCompatibleContentPart,
+) -> Result<Value, String> {
+    match part {
+        OpenAiCompatibleContentPart::Text(text) => Ok(json!({
+            "type": "text",
+            "text": text,
+        })),
+        OpenAiCompatibleContentPart::ImageUrl {
+            data_url,
+            detail,
+            file_id: _,
+        } => {
+            if !is_supported_image_data_url(data_url) {
+                return Err("Image data URL is not supported".to_string());
+            }
+
+            Ok(json!({
+                "type": "image_url",
+                "image_url": {
+                    "url": data_url,
+                    "detail": openai_image_detail_value(*detail),
+                }
+            }))
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn openai_image_detail_value(detail: OpenAiImageDetail) -> &'static str {
+    match detail {
+        OpenAiImageDetail::Auto => "auto",
+        OpenAiImageDetail::Low => "low",
+        OpenAiImageDetail::High => "high",
+    }
+}
+
+#[allow(dead_code)]
+fn is_supported_image_data_url(value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+
+    [
+        "data:image/png;base64,",
+        "data:image/jpeg;base64,",
+        "data:image/webp;base64,",
+    ]
+    .iter()
+    .any(|prefix| value.starts_with(prefix))
+}
+
 fn apply_openai_custom_headers(
     builder: reqwest::RequestBuilder,
     headers: &[DesktopProviderCustomHeaderConfig],
@@ -5020,4 +5161,122 @@ fn now_millis() -> u64 {
 
 fn now_iso() -> String {
     Utc::now().to_rfc3339()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn openai_vision_test_config(custom_body: Option<Value>) -> OpenAiChatConfig {
+        OpenAiChatConfig {
+            base_url: "http://127.0.0.1:9999/v1".to_string(),
+            model_id: "vision-test-model".to_string(),
+            api_key: "test-key".to_string(),
+            custom_headers: Vec::new(),
+            custom_body,
+        }
+    }
+
+    fn openai_vision_test_message(data_url: &str) -> OpenAiCompatibleChatMessage {
+        OpenAiCompatibleChatMessage {
+            role: "user".to_string(),
+            content: OpenAiCompatibleMessageContent::Parts(vec![
+                OpenAiCompatibleContentPart::Text("Describe this image".to_string()),
+                OpenAiCompatibleContentPart::ImageUrl {
+                    data_url: data_url.to_string(),
+                    detail: OpenAiImageDetail::Auto,
+                    file_id: 123,
+                },
+            ]),
+        }
+    }
+
+    #[test]
+    fn openai_vision_builder_serializes_content_array() {
+        let config = openai_vision_test_config(None);
+        let body = build_openai_vision_chat_request_body(
+            &config,
+            vec![openai_vision_test_message("data:image/png;base64,AAAA")],
+            true,
+            OpenAiRequestKind::StreamingChat,
+        )
+        .expect("vision request body should build");
+
+        assert_eq!(body["model"], json!("vision-test-model"));
+        assert_eq!(body["stream"], json!(true));
+
+        let content = body["messages"][0]["content"]
+            .as_array()
+            .expect("vision message content should be an array");
+        assert_eq!(content[0]["type"], json!("text"));
+        assert_eq!(content[0]["text"], json!("Describe this image"));
+        assert_eq!(content[1]["type"], json!("image_url"));
+        assert_eq!(
+            content[1]["image_url"]["url"]
+                .as_str()
+                .expect("image URL should be a string")
+                .starts_with("data:image/png;base64,"),
+            true
+        );
+        assert_eq!(content[1]["image_url"]["detail"], json!("auto"));
+    }
+
+    #[test]
+    fn openai_vision_builder_does_not_serialize_internal_file_id() {
+        let config = openai_vision_test_config(None);
+        let body = build_openai_vision_chat_request_body(
+            &config,
+            vec![openai_vision_test_message("data:image/jpeg;base64,AAAA")],
+            true,
+            OpenAiRequestKind::StreamingChat,
+        )
+        .expect("vision request body should build");
+
+        let serialized = serde_json::to_string(&body).expect("body should serialize");
+        assert!(!serialized.contains("file_id"));
+        assert!(!serialized.contains("storageKey"));
+        assert!(!serialized.contains("/api/files/path"));
+        assert!(!serialized.contains("file://"));
+        assert!(!serialized.contains("123"));
+    }
+
+    #[test]
+    fn openai_vision_builder_rejects_unsupported_data_url() {
+        let config = openai_vision_test_config(None);
+        for value in [
+            "data:image/svg+xml;base64,AAAA",
+            "data:image/gif;base64,AAAA",
+            "data:text/html;base64,AAAA",
+            "file:///C:/test.png",
+            "/api/files/path/1",
+            "https://example.com/image.png",
+            "",
+        ] {
+            let result = build_openai_vision_chat_request_body(
+                &config,
+                vec![openai_vision_test_message(value)],
+                true,
+                OpenAiRequestKind::StreamingChat,
+            );
+            assert!(result.is_err(), "{value} should be rejected");
+        }
+    }
+
+    #[test]
+    fn openai_vision_text_builder_still_serializes_string_content() {
+        let config = openai_vision_test_config(None);
+        let body = build_openai_chat_request_body(
+            &config,
+            vec![OpenAiChatMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            true,
+            OpenAiRequestKind::StreamingChat,
+        )
+        .expect("text request body should build");
+
+        assert_eq!(body["messages"][0]["content"], json!("hello"));
+        assert!(body["messages"][0]["content"].as_array().is_none());
+    }
 }

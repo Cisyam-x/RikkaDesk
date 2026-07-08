@@ -100,6 +100,13 @@ Phase 10 P6.1 adds a dedicated OpenAI-compatible image input prototype design:
 - The design requires IMAGE capability gating, explicit per-send confirmation, in-memory data URLs, and synthetic capture-server validation before any real-provider test.
 - Attachments still are not sent to providers in the current implementation.
 
+Phase 10 P6.2 adds only the backend internal vision request skeleton:
+
+- OpenAI-compatible vision structs and a Chat Completions content-array body builder now exist internally.
+- The builder is not connected to `/messages`, `/regenerate`, Test Connection, or streaming.
+- Text-only chat and attachment local-only guards remain the active runtime behavior.
+- No image blob is read, no file-derived base64 is generated, and no image request is sent to any provider.
+
 ## Phase 10 Goals And Non-Goals
 
 Long-term Phase 10 goals:

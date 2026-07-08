@@ -48,6 +48,23 @@ Conclusion:
 P6 must introduce a parallel vision request path instead of mutating the existing text-only path in place.
 ```
 
+## P6.2 Implementation Status
+
+Phase 10 P6.2 adds the internal request model skeleton only:
+
+- Added parallel OpenAI-compatible vision request structs.
+- Added a Chat Completions content-array body builder skeleton.
+- Added data URL prefix validation for PNG, JPEG, and WEBP data URLs.
+- Added static/unit coverage for content-array serialization, internal `file_id` exclusion, unsupported data URL rejection, and unchanged text builder string content.
+- Existing text-only provider path remains unchanged.
+- No runtime path calls the vision builder.
+- No image file is read.
+- No managed file blob is read for provider input.
+- No base64 is generated from files.
+- No provider image request is sent.
+- P6.3 confirmation UI remains future work.
+- P6.4 capture-server prototype remains future work.
+
 ## API Shape Options
 
 ### Option A: Chat Completions Content Array

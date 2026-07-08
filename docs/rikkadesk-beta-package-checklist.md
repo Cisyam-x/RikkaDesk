@@ -323,6 +323,17 @@ Phase 10 P6.1 design checks:
 - Confirm the design requires a local synthetic capture server before optional manual real-provider testing.
 - Confirm current implementation still does not send attachments to providers.
 
+Phase 10 P6.2 static checks:
+
+- Confirm text-only builder output still serializes `messages[].content` as a string.
+- Confirm the internal vision builder can serialize Chat Completions content-array messages.
+- Confirm internal `file_id` is not serialized into provider request JSON.
+- Confirm unsupported data URL prefixes are rejected, including GIF, SVG, HTML, local file URLs, managed file URLs, and external HTTP(S) URLs.
+- Confirm no runtime path calls the internal vision builder.
+- Confirm attachment messages still return the local-only attachment notice.
+- Confirm no provider call occurs for non-text message parts.
+- Confirm no image blob is read, no file-derived base64 is generated, and no image request is sent.
+
 ## Test Real OpenAI-Compatible Streaming Chat
 
 1. Configure Provider Settings with a real OpenAI-compatible endpoint and a local user-entered API key.
