@@ -32,6 +32,14 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "~/components/ui/dropdown-menu";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "~/components/ui/dialog";
 import { Textarea } from "~/components/ui/textarea";
 import { resolveFileUrl } from "~/lib/files";
 import { cn } from "~/lib/utils";
@@ -340,6 +348,7 @@ function ChatInputInner({
   const [submitting, setSubmitting] = React.useState(false);
   const [uploading, setUploading] = React.useState(false);
   const [uploadMenuOpen, setUploadMenuOpen] = React.useState(false);
+  const [confirmImageSendOpen, setConfirmImageSendOpen] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const [dragActive, setDragActive] = React.useState(false);
   const dragDepthRef = React.useRef(0);
@@ -418,34 +427,16 @@ function ChatInputInner({
     [onAddParts, ready, t],
   );
 
-  const handlePrimaryAction = React.useCallback(async () => {
-    if (actionDisabled) {
-      return;
-    }
-
+  const submitSend = React.useCallback(async () => {
     setSubmitting(true);
     setError(null);
 
     try {
-      if (canStop) {
-        await onStop?.();
-        return;
+      if (attachments.length > 0) {
+        toast.info(t("chat.attachments_local_only_beta"));
       }
 
-      if (canSend) {
-        if (hasImageAttachment(attachments) && !modelSupportsImageInput(selectedModel)) {
-          const message = t("chat.image_attachment_text_only_model");
-          setError(message);
-          toast.error(message);
-          return;
-        }
-
-        if (attachments.length > 0) {
-          toast.info(t("chat.attachments_local_only_beta"));
-        }
-
-        await onSend();
-      }
+      await onSend();
     } catch (submitError) {
       const message =
         submitError instanceof Error
@@ -455,7 +446,67 @@ function ChatInputInner({
     } finally {
       setSubmitting(false);
     }
-  }, [actionDisabled, attachments, canSend, canStop, onSend, onStop, selectedModel, t]);
+  }, [attachments.length, onSend, t]);
+
+  const handlePrimaryAction = React.useCallback(async () => {
+    if (actionDisabled) {
+      return;
+    }
+
+    if (canStop) {
+      setSubmitting(true);
+      setError(null);
+      try {
+        await onStop?.();
+      } catch (submitError) {
+        const message =
+          submitError instanceof Error
+            ? submitError.message
+            : t("chat.send_failed");
+        setError(message);
+      } finally {
+        setSubmitting(false);
+      }
+      return;
+    }
+
+    if (!canSend) {
+      return;
+    }
+
+    const hasImage = hasImageAttachment(attachments);
+    if (hasImage && !modelSupportsImageInput(selectedModel)) {
+      const message = t("chat.image_attachment_text_only_model");
+      setError(message);
+      toast.error(message);
+      return;
+    }
+
+    if (hasImage && modelSupportsImageInput(selectedModel)) {
+      setConfirmImageSendOpen(true);
+      return;
+    }
+
+    await submitSend();
+  }, [
+    actionDisabled,
+    attachments,
+    canSend,
+    canStop,
+    onStop,
+    selectedModel,
+    submitSend,
+    t,
+  ]);
+
+  const handleConfirmImageSend = React.useCallback(() => {
+    setConfirmImageSendOpen(false);
+    if (!canSend || submitting || uploading || disabled || isGenerating) {
+      return;
+    }
+
+    void submitSend();
+  }, [canSend, disabled, isGenerating, submitSend, submitting, uploading]);
 
   const handleTextChange = React.useCallback(
     (event: React.ChangeEvent<HTMLTextAreaElement>) => {
@@ -614,12 +665,39 @@ function ChatInputInner({
     : t("chat.placeholder_not_ready");
 
   return (
-    <div
-      className={cn(
-        "bg-background/95 backdrop-blur supports-backdrop-filter:bg-background/60",
-        className,
-      )}
-    >
+    <>
+      <Dialog open={confirmImageSendOpen} onOpenChange={setConfirmImageSendOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>{t("chat.confirm_image_attachment_title")}</DialogTitle>
+            <DialogDescription>
+              {t("chat.confirm_image_attachment_description")}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setConfirmImageSendOpen(false)}
+            >
+              {t("chat.confirm_image_attachment_cancel")}
+            </Button>
+            <Button
+              type="button"
+              onClick={handleConfirmImageSend}
+              disabled={!canSend || submitting || uploading || disabled || isGenerating}
+            >
+              {t("chat.confirm_image_attachment_continue")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+      <div
+        className={cn(
+          "bg-background/95 backdrop-blur supports-backdrop-filter:bg-background/60",
+          className,
+        )}
+      >
       <div className="mx-auto w-full max-w-3xl px-4 py-4">
         <div
           className={cn(
@@ -875,7 +953,8 @@ function ChatInputInner({
           <p className="mt-1 text-center text-xs text-destructive">{error}</p>
         ) : null}
       </div>
-    </div>
+      </div>
+    </>
   );
 }
 

@@ -62,7 +62,22 @@ Phase 10 P6.2 adds the internal request model skeleton only:
 - No managed file blob is read for provider input.
 - No base64 is generated from files.
 - No provider image request is sent.
-- P6.3 confirmation UI remains future work.
+- P6.4 capture-server prototype remains future work.
+
+## P6.3 Implementation Status
+
+Phase 10 P6.3 adds a local-only confirmation UI for IMAGE-capable models with image attachments:
+
+- IMAGE-capable model plus image attachment opens a confirmation dialog before `/messages`.
+- The dialog copy explicitly says P6.3 remains local-only and images are not sent to model providers.
+- Cancel closes the dialog, keeps the draft and attachments, and does not call `/messages`.
+- Continue uses the existing local-only attachment flow and still receives the backend attachment notice.
+- TEXT-only model plus image attachment remains blocked before the confirmation dialog.
+- Document-only attachments and text-only messages do not show the image confirmation dialog.
+- No runtime path calls the vision builder.
+- No image file is read for provider input.
+- No file-derived base64 is generated.
+- No provider image request is sent.
 - P6.4 capture-server prototype remains future work.
 
 ## API Shape Options
@@ -538,19 +553,22 @@ Non-goals:
 
 Goal:
 
-- Add explicit image-send confirmation for IMAGE-capable models.
-- Cancel does not call provider.
-- Confirm can initially pass an explicit in-memory intent flag while backend still returns local-only.
+- Add explicit image attachment confirmation for IMAGE-capable models.
+- Cancel keeps the draft and attachments and does not call `/messages`.
+- Confirm continues through the existing local-only attachment flow.
+- Do not pass provider intent, data URLs, base64, or a new request shape in P6.3.
 
 Candidate files:
 
 - `web-ui/app/components/input/chat-input.tsx`
 - locale files
+- docs/checklist status files
 
 Non-goals:
 
 - No persistent "do not ask again".
 - No provider-level privacy setting.
+- No real provider image send.
 
 ### P6.4: Synthetic Capture-Server Prototype
 

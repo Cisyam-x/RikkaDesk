@@ -334,6 +334,19 @@ Phase 10 P6.2 static checks:
 - Confirm no provider call occurs for non-text message parts.
 - Confirm no image blob is read, no file-derived base64 is generated, and no image request is sent.
 
+Phase 10 P6.3 confirmation UI checks:
+
+- Confirm TEXT-only model plus image attachment is blocked before `/messages`.
+- Confirm TEXT-only model plus image attachment does not open the image confirmation dialog.
+- Confirm IMAGE-capable model plus image attachment opens the confirmation dialog.
+- Confirm Cancel keeps the draft text and attachments and does not call `/messages`.
+- Confirm Continue calls `/messages` and the backend still returns the local-only attachment notice.
+- Confirm document-only attachments do not show the image confirmation dialog.
+- Confirm text-only messages do not show the image confirmation dialog.
+- Confirm no runtime path calls the internal vision builder.
+- Confirm no image request is sent to any provider.
+- Confirm no image blob is read, no file-derived base64 is generated, and no base64 appears in state or logs.
+
 ## Test Real OpenAI-Compatible Streaming Chat
 
 1. Configure Provider Settings with a real OpenAI-compatible endpoint and a local user-entered API key.

@@ -107,6 +107,15 @@ Phase 10 P6.2 adds only the backend internal vision request skeleton:
 - Text-only chat and attachment local-only guards remain the active runtime behavior.
 - No image blob is read, no file-derived base64 is generated, and no image request is sent to any provider.
 
+Phase 10 P6.3 adds local-only image attachment confirmation UI:
+
+- IMAGE-capable model plus image attachment opens a confirmation dialog before `/messages`.
+- Cancel keeps the draft and attachments and does not call `/messages`.
+- Continue still uses the current local-only attachment flow and backend notice.
+- TEXT-only image gating remains unchanged.
+- Document-only attachments and text-only messages do not show the image confirmation dialog.
+- Provider image sending, file-derived base64 generation, and capture-server validation remain deferred.
+
 ## Phase 10 Goals And Non-Goals
 
 Long-term Phase 10 goals:
