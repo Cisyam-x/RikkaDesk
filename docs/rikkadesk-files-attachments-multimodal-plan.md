@@ -119,11 +119,15 @@ Phase 10 P6.3 adds local-only image attachment confirmation UI:
 Phase 10 P6.4 adds a loopback-only synthetic capture-server prototype:
 
 - Confirmed IMAGE-capable image messages pass non-persistent capture intent to `/messages`.
+- Frontend provider-bound image candidate gating now matches the backend: only PNG, JPEG, and WEBP can trigger capture confirmation.
+- GIF images remain local-only and no longer trigger capture confirmation.
+- Multiple provider-bound images are blocked before `/messages` with a one-image prototype error.
 - The backend allows capture requests only for local loopback provider Base URLs.
 - Only one current-turn PNG/JPEG/WEBP managed file can be encoded into an in-memory data URL.
 - GIF, TXT, PDF, document-only, multi-image, missing-file, and non-loopback cases remain local-only or safe-error.
 - The provider-bound request body never uses `/api/files/path/{id}`, `file://`, storage keys, or local absolute paths.
 - Base64 is never persisted to state, message parts, file metadata, provider import/export, or logs.
+- Final synthetic smoke confirms no request-body, data URL, base64, local path, storage key, or API key leakage into state or logs.
 - Real-provider image input remains deferred to P6.5 or later.
 
 ## Phase 10 Goals And Non-Goals

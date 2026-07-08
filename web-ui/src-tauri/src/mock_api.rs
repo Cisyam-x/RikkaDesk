@@ -5676,6 +5676,89 @@ mod tests {
     }
 
     #[test]
+    fn loopback_base_url_rejects_private_networks() {
+        for value in [
+            "http://192.168.0.2:9999/v1",
+            "http://10.1.2.3:9999/v1",
+            "http://172.16.0.1:9999/v1",
+            "http://172.31.255.254:9999/v1",
+            "http://0.0.0.0:9999/v1",
+        ] {
+            assert!(
+                !is_loopback_provider_base_url(value),
+                "{value} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_bound_image_file_ids_ignores_gif() {
+        let parts = vec![json!({
+            "type": "image",
+            "metadata": {
+                "fileId": 42,
+                "mime": "image/gif"
+            }
+        })];
+
+        let file_ids =
+            provider_bound_image_file_ids(&parts).expect("gif should not be provider-bound");
+
+        assert!(file_ids.is_empty());
+    }
+
+    #[test]
+    fn provider_bound_image_file_ids_rejects_multiple_provider_images() {
+        let parts = vec![
+            json!({
+                "type": "image",
+                "metadata": {
+                    "fileId": 1,
+                    "mime": "image/png"
+                }
+            }),
+            json!({
+                "type": "image",
+                "metadata": {
+                    "fileId": 2,
+                    "mime": "image/webp"
+                }
+            }),
+        ];
+
+        let result = provider_bound_image_file_ids(&parts);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn provider_bound_image_file_ids_rejects_missing_metadata() {
+        let parts = vec![json!({
+            "type": "image",
+            "url": "/api/files/path/1"
+        })];
+
+        let result = provider_bound_image_file_ids(&parts);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn image_data_url_rejects_gif() {
+        let result = image_data_url("image/gif", b"GIF89a");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn image_data_url_rejects_oversized_bytes() {
+        let bytes = vec![0; PROVIDER_IMAGE_INPUT_MAX_BYTES + 1];
+        let result = image_data_url("image/png", &bytes);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn base64_encoder_known_value() {
         assert_eq!(base64_encode_for_data_url(b""), "");
         assert_eq!(base64_encode_for_data_url(b"f"), "Zg==");

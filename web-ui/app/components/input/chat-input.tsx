@@ -81,6 +81,11 @@ const ALLOWED_IMAGE_MIMES = new Set([
   "image/webp",
   "image/gif",
 ]);
+const PROVIDER_BOUND_IMAGE_MIMES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/webp",
+]);
 const ALLOWED_DOCUMENT_MIMES = new Set(["text/plain", "application/pdf"]);
 const TEXT_DETECTION_BYTES = 4096;
 
@@ -274,6 +279,18 @@ function getPartSizeBytes(part: UIMessagePart): number | null {
 
 function hasImageAttachment(parts: UIMessagePart[]): boolean {
   return parts.some((part) => part.type === "image");
+}
+
+function isProviderBoundImageCandidate(part: UIMessagePart): boolean {
+  return (
+    part.type === "image" &&
+    typeof part.metadata?.mime === "string" &&
+    PROVIDER_BOUND_IMAGE_MIMES.has(part.metadata.mime)
+  );
+}
+
+function countProviderBoundImageCandidates(parts: UIMessagePart[]): number {
+  return parts.filter(isProviderBoundImageCandidate).length;
 }
 
 function modelSupportsImageInput(model: ProviderModel | null): boolean {
@@ -479,15 +496,24 @@ function ChatInputInner({
       return;
     }
 
-    const hasImage = hasImageAttachment(attachments);
-    if (hasImage && !modelSupportsImageInput(selectedModel)) {
+    const hasAnyImage = hasImageAttachment(attachments);
+    const providerBoundImageCount = countProviderBoundImageCandidates(attachments);
+    const supportsImageInput = modelSupportsImageInput(selectedModel);
+    if (hasAnyImage && !supportsImageInput) {
       const message = t("chat.image_attachment_text_only_model");
       setError(message);
       toast.error(message);
       return;
     }
 
-    if (hasImage && modelSupportsImageInput(selectedModel)) {
+    if (providerBoundImageCount > 1) {
+      const message = t("chat.image_attachment_one_image_limit");
+      setError(message);
+      toast.error(message);
+      return;
+    }
+
+    if (providerBoundImageCount === 1 && supportsImageInput) {
       setConfirmImageSendOpen(true);
       return;
     }

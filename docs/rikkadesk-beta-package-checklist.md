@@ -350,6 +350,7 @@ Phase 10 P6.3 confirmation UI checks:
 Phase 10 P6.4 synthetic capture-server checks:
 
 - Confirm TEXT-only model plus PNG is blocked before `/messages`.
+- Confirm TEXT-only model plus GIF is also blocked before `/messages`.
 - Confirm IMAGE-capable model plus PNG opens confirmation.
 - Confirm Cancel keeps draft/attachments and capture server receives no request.
 - Confirm Continue sends `/messages` with non-persistent capture intent.
@@ -358,8 +359,9 @@ Phase 10 P6.4 synthetic capture-server checks:
 - Confirm `image_url.url` starts with `data:image/png;base64,` for the synthetic PNG.
 - Confirm request body does not contain `/api/files/path`, `file://`, Windows paths, storage keys, or `secretRef`.
 - Confirm state does not contain base64, `image_url`, `input_image`, request body, local absolute paths, or storage keys in provider-bound data.
-- Confirm GIF, TXT, and PDF attachments remain local-only and do not call capture server.
-- Confirm two provider-bound images are blocked with a safe one-image prototype error.
+- Confirm IMAGE-capable GIF does not open capture confirmation, remains local-only, and does not call capture server.
+- Confirm TXT and PDF attachments do not open image confirmation, remain local-only, and do not call capture server.
+- Confirm two provider-bound PNG/JPEG/WEBP images are blocked before `/messages` with a safe one-image prototype error.
 - Confirm non-loopback provider Base URLs are rejected or local-only even after confirmation.
 - Confirm no real provider endpoint or real API key is used.
 

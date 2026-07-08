@@ -80,6 +80,10 @@ Phase 10 P6.4 adds a loopback-only synthetic capture-server prototype:
 
 - Continue from the image confirmation dialog sends top-level `imageInputConfirmed: true` and `imageInputMode: "capture-local"` intent to `/messages`.
 - The intent is not persisted in conversation state, message part metadata, file metadata, or provider import/export data.
+- Frontend confirmation gating is aligned with backend provider-bound image rules: only PNG, JPEG, and WEBP image attachments trigger the capture confirmation.
+- TEXT-only models still block any image attachment, including GIF and unsupported legacy image parts, before `/messages`.
+- IMAGE-capable messages with multiple provider-bound images are blocked before `/messages` with a one-image prototype error.
+- GIF image attachments no longer trigger capture confirmation and remain local-only.
 - The backend capture path only runs for confirmed IMAGE-capable messages with exactly one provider-bound PNG, JPEG, or WEBP image.
 - Capture requests are allowed only for loopback provider Base URLs: `127.0.0.1`, `localhost`, or `[::1]`.
 - Non-loopback, text-only, document-only, GIF, missing-file, and multi-image cases remain local-only or return a safe in-chat error.
@@ -89,6 +93,8 @@ Phase 10 P6.4 adds a loopback-only synthetic capture-server prototype:
 - The request body uses Chat Completions content array with a text part plus `image_url`.
 - Historical images are not resent.
 - `/regenerate` still does not support image resend.
+- Final synthetic smoke confirms request bodies do not contain `/api/files/path`, `file://`, Windows paths, storage keys, or `secretRef`.
+- Final synthetic state checks confirm no base64, `image_url`, `input_image`, request body, fixture path, app data path, or API key is persisted.
 - P6.4 remains synthetic-only and does not include real-provider manual testing.
 - P6.5 optional real-provider manual gate remains future work.
 
