@@ -282,6 +282,17 @@ Phase 10 P3 smoke checks:
 - Confirm the mock assistant reply still works and provider requests remain text-only.
 - Confirm `state.v1.json` has `schemaVersion: 5`, contains file metadata, and does not contain file contents, base64 payloads, or original absolute upload paths.
 
+Phase 10 P4 smoke checks:
+
+- Upload a synthetic PNG, send it, and confirm the message renders a safe raster image preview.
+- Delete the underlying synthetic image file and confirm the message shows an unavailable state without crashing.
+- Upload synthetic TXT and PDF files and confirm they render as document chips only.
+- Confirm document chips do not create iframe, object, embed, PDF, Office, HTML, or SVG inline previews.
+- Confirm unsafe legacy image/document URLs are blocked: `data:`, `blob:`, `file:`, `javascript:`, external HTTP(S), arbitrary relative paths, and malformed `/api/files/path/*`.
+- Confirm SVG and HTML are not previewed as active images or documents.
+- Confirm safe document links point only to controlled `/api/files/path/{id}` URLs and keep `target="_blank"` plus `rel="noopener noreferrer"`.
+- Confirm no `dangerouslySetInnerHTML`, iframe, object, or embed is introduced for attachment message parts.
+
 ## Test Real OpenAI-Compatible Streaming Chat
 
 1. Configure Provider Settings with a real OpenAI-compatible endpoint and a local user-entered API key.

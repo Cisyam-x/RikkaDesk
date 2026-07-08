@@ -80,13 +80,20 @@ function renderContentPart(
     case "text":
       return <TextPart text={part.text} isAnimating={loading} onClickCitation={onClickCitation} />;
     case "image":
-      return <ImagePart url={part.url} />;
+      return <ImagePart url={part.url} metadata={part.metadata} />;
     case "video":
       return <VideoPart url={part.url} />;
     case "audio":
       return <AudioPart url={part.url} />;
     case "document":
-      return <DocumentPart url={part.url} fileName={part.fileName} mime={part.mime} />;
+      return (
+        <DocumentPart
+          url={part.url}
+          fileName={part.fileName}
+          mime={part.mime}
+          metadata={part.metadata}
+        />
+      );
     case "reasoning":
       return (
         <ReasoningFallbackPart reasoning={part.reasoning} isFinished={part.finishedAt != null} />

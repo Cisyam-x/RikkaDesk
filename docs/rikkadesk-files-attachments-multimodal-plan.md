@@ -72,6 +72,15 @@ Phase 10 P3 aligned the inherited upload UI with the P2 skeleton:
 - Attachment deletion calls the local `DELETE /api/files/{id}` skeleton for draft attachments.
 - Multimodal provider calls, OCR, PDF/Office parsing, Workspace, MCP/tools, and search remain deferred.
 
+Phase 10 P4 hardened attachment message rendering:
+
+- Image and document parts now resolve only controlled managed file URLs under `/api/files/path/{id}`.
+- Image previews require managed metadata with a matching `fileId` and a raster image MIME: PNG, JPEG, WEBP, or GIF.
+- SVG, HTML, `data:`, `blob:`, `file:`, `javascript:`, external HTTP(S), arbitrary relative paths, and malformed managed file paths are blocked in message part rendering.
+- PDF and text files remain document chips only, with no inline PDF, Office, HTML, or SVG preview.
+- Missing or deleted files render a safe unavailable state instead of breaking the message UI.
+- Multimodal provider calls remain deferred, and attachments are still not sent to OpenAI-compatible providers.
+
 ## Phase 10 Goals And Non-Goals
 
 Long-term Phase 10 goals:
@@ -632,8 +641,10 @@ Not included:
 Acceptance:
 
 - Raster images preview safely.
-- SVG and HTML are blocked or shown as file chips.
-- PDF remains chip-only or uses a separately reviewed sandbox.
+- SVG, HTML, external URLs, `data:`, `blob:`, `file:`, `javascript:`, and malformed managed file paths are blocked.
+- PDF and text files remain chip-only.
+- Missing or deleted files show a safe fallback.
+- Rendering uses no iframe, object, embed, or `dangerouslySetInnerHTML`.
 
 ### P5: Model Capability Metadata
 
