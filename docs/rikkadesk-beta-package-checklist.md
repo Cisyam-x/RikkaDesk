@@ -340,12 +340,28 @@ Phase 10 P6.3 confirmation UI checks:
 - Confirm TEXT-only model plus image attachment does not open the image confirmation dialog.
 - Confirm IMAGE-capable model plus image attachment opens the confirmation dialog.
 - Confirm Cancel keeps the draft text and attachments and does not call `/messages`.
-- Confirm Continue calls `/messages` and the backend still returns the local-only attachment notice.
+- Confirm Continue calls `/messages`; without loopback capture eligibility, the backend still returns the local-only attachment notice.
 - Confirm document-only attachments do not show the image confirmation dialog.
 - Confirm text-only messages do not show the image confirmation dialog.
-- Confirm no runtime path calls the internal vision builder.
-- Confirm no image request is sent to any provider.
+- Confirm P6.3 alone did not call the internal vision builder; P6.4 may call it only for loopback capture.
+- Confirm P6.3 alone did not send image requests; P6.4 may send only to loopback capture.
 - Confirm no image blob is read, no file-derived base64 is generated, and no base64 appears in state or logs.
+
+Phase 10 P6.4 synthetic capture-server checks:
+
+- Confirm TEXT-only model plus PNG is blocked before `/messages`.
+- Confirm IMAGE-capable model plus PNG opens confirmation.
+- Confirm Cancel keeps draft/attachments and capture server receives no request.
+- Confirm Continue sends `/messages` with non-persistent capture intent.
+- Confirm loopback capture server receives one request for `http://127.0.0.1:9999/v1`.
+- Confirm request body has Chat Completions `messages[].content[]` array with text and `image_url` parts.
+- Confirm `image_url.url` starts with `data:image/png;base64,` for the synthetic PNG.
+- Confirm request body does not contain `/api/files/path`, `file://`, Windows paths, storage keys, or `secretRef`.
+- Confirm state does not contain base64, `image_url`, `input_image`, request body, local absolute paths, or storage keys in provider-bound data.
+- Confirm GIF, TXT, and PDF attachments remain local-only and do not call capture server.
+- Confirm two provider-bound images are blocked with a safe one-image prototype error.
+- Confirm non-loopback provider Base URLs are rejected or local-only even after confirmation.
+- Confirm no real provider endpoint or real API key is used.
 
 ## Test Real OpenAI-Compatible Streaming Chat
 

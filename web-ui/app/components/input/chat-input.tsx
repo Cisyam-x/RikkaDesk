@@ -65,7 +65,7 @@ export interface ChatInputProps {
   onAddParts: (parts: UIMessagePart[]) => void;
   shouldDeleteFileOnRemove?: (part: UIMessagePart) => boolean;
   onRemovePart: (index: number, part: UIMessagePart) => Promise<void> | void;
-  onSend: () => Promise<void> | void;
+  onSend: (options?: SendOptions) => Promise<void> | void;
   onStop?: () => Promise<void> | void;
   onCancelEdit?: () => void;
   onSuggestionClick?: (suggestion: string) => void;
@@ -108,6 +108,11 @@ async function detectUploadFile(
 
   return { allowed: false, mimeType: file.type || "application/octet-stream" };
 }
+
+export type SendOptions = {
+  imageInputConfirmed?: boolean;
+  imageInputMode?: "capture-local";
+};
 
 async function isSafeTextUpload(file: globalThis.File): Promise<boolean> {
   if (hasBlockedUploadExtension(file.name)) {
@@ -427,7 +432,7 @@ function ChatInputInner({
     [onAddParts, ready, t],
   );
 
-  const submitSend = React.useCallback(async () => {
+  const submitSend = React.useCallback(async (options?: SendOptions) => {
     setSubmitting(true);
     setError(null);
 
@@ -436,7 +441,7 @@ function ChatInputInner({
         toast.info(t("chat.attachments_local_only_beta"));
       }
 
-      await onSend();
+      await onSend(options);
     } catch (submitError) {
       const message =
         submitError instanceof Error
@@ -505,7 +510,10 @@ function ChatInputInner({
       return;
     }
 
-    void submitSend();
+    void submitSend({
+      imageInputConfirmed: true,
+      imageInputMode: "capture-local",
+    });
   }, [canSend, disabled, isGenerating, submitSend, submitting, uploading]);
 
   const handleTextChange = React.useCallback(

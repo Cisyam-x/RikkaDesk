@@ -116,6 +116,16 @@ Phase 10 P6.3 adds local-only image attachment confirmation UI:
 - Document-only attachments and text-only messages do not show the image confirmation dialog.
 - Provider image sending, file-derived base64 generation, and capture-server validation remain deferred.
 
+Phase 10 P6.4 adds a loopback-only synthetic capture-server prototype:
+
+- Confirmed IMAGE-capable image messages pass non-persistent capture intent to `/messages`.
+- The backend allows capture requests only for local loopback provider Base URLs.
+- Only one current-turn PNG/JPEG/WEBP managed file can be encoded into an in-memory data URL.
+- GIF, TXT, PDF, document-only, multi-image, missing-file, and non-loopback cases remain local-only or safe-error.
+- The provider-bound request body never uses `/api/files/path/{id}`, `file://`, storage keys, or local absolute paths.
+- Base64 is never persisted to state, message parts, file metadata, provider import/export, or logs.
+- Real-provider image input remains deferred to P6.5 or later.
+
 ## Phase 10 Goals And Non-Goals
 
 Long-term Phase 10 goals:

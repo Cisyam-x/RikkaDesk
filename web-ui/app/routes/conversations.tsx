@@ -13,7 +13,7 @@ import {
   ConversationEmptyState,
   ConversationScrollButton,
 } from "~/components/extended/conversation";
-import { ChatInput } from "~/components/input/chat-input";
+import { ChatInput, type SendOptions } from "~/components/input/chat-input";
 import { ChatMessage } from "~/components/message/chat-message";
 import { Button } from "~/components/ui/button";
 import { Drawer, DrawerContent } from "~/components/ui/drawer";
@@ -473,7 +473,7 @@ function useDraftInputController({
     [draftKey, removeDraftPart],
   );
 
-  const handleSubmit = React.useCallback(async () => {
+  const handleSubmit = React.useCallback(async (options?: SendOptions) => {
     if (!draftKey) return;
 
     const parts = getSubmitParts(draftKey);
@@ -493,7 +493,10 @@ function useDraftInputController({
     if (activeId) {
       clearDraft(draftKey);
       try {
-        await api.post<{ status: string }>(`conversations/${activeId}/messages`, { parts });
+        await api.post<{ status: string }>(`conversations/${activeId}/messages`, {
+          parts,
+          ...(options ?? {}),
+        });
       } catch (error) {
         restoreDraft();
         throw error;
@@ -510,6 +513,7 @@ function useDraftInputController({
     try {
       await api.post<{ status: string }>(`conversations/${conversationId}/messages`, {
         parts,
+        ...(options ?? {}),
         ...(useConversationPromptInjection
           ? {
               modeInjectionIds: promptInjectionIds.modeInjectionIds,
@@ -910,9 +914,9 @@ function ConversationsPageInner() {
     [editingSession, handleInputTextChange],
   );
 
-  const handleSend = React.useCallback(async () => {
+  const handleSend = React.useCallback(async (options?: SendOptions) => {
     if (!editingSession) {
-      await handleSubmit();
+      await handleSubmit(options);
       return;
     }
 

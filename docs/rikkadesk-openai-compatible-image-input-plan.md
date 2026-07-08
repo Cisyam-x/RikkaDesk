@@ -62,7 +62,6 @@ Phase 10 P6.2 adds the internal request model skeleton only:
 - No managed file blob is read for provider input.
 - No base64 is generated from files.
 - No provider image request is sent.
-- P6.4 capture-server prototype remains future work.
 
 ## P6.3 Implementation Status
 
@@ -71,14 +70,27 @@ Phase 10 P6.3 adds a local-only confirmation UI for IMAGE-capable models with im
 - IMAGE-capable model plus image attachment opens a confirmation dialog before `/messages`.
 - The dialog copy explicitly says P6.3 remains local-only and images are not sent to model providers.
 - Cancel closes the dialog, keeps the draft and attachments, and does not call `/messages`.
-- Continue uses the existing local-only attachment flow and still receives the backend attachment notice.
+- Continue now passes an explicit non-persistent capture intent to `/messages`.
 - TEXT-only model plus image attachment remains blocked before the confirmation dialog.
 - Document-only attachments and text-only messages do not show the image confirmation dialog.
-- No runtime path calls the vision builder.
-- No image file is read for provider input.
-- No file-derived base64 is generated.
-- No provider image request is sent.
-- P6.4 capture-server prototype remains future work.
+
+## P6.4 Implementation Status
+
+Phase 10 P6.4 adds a loopback-only synthetic capture-server prototype:
+
+- Continue from the image confirmation dialog sends top-level `imageInputConfirmed: true` and `imageInputMode: "capture-local"` intent to `/messages`.
+- The intent is not persisted in conversation state, message part metadata, file metadata, or provider import/export data.
+- The backend capture path only runs for confirmed IMAGE-capable messages with exactly one provider-bound PNG, JPEG, or WEBP image.
+- Capture requests are allowed only for loopback provider Base URLs: `127.0.0.1`, `localhost`, or `[::1]`.
+- Non-loopback, text-only, document-only, GIF, missing-file, and multi-image cases remain local-only or return a safe in-chat error.
+- The backend reads the selected managed image blob from the controlled app-data file store by `fileId`; it does not trust message URLs.
+- The selected image is encoded into an in-memory data URL only for the current Chat Completions request body.
+- The data URL is not saved to `state.v1.json`, conversation parts, file metadata, provider import/export, or logs.
+- The request body uses Chat Completions content array with a text part plus `image_url`.
+- Historical images are not resent.
+- `/regenerate` still does not support image resend.
+- P6.4 remains synthetic-only and does not include real-provider manual testing.
+- P6.5 optional real-provider manual gate remains future work.
 
 ## API Shape Options
 
@@ -555,8 +567,8 @@ Goal:
 
 - Add explicit image attachment confirmation for IMAGE-capable models.
 - Cancel keeps the draft and attachments and does not call `/messages`.
-- Confirm continues through the existing local-only attachment flow.
-- Do not pass provider intent, data URLs, base64, or a new request shape in P6.3.
+- Confirm passes non-persistent capture intent only.
+- Do not generate data URLs or call providers in P6.3.
 
 Candidate files:
 
@@ -574,13 +586,16 @@ Non-goals:
 
 Goal:
 
-- Send one synthetic 1x1 PNG to a local capture server.
+- Send one synthetic PNG/JPEG/WEBP to a local loopback capture server after confirmation.
 - Validate Chat Completions content array request shape.
 - Verify base64 is absent from state/logs.
 
 Candidate files:
 
 - `web-ui/src-tauri/src/mock_api.rs`
+- `web-ui/app/components/input/chat-input.tsx`
+- `web-ui/app/routes/conversations.tsx`
+- locale files
 - local smoke scripts or temporary test notes, if kept out of commits unless explicitly requested
 
 Non-goals:

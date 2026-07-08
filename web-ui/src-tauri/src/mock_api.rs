@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
     fs as std_fs, io,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::PathBuf,
     ptr,
     sync::{
@@ -58,6 +58,7 @@ const FILE_UPLOAD_MAX_ITEMS: usize = 5;
 const FILE_UPLOAD_MAX_BYTES: usize = 20 * 1024 * 1024;
 const FILE_UPLOAD_TOTAL_MAX_BYTES: usize = FILE_UPLOAD_MAX_ITEMS * FILE_UPLOAD_MAX_BYTES;
 const FILE_DISPLAY_NAME_MAX_CHARS: usize = 160;
+const PROVIDER_IMAGE_INPUT_MAX_BYTES: usize = 5 * 1024 * 1024;
 #[cfg(not(windows))]
 const SECRET_SERVICE_NAME: &str = "RikkaDesk";
 const OPENAI_COMPATIBLE_PROVIDER_TYPE: &str = "openai-compatible";
@@ -86,6 +87,14 @@ const MOCK_WELCOME_CONVERSATION_ID: &str = "mock-welcome";
 const MOCK_REPLY_TEXT: &str = "这是 RikkaDesk Mock 后端返回的测试回复。";
 const LOCAL_ATTACHMENT_REPLY_TEXT: &str =
     "附件已保存到本地会话。当前 beta 暂不支持将附件发送给模型服务。";
+const LOCAL_IMAGE_CAPTURE_CONFIG_REQUIRED_TEXT: &str =
+    "图片输入捕获测试需要配置本地 loopback capture provider 和测试密钥。";
+const LOCAL_IMAGE_CAPTURE_LOOPBACK_REQUIRED_TEXT: &str =
+    "图片输入捕获测试只允许本机 loopback capture provider。附件已保存在本地会话，未发送给模型服务。";
+const LOCAL_IMAGE_CAPTURE_CAPABILITY_REQUIRED_TEXT: &str =
+    "当前模型未启用图片输入能力。附件已保存在本地会话，未发送给模型服务。";
+const LOCAL_IMAGE_CAPTURE_UNSUPPORTED_TEXT: &str =
+    "当前图片输入捕获测试只支持一张 PNG、JPEG 或 WEBP 图片。附件已保存在本地会话，未发送给模型服务。";
 
 #[derive(Clone)]
 pub struct MockApiHandle {
@@ -919,12 +928,19 @@ struct OpenAiChatConfig {
     api_key: String,
     custom_headers: Vec<DesktopProviderCustomHeaderConfig>,
     custom_body: Option<Value>,
+    input_modalities: Vec<String>,
 }
 
 #[derive(Clone, Serialize)]
 struct OpenAiChatMessage {
     role: String,
     content: String,
+}
+
+struct ManagedImageProviderInput {
+    file_id: u64,
+    mime: String,
+    bytes: Vec<u8>,
 }
 
 #[allow(dead_code)]
@@ -1074,6 +1090,8 @@ struct SendMessageRequest {
     parts: Vec<Value>,
     mode_injection_ids: Option<Vec<String>>,
     lorebook_ids: Option<Vec<String>>,
+    image_input_confirmed: Option<bool>,
+    image_input_mode: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1885,6 +1903,8 @@ async fn send_message(
     let created_at = now_iso();
     let user_text = first_text_part(&payload.parts);
     let user_has_non_text_parts = has_non_text_parts(&payload.parts);
+    let request_parts = payload.parts.clone();
+    let capture_intent = is_capture_local_image_intent(&payload);
 
     let updated_after_user_message = {
         let mut conversations = state.conversations.write().await;
@@ -1926,6 +1946,27 @@ async fn send_message(
     broadcast_list_invalidate(&state).await;
 
     if user_has_non_text_parts {
+        if capture_intent {
+            match start_local_image_capture_prototype(
+                &state,
+                &id,
+                &assistant_id,
+                &model_id,
+                user_text.clone(),
+                &request_parts,
+                now,
+            )
+            .await
+            {
+                Ok(true) => return Json(json!({ "status": "accepted" })),
+                Ok(false) => {}
+                Err(error) => {
+                    append_assistant_reply(&state, &id, &assistant_id, &model_id, error, now).await;
+                    return Json(json!({ "status": "accepted" }));
+                }
+            }
+        }
+
         append_assistant_reply(
             &state,
             &id,
@@ -1988,6 +2029,58 @@ async fn send_message(
     spawn_openai_stream_generation(state.clone(), id, assistant_message_id, config, messages);
 
     Json(json!({ "status": "accepted" }))
+}
+
+fn is_capture_local_image_intent(payload: &SendMessageRequest) -> bool {
+    payload.image_input_confirmed == Some(true)
+        && payload.image_input_mode.as_deref() == Some("capture-local")
+}
+
+async fn start_local_image_capture_prototype(
+    state: &Arc<MockApiState>,
+    conversation_id: &str,
+    assistant_id: &str,
+    model_id: &str,
+    user_text: Option<String>,
+    parts: &[Value],
+    now: u64,
+) -> Result<bool, String> {
+    let image_file_ids = provider_bound_image_file_ids(parts)?;
+    let Some(file_id) = image_file_ids.first().copied() else {
+        return Ok(false);
+    };
+
+    let config = resolve_openai_chat_config(state, model_id)
+        .await
+        .map_err(|_| LOCAL_IMAGE_CAPTURE_CONFIG_REQUIRED_TEXT.to_string())?
+        .ok_or_else(|| LOCAL_IMAGE_CAPTURE_CONFIG_REQUIRED_TEXT.to_string())?;
+
+    if !is_loopback_provider_base_url(&config.base_url) {
+        return Err(LOCAL_IMAGE_CAPTURE_LOOPBACK_REQUIRED_TEXT.to_string());
+    }
+    if !config
+        .input_modalities
+        .iter()
+        .any(|modality| modality == MODEL_MODALITY_IMAGE)
+    {
+        return Err(LOCAL_IMAGE_CAPTURE_CAPABILITY_REQUIRED_TEXT.to_string());
+    }
+
+    let image = managed_file_for_provider_image_input(state, file_id).await?;
+    let messages = openai_vision_messages_for_current_turn(user_text, image)?;
+    let assistant_message_id =
+        append_empty_streaming_assistant_reply(state, conversation_id, assistant_id, model_id, now)
+            .await;
+    start_generation(state, conversation_id).await;
+    spawn_openai_vision_capture_generation(
+        state.clone(),
+        conversation_id.to_string(),
+        assistant_message_id,
+        config,
+        messages,
+    );
+
+    Ok(true)
 }
 
 async fn stop_conversation(
@@ -2615,6 +2708,52 @@ async fn cleanup_uploaded_blobs(paths: Vec<PathBuf>) {
     }
 }
 
+async fn managed_file_for_provider_image_input(
+    state: &Arc<MockApiState>,
+    file_id: u64,
+) -> Result<ManagedImageProviderInput, String> {
+    let metadata = {
+        let files = state.files.read().await;
+        files
+            .iter()
+            .find(|file| file.id == file_id && file.deleted_at.is_none())
+            .cloned()
+    }
+    .ok_or_else(|| "Image attachment is unavailable".to_string())?;
+
+    if !is_safe_storage_key(&metadata.storage_key) {
+        return Err("Image attachment is unavailable".to_string());
+    }
+    if !is_provider_image_mime(&metadata.mime) {
+        return Err(LOCAL_IMAGE_CAPTURE_UNSUPPORTED_TEXT.to_string());
+    }
+    if metadata.size_bytes > PROVIDER_IMAGE_INPUT_MAX_BYTES as u64 {
+        return Err("Image attachment is too large for capture testing".to_string());
+    }
+
+    let Some(path) = state.persistence.file_blob_path(&metadata.storage_key) else {
+        return Err("Image attachment is unavailable".to_string());
+    };
+    let bytes = fs::read(path)
+        .await
+        .map_err(|_| "Image attachment is unavailable".to_string())?;
+    if bytes.len() > PROVIDER_IMAGE_INPUT_MAX_BYTES {
+        return Err("Image attachment is too large for capture testing".to_string());
+    }
+
+    let detected = detect_safe_upload_mime(&bytes, &metadata.display_name)
+        .map_err(|_| "Image attachment type is not supported for capture testing".to_string())?;
+    if detected != metadata.mime || !is_provider_image_mime(detected) {
+        return Err("Image attachment type is not supported for capture testing".to_string());
+    }
+
+    Ok(ManagedImageProviderInput {
+        file_id,
+        mime: metadata.mime,
+        bytes,
+    })
+}
+
 async fn desktop_provider_responses(
     state: &Arc<MockApiState>,
 ) -> Result<Vec<DesktopProviderResponse>, String> {
@@ -3078,6 +3217,62 @@ fn is_supported_provider_base_url(value: &str) -> bool {
     }
 }
 
+fn is_loopback_provider_base_url(base_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url.trim()) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.trim_matches(['[', ']']);
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+
+    host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+fn provider_bound_image_file_ids(parts: &[Value]) -> Result<Vec<u64>, String> {
+    let mut file_ids = Vec::new();
+    for part in parts {
+        if part.get("type").and_then(Value::as_str) != Some("image") {
+            continue;
+        }
+
+        let Some(metadata) = part.get("metadata").and_then(Value::as_object) else {
+            return Err("Image attachment metadata is missing".to_string());
+        };
+        let mime = metadata
+            .get("mime")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if mime == "image/gif" {
+            continue;
+        }
+        if !is_provider_image_mime(mime) {
+            return Err(LOCAL_IMAGE_CAPTURE_UNSUPPORTED_TEXT.to_string());
+        }
+        let Some(file_id) = metadata.get("fileId").and_then(Value::as_u64) else {
+            return Err("Image attachment metadata is missing".to_string());
+        };
+        file_ids.push(file_id);
+    }
+
+    if file_ids.len() > 1 {
+        return Err("Only one image can be sent in this prototype.".to_string());
+    }
+
+    Ok(file_ids)
+}
+
+fn is_provider_image_mime(mime: &str) -> bool {
+    matches!(mime, "image/png" | "image/jpeg" | "image/webp")
+}
+
 fn field_is_too_long(value: &str, max_chars: usize) -> bool {
     value.chars().count() > max_chars
 }
@@ -3269,13 +3464,16 @@ async fn resolve_openai_chat_config(
                         provider.secret_ref.clone(),
                         provider.custom_headers.clone(),
                         provider.custom_body.clone(),
+                        model.input_modalities.clone(),
                     )
                 })
             })
         })
     };
 
-    let Some((base_url, model_id, secret_ref, custom_headers, custom_body)) = config else {
+    let Some((base_url, model_id, secret_ref, custom_headers, custom_body, input_modalities)) =
+        config
+    else {
         return Ok(None);
     };
 
@@ -3299,6 +3497,7 @@ async fn resolve_openai_chat_config(
         api_key,
         custom_headers,
         custom_body,
+        input_modalities,
     }))
 }
 
@@ -3354,6 +3553,7 @@ async fn resolve_openai_chat_config_for_provider(
         api_key,
         custom_headers: provider.custom_headers.clone(),
         custom_body: provider.custom_body.clone(),
+        input_modalities: model.input_modalities.clone(),
     }))
 }
 
@@ -3495,6 +3695,67 @@ fn is_supported_image_data_url(value: &str) -> bool {
     .any(|prefix| value.starts_with(prefix))
 }
 
+fn image_data_url(mime: &str, bytes: &[u8]) -> Result<String, String> {
+    if !is_provider_image_mime(mime) {
+        return Err("Image attachment type is not supported for capture testing".to_string());
+    }
+    if bytes.len() > PROVIDER_IMAGE_INPUT_MAX_BYTES {
+        return Err("Image attachment is too large for capture testing".to_string());
+    }
+
+    Ok(format!(
+        "data:{mime};base64,{}",
+        base64_encode_for_data_url(bytes)
+    ))
+}
+
+fn base64_encode_for_data_url(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+
+        output.push(TABLE[(b0 >> 2) as usize] as char);
+        output.push(TABLE[(((b0 & 0b0000_0011) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            output.push(TABLE[(((b1 & 0b0000_1111) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            output.push('=');
+        }
+        if chunk.len() > 2 {
+            output.push(TABLE[(b2 & 0b0011_1111) as usize] as char);
+        } else {
+            output.push('=');
+        }
+    }
+    output
+}
+
+fn openai_vision_messages_for_current_turn(
+    user_text: Option<String>,
+    image: ManagedImageProviderInput,
+) -> Result<Vec<OpenAiCompatibleChatMessage>, String> {
+    let text = user_text
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "Describe this image.".to_string());
+    let data_url = image_data_url(&image.mime, &image.bytes)?;
+
+    Ok(vec![OpenAiCompatibleChatMessage {
+        role: "user".to_string(),
+        content: OpenAiCompatibleMessageContent::Parts(vec![
+            OpenAiCompatibleContentPart::Text(text),
+            OpenAiCompatibleContentPart::ImageUrl {
+                data_url,
+                detail: OpenAiImageDetail::Auto,
+                file_id: image.file_id,
+            },
+        ]),
+    }])
+}
+
 fn apply_openai_custom_headers(
     builder: reqwest::RequestBuilder,
     headers: &[DesktopProviderCustomHeaderConfig],
@@ -3582,6 +3843,37 @@ fn spawn_openai_stream_generation(
     });
 }
 
+fn spawn_openai_vision_capture_generation(
+    state: Arc<MockApiState>,
+    conversation_id: String,
+    assistant_message_id: String,
+    config: OpenAiChatConfig,
+    messages: Vec<OpenAiCompatibleChatMessage>,
+) {
+    tokio::spawn(async move {
+        let stream_result = stream_openai_compatible_vision_capture(
+            &state,
+            &conversation_id,
+            &assistant_message_id,
+            &config,
+            messages,
+        )
+        .await;
+
+        if let Err(error) = stream_result {
+            append_text_to_assistant_message(
+                &state,
+                &conversation_id,
+                &assistant_message_id,
+                &error,
+            )
+            .await;
+        }
+
+        finish_streaming_assistant_reply(&state, &conversation_id, &assistant_message_id).await;
+    });
+}
+
 async fn stream_openai_compatible_chat(
     state: &Arc<MockApiState>,
     conversation_id: &str,
@@ -3610,6 +3902,70 @@ async fn stream_openai_compatible_chat(
             status.as_u16(),
             status.canonical_reason().unwrap_or("HTTP error")
         ));
+    }
+
+    let mut buffer = String::new();
+    while let Some(chunk) = response.chunk().await.map_err(safe_reqwest_error)? {
+        if !is_generation_active(state, conversation_id).await {
+            return Ok(());
+        }
+
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(line_end) = buffer.find('\n') {
+            let line = buffer[..line_end].trim_end_matches('\r').to_string();
+            buffer.drain(..=line_end);
+            if handle_openai_stream_line(state, conversation_id, assistant_message_id, &line)
+                .await?
+            {
+                return Ok(());
+            }
+            if !is_generation_active(state, conversation_id).await {
+                return Ok(());
+            }
+        }
+    }
+
+    if !buffer.trim().is_empty()
+        && handle_openai_stream_line(state, conversation_id, assistant_message_id, &buffer).await?
+    {
+        return Ok(());
+    }
+
+    if !is_generation_active(state, conversation_id).await {
+        Ok(())
+    } else {
+        Err("stream ended before DONE".to_string())
+    }
+}
+
+async fn stream_openai_compatible_vision_capture(
+    state: &Arc<MockApiState>,
+    conversation_id: &str,
+    assistant_message_id: &str,
+    config: &OpenAiChatConfig,
+    messages: Vec<OpenAiCompatibleChatMessage>,
+) -> Result<(), String> {
+    let body = build_openai_vision_chat_request_body(
+        config,
+        messages,
+        true,
+        OpenAiRequestKind::StreamingChat,
+    )?;
+
+    let request = state
+        .http_client
+        .post(openai_chat_completions_url(&config.base_url));
+    let request = apply_openai_custom_headers(request, &config.custom_headers)?;
+    let mut response = request
+        .bearer_auth(&config.api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(safe_reqwest_error)?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(safe_http_status_error(status));
     }
 
     let mut buffer = String::new();
@@ -5174,6 +5530,10 @@ mod tests {
             api_key: "test-key".to_string(),
             custom_headers: Vec::new(),
             custom_body,
+            input_modalities: vec![
+                MODEL_MODALITY_TEXT.to_string(),
+                MODEL_MODALITY_IMAGE.to_string(),
+            ],
         }
     }
 
@@ -5278,5 +5638,49 @@ mod tests {
 
         assert_eq!(body["messages"][0]["content"], json!("hello"));
         assert!(body["messages"][0]["content"].as_array().is_none());
+    }
+
+    #[test]
+    fn loopback_base_url_allows_localhost() {
+        for value in [
+            "http://127.0.0.1:9999/v1",
+            "http://localhost:9999/v1",
+            "http://[::1]:9999/v1",
+            "https://127.0.0.1:9999/v1",
+        ] {
+            assert!(
+                is_loopback_provider_base_url(value),
+                "{value} should be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn loopback_base_url_rejects_public_and_private_hosts() {
+        for value in [
+            "https://api.openai.com/v1",
+            "http://example.com/v1",
+            "http://192.168.1.10:9999/v1",
+            "http://10.0.0.1:9999/v1",
+            "http://172.16.0.1:9999/v1",
+            "http://0.0.0.0:9999/v1",
+            "file:///C:/test",
+            "/v1",
+            "",
+        ] {
+            assert!(
+                !is_loopback_provider_base_url(value),
+                "{value} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn base64_encoder_known_value() {
+        assert_eq!(base64_encode_for_data_url(b""), "");
+        assert_eq!(base64_encode_for_data_url(b"f"), "Zg==");
+        assert_eq!(base64_encode_for_data_url(b"fo"), "Zm8=");
+        assert_eq!(base64_encode_for_data_url(b"foo"), "Zm9v");
+        assert_eq!(base64_encode_for_data_url(b"hello"), "aGVsbG8=");
     }
 }
