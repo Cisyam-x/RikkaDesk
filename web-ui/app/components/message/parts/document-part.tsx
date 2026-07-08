@@ -1,3 +1,4 @@
+import * as React from "react";
 import { File, FileText } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
@@ -6,7 +7,7 @@ import {
   getManagedFileIdFromMetadata,
   getManagedFileMime,
   getManagedFileSizeBytes,
-  resolveManagedFileUrl,
+  resolveManagedFileUrlAsync,
 } from "~/lib/files";
 
 interface DocumentPartProps {
@@ -30,12 +31,32 @@ function normalizeMime(mime: string | null | undefined): string | null {
 
 export function DocumentPart({ url, fileName, mime, metadata }: DocumentPartProps) {
   const { t } = useTranslation("message");
+  const [documentUrl, setDocumentUrl] = React.useState<string | null>(null);
   const fileId = getManagedFileIdFromMetadata(metadata);
-  const documentUrl = resolveManagedFileUrl(url, fileId);
   const sizeBytes = getManagedFileSizeBytes(metadata);
   const metadataMime = getManagedFileMime(metadata);
   const safeFileName = fileName?.trim() || t("attachment_part.attachment");
   const safeMime = metadataMime ?? normalizeMime(mime) ?? "application/octet-stream";
+
+  React.useEffect(() => {
+    let cancelled = false;
+
+    setDocumentUrl(null);
+    void resolveManagedFileUrlAsync(url, fileId)
+      .then((resolvedUrl) => {
+        if (cancelled) return;
+        setDocumentUrl(resolvedUrl);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setDocumentUrl(null);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [fileId, url]);
+
   const content = (
     <>
       {getDocumentIcon(safeMime)}

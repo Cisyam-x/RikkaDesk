@@ -1,4 +1,4 @@
-import { appendWebAuthQuery } from "~/services/api";
+import { appendWebAuthQuery, resolveApiUrl } from "~/services/api";
 import type { UIMessagePart } from "~/types";
 
 const MANAGED_FILE_PATH_PATTERN = /^\/api\/files\/path\/([1-9]\d*)$/;
@@ -29,6 +29,12 @@ export function resolveFileUrl(url: string): string {
   }
 
   return "";
+}
+
+export async function resolveFileUrlAsync(url: string): Promise<string> {
+  const resolved = resolveFileUrl(url);
+  if (!resolved) return "";
+  return resolveApiUrl(resolved);
 }
 
 function safePositiveInteger(value: unknown): number | null {
@@ -103,6 +109,15 @@ export function resolveManagedFileUrl(
   }
 
   return appendWebAuthQuery(`/api/files/path/${pathId}`);
+}
+
+export async function resolveManagedFileUrlAsync(
+  url: string | undefined,
+  fileId?: number | null,
+): Promise<string | null> {
+  const resolved = resolveManagedFileUrl(url, fileId);
+  if (!resolved) return null;
+  return resolveApiUrl(resolved);
 }
 
 export function formatFileSize(size: number): string {

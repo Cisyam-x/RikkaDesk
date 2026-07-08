@@ -41,7 +41,11 @@ import {
   DialogTitle,
 } from "~/components/ui/dialog";
 import { Textarea } from "~/components/ui/textarea";
-import { resolveFileUrl } from "~/lib/files";
+import {
+  getManagedFileMime,
+  isManagedRasterImageMime,
+  resolveManagedFileUrlAsync,
+} from "~/lib/files";
 import { cn } from "~/lib/utils";
 import api from "~/services/api";
 import type {
@@ -277,6 +281,58 @@ function getPartSizeBytes(part: UIMessagePart): number | null {
     : null;
 }
 
+function AttachmentImageThumbnail({
+  part,
+}: {
+  part: Extract<UIMessagePart, { type: "image" }>;
+}) {
+  const [src, setSrc] = React.useState<string | null>(null);
+  const fileId = getPartFileId(part);
+  const mime = getManagedFileMime(part.metadata);
+  const canPreview = fileId != null && isManagedRasterImageMime(mime);
+
+  React.useEffect(() => {
+    let cancelled = false;
+
+    setSrc(null);
+    if (!canPreview) {
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    void resolveManagedFileUrlAsync(part.url, fileId)
+      .then((resolvedUrl) => {
+        if (cancelled) return;
+        setSrc(resolvedUrl);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setSrc(null);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [canPreview, fileId, part.url]);
+
+  if (!src) {
+    return <Image className="size-3.5" />;
+  }
+
+  return (
+    <img
+      alt="upload"
+      className="size-5 rounded object-cover"
+      decoding="async"
+      loading="lazy"
+      onError={() => setSrc(null)}
+      referrerPolicy="no-referrer"
+      src={src}
+    />
+  );
+}
+
 function hasImageAttachment(parts: UIMessagePart[]): boolean {
   return parts.some((part) => part.type === "image");
 }
@@ -400,36 +456,36 @@ function ChatInputInner({
         return;
       }
 
-      const allFiles = Array.from(fileList);
-      const results = await Promise.all(
-        allFiles.map(async (f) => ({ file: f, ...(await detectUploadFile(f)) })),
-      );
-      const uploadableFiles = results.filter((r) => r.allowed);
-      const skippedFiles = results.filter((r) => !r.allowed);
-
-      if (skippedFiles.length > 0) {
-        toast.warning(
-          t("chat.unsupported_file_skipped", { count: skippedFiles.length }),
-        );
-      }
-
-      if (uploadableFiles.length === 0) {
-        return;
-      }
-
-      const formData = new FormData();
-      uploadableFiles.forEach(({ file, mimeType }) => {
-        // 用 magic bytes 检测结果覆盖浏览器的 file.type，修正跨平台 MIME 歧义
-        const safeFile =
-          file.type !== mimeType
-            ? new globalThis.File([file], file.name, { type: mimeType })
-            : file;
-        formData.append("files", safeFile, safeFile.name);
-      });
-
       setUploading(true);
       setError(null);
       try {
+        const allFiles = Array.from(fileList);
+        const results = await Promise.all(
+          allFiles.map(async (f) => ({ file: f, ...(await detectUploadFile(f)) })),
+        );
+        const uploadableFiles = results.filter((r) => r.allowed);
+        const skippedFiles = results.filter((r) => !r.allowed);
+
+        if (skippedFiles.length > 0) {
+          toast.warning(
+            t("chat.unsupported_file_skipped", { count: skippedFiles.length }),
+          );
+        }
+
+        if (uploadableFiles.length === 0) {
+          return;
+        }
+
+        const formData = new FormData();
+        uploadableFiles.forEach(({ file, mimeType }) => {
+          // 用 magic bytes 检测结果覆盖浏览器的 file.type，修正跨平台 MIME 歧义
+          const safeFile =
+            file.type !== mimeType
+              ? new globalThis.File([file], file.name, { type: mimeType })
+              : file;
+          formData.append("files", safeFile, safeFile.name);
+        });
+
         const response = await api.postMultipart<UploadFilesResponseDto>(
           "files/upload",
           formData,
@@ -442,6 +498,7 @@ function ChatInputInner({
             ? uploadError.message
             : t("chat.upload_failed");
         setError(message);
+        toast.error(message);
       } finally {
         setUploading(false);
       }
@@ -603,8 +660,12 @@ function ChatInputInner({
 
   const handleUploadInputChange = React.useCallback(
     async (event: React.ChangeEvent<HTMLInputElement>) => {
-      await uploadFiles(event.target.files);
-      event.currentTarget.value = "";
+      const input = event.currentTarget;
+      try {
+        await uploadFiles(input.files);
+      } finally {
+        input.value = "";
+      }
     },
     [uploadFiles],
   );
@@ -798,11 +859,7 @@ function ChatInputInner({
                     className="group inline-flex max-w-[260px] items-center gap-1 rounded-full border bg-background/80 px-2 py-1 text-xs"
                   >
                     {part.type === "image" ? (
-                      <img
-                        alt="upload"
-                        className="size-5 rounded object-cover"
-                        src={resolveFileUrl(part.url)}
-                      />
+                      <AttachmentImageThumbnail part={part} />
                     ) : (
                       partIcon(part)
                     )}
@@ -864,26 +921,30 @@ function ChatInputInner({
           />
           <div className="flex items-center justify-between gap-2">
             <div className="flex min-w-0 items-center gap-1">
+              <input
+                ref={fileInputRef}
+                accept={DOCUMENT_UPLOAD_ACCEPT}
+                className="hidden"
+                multiple
+                onChange={(event) => {
+                  void handleUploadInputChange(event);
+                }}
+                type="file"
+              />
+              <input
+                ref={imageInputRef}
+                accept={IMAGE_UPLOAD_ACCEPT}
+                className="hidden"
+                multiple
+                onChange={(event) => {
+                  void handleUploadInputChange(event);
+                }}
+                type="file"
+              />
               <DropdownMenu
                 open={uploadMenuOpen}
                 onOpenChange={setUploadMenuOpen}
               >
-                <input
-                  ref={fileInputRef}
-                  accept={DOCUMENT_UPLOAD_ACCEPT}
-                  className="hidden"
-                  multiple
-                  onChange={handleUploadInputChange}
-                  type="file"
-                />
-                <input
-                  ref={imageInputRef}
-                  accept={IMAGE_UPLOAD_ACCEPT}
-                  className="hidden"
-                  multiple
-                  onChange={handleUploadInputChange}
-                  type="file"
-                />
                 <DropdownMenuTrigger asChild>
                   <Button
                     variant="ghost"
@@ -907,6 +968,7 @@ function ChatInputInner({
                   <DropdownMenuItem
                     onClick={() => {
                       imageInputRef.current?.click();
+                      setUploadMenuOpen(false);
                     }}
                   >
                     <Image className="size-4" />
@@ -915,6 +977,7 @@ function ChatInputInner({
                   <DropdownMenuItem
                     onClick={() => {
                       fileInputRef.current?.click();
+                      setUploadMenuOpen(false);
                     }}
                   >
                     <File className="size-4" />

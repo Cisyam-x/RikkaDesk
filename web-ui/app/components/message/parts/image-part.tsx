@@ -6,7 +6,7 @@ import {
   getManagedFileIdFromMetadata,
   getManagedFileMime,
   isManagedRasterImageMime,
-  resolveManagedFileUrl,
+  resolveManagedFileUrlAsync,
 } from "~/lib/files";
 
 interface ImagePartProps {
@@ -18,13 +18,57 @@ export function ImagePart({ url, metadata }: ImagePartProps) {
   const { t } = useTranslation("message");
   const [error, setError] = React.useState(false);
   const [loaded, setLoaded] = React.useState(false);
+  const [resolving, setResolving] = React.useState(false);
+  const [imageUrl, setImageUrl] = React.useState<string | null>(null);
   const fileId = getManagedFileIdFromMetadata(metadata);
   const mime = getManagedFileMime(metadata);
-  const imageUrl = fileId != null && isManagedRasterImageMime(mime)
-    ? resolveManagedFileUrl(url, fileId)
-    : null;
+  const canResolveImage = fileId != null && isManagedRasterImageMime(mime);
+
+  React.useEffect(() => {
+    let cancelled = false;
+
+    setError(false);
+    setLoaded(false);
+
+    if (!canResolveImage) {
+      setResolving(false);
+      setImageUrl(null);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    setResolving(true);
+    void resolveManagedFileUrlAsync(url, fileId)
+      .then((resolvedUrl) => {
+        if (cancelled) return;
+        setImageUrl(resolvedUrl);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setImageUrl(null);
+      })
+      .finally(() => {
+        if (cancelled) return;
+        setResolving(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [canResolveImage, fileId, url]);
 
   if (!url) return null;
+
+  if (resolving) {
+    return (
+      <div className="relative my-2 max-w-md">
+        <div className="flex h-48 items-center justify-center rounded-md border border-muted bg-muted/30">
+          <div className="text-sm text-muted-foreground">Loading image...</div>
+        </div>
+      </div>
+    );
+  }
 
   if (!imageUrl || error) {
     return (
