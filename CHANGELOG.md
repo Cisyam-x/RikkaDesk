@@ -6,9 +6,40 @@ This changelog tracks the RikkaDesk desktop work in this fork. It does not repla
 
 ## 0.1.0 Private Beta Line
 
-The current feature-stable private beta tag is planned as `rikkadesk-v0.1.0-beta.11`. The `beta/0.1.0` branch may contain later documentation or feature work after that tag.
+The current feature-stable private beta tag remains `rikkadesk-v0.1.0-beta.11`. The `beta/0.1.0` branch may contain later documentation or feature work after that tag.
 
 This beta line is not a public GitHub Release.
+
+### Unreleased / beta.12 candidate
+
+Added:
+
+- Add a local attachment skeleton for managed files.
+- Add safe PNG/JPEG/WEBP/GIF image attachments and TXT/PDF document chips.
+- Add safe image/document message rendering for managed file URLs.
+- Add provider model capability metadata with TEXT and IMAGE input markers.
+- Add IMAGE-capable model confirmation UI.
+- Add a loopback-only synthetic image capture prototype for one current-turn PNG/JPEG/WEBP image.
+- Add real-provider image manual gate documentation.
+
+Changed:
+
+- Provider import/export is version 4 with model modality metadata.
+- Local state schema is 6.
+- Attachment workflows are documented as local-first and provider-safe.
+
+Security:
+
+- File blobs are stored under app data and referenced by managed file IDs.
+- State must not contain file contents, base64 payloads, original absolute paths, provider request bodies, or API keys.
+- Loopback capture keeps data URLs in memory for the request only and does not persist them.
+- Real-provider image input remains disabled unless a later manual gate implementation is reviewed.
+
+Known limits:
+
+- Real-provider image input is not enabled in the beta.12 default scope.
+- OCR, PDF/Office parsing, audio/video input, Workspace, MCP/tools, search, and full multimodal provider support remain unsupported.
+- Installers are unsigned.
 
 ### `rikkadesk-v0.1.0-beta.11` - Markdown Rendering Hardening
 
@@ -168,6 +199,7 @@ The `beta/0.1.0` branch included these follow-up updates after the beta.4 featur
 - Provider multi-model state, UI, and import/export v2 work, tagged or planned as `rikkadesk-v0.1.0-beta.9`.
 - Provider advanced request config and import/export v3 work, tagged as `rikkadesk-v0.1.0-beta.10`.
 - Markdown rendering polish, mhchem support, raw HTML hardening, and Workbench preview sandbox hardening, planned as `rikkadesk-v0.1.0-beta.11`.
+- Local attachment skeleton, safe attachment rendering, model capability metadata, and loopback-only synthetic image capture prototype are in the beta.12 candidate branch, not yet tagged.
 
 ## Security
 
@@ -182,8 +214,8 @@ The `beta/0.1.0` branch included these follow-up updates after the beta.4 featur
 
 - Only OpenAI-compatible text chat is supported.
 - Gemini, Claude, Anthropic, Vertex, and provider-specific protocols are not implemented.
-- Files, attachments, images, audio, tools, MCP, search, Workspace, forks, and multimodal requests are not implemented.
-- One provider can contain multiple text models, but per-model secrets, per-model Base URLs, tools, and multimodal abilities are not implemented.
+- Local file attachments and safe attachment rendering exist in the beta.12 candidate branch, but real-provider image input is not enabled by default.
+- One provider can contain multiple text models and model capability metadata, but per-model secrets, per-model Base URLs, tools, OCR/PDF parsing, and full multimodal provider requests are not implemented.
 - Stop/cancel behavior is minimal and may not abort the underlying provider HTTP request immediately.
 - JSON state is a beta prototype store, not the final database architecture.
 - Windows installers are unsigned.

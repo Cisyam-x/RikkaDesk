@@ -205,6 +205,13 @@ Release copy should be conservative:
 - Real-provider manual gate is experimental and not for ordinary testers.
 - No real-provider image test should be run by Codex or automation.
 
+Phase 10 P6.6 release copy should keep the same boundary:
+
+- Document local attachment skeletons and loopback-only synthetic capture.
+- Do not claim full multimodal support.
+- Do not claim real-provider image input is enabled.
+- Do not instruct ordinary beta testers to run real-provider image tests.
+
 ## P6.5 P0 Acceptance
 
 - This document exists.

@@ -139,6 +139,13 @@ Phase 10 P6.5 P0 adds the real-provider image manual gate design:
 - Loopback-only capture remains the only implemented image-send path.
 - Future real-provider image sending requires a separate P6.5 P1 code review and an explicit manual gate.
 
+Phase 10 P6.6 prepares beta.12 candidate documentation and release copy:
+
+- README, changelog, release draft, and package checklist now describe the Phase 10 local attachment skeleton and loopback-only capture prototype.
+- The docs explicitly avoid claiming full multimodal support or real-provider image input.
+- The current stable private tag remains `rikkadesk-v0.1.0-beta.11`; beta.12 is not tagged by P6.6.
+- No code, schema, provider import/export, dependency, Tauri, Android, SecretStore, or file API behavior changes are made in P6.6.
+
 ## Phase 10 Goals And Non-Goals
 
 Long-term Phase 10 goals:

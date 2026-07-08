@@ -20,12 +20,20 @@ Included:
 - Secret references in JSON and encrypted local secret blobs for API keys.
 - OpenAI-compatible text chat with streaming responses.
 - Mock fallback when a real provider is not configured or cannot be used.
+- Local attachment skeleton with managed file metadata.
+- Safe raster image attachments for PNG, JPEG, WEBP, and GIF.
+- TXT/PDF document chips with no inline PDF preview.
+- Safe image/document message rendering for managed file URLs.
+- Provider model capability metadata with TEXT and IMAGE input markers.
+- Loopback-only synthetic image capture prototype for one current-turn PNG/JPEG/WEBP image.
 
 Not included:
 
 - Public GitHub Release publishing.
 - Gemini, Claude, Anthropic, Vertex, or provider-specific protocols.
-- Files, attachments, images, audio, tools, MCP, search, Workspace, forks, or release auto-updates.
+- Real-provider image input by default.
+- Full multimodal provider support.
+- OCR, PDF/Office parsing, audio/video input, tools, MCP, search, Workspace, forks, or release auto-updates.
 - SQLite, sync, multi-device backup, or production-grade migration tooling.
 - Any change to the upstream Android `app` module.
 
@@ -491,7 +499,8 @@ Checklist:
 - Favorite and unfavorite a provider model from the model selector.
 - Use Set as current model from Provider Settings.
 - Run Test Connection for a specific model with both a valid test endpoint and an intentionally invalid endpoint when available.
-- Export providers and confirm the JSON is version 3 with `providers[].models[]`, safe `customHeaders[]`, and safe `customBody`.
+- Export providers and confirm the JSON is version 4 with `providers[].models[]`, `inputModalities`, `outputModalities`, safe `customHeaders[]`, and safe `customBody`.
+- Import a version 4 provider export with model modality metadata and safe advanced config, then confirm imported providers have `hasSecret: false`.
 - Import a version 3 provider export with multiple models and safe advanced config, then confirm imported providers have `hasSecret: false`.
 - Import a version 2 provider export with multiple models and confirm imported providers have `hasSecret: false` and no advanced config.
 - Import an older version 1 provider export and confirm it imports as a single model.
@@ -530,12 +539,15 @@ Before sharing a local beta installer:
 
 ## Known Limits
 
-- Only OpenAI-compatible text chat is supported.
+- Only OpenAI-compatible text chat is supported for real provider testing by default.
 - Streaming support handles text deltas only.
 - Stop/cancel behavior is minimal and may not abort the underlying provider request immediately.
 - Provider Settings supports multi-provider list, add, edit, delete, multiple models per provider, favorite model, Set as current model, and per-model Test Connection flows.
 - API keys are not exported or synced.
-- No file attachments, images, audio, tools, MCP, search, Workspace, forks, or multimodal provider calls.
+- Local file attachments and safe attachment rendering are implemented for the desktop beta candidate.
+- Real-provider image input is not enabled by default.
+- The image capture prototype is loopback-only and intended for synthetic local testing.
+- No OCR, PDF/Office parsing, audio/video input, tools, MCP, search, Workspace, forks, or full multimodal provider calls.
 - Local JSON state is a beta prototype store, not a final database schema.
 - Installers and `rikkadesk.exe` are unsigned unless a signing workflow is added later.
 - Windows 11 Smart App Control may block unsigned private beta builds before the app starts.

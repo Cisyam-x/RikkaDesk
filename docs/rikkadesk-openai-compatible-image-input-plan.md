@@ -110,6 +110,15 @@ Phase 10 P6.5 P0 adds the real-provider manual gate design only:
 - Loopback-only capture remains the only implemented image-send path.
 - Future P6.5 P1 code must receive separate review before implementation.
 
+## P6.6 Implementation Status
+
+Phase 10 P6.6 prepares beta.12 candidate docs and release copy only:
+
+- README, changelog, release draft, and package checklist copy now describe local attachments, model capability metadata, and loopback-only synthetic image capture accurately.
+- Real-provider image input remains disabled.
+- The current stable private tag remains `rikkadesk-v0.1.0-beta.11`; beta.12 is not tagged in P6.6.
+- No code, schema, provider import/export, dependencies, Tauri configuration, Android app, or provider behavior changed.
+
 ## API Shape Options
 
 ### Option A: Chat Completions Content Array
