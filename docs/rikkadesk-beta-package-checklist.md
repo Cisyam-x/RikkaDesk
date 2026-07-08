@@ -310,6 +310,19 @@ Phase 10 P5a smoke checks:
 - Confirm backend `/messages` and `/regenerate` do not call real providers when any non-text message part is present.
 - Confirm `state.v1.json` does not contain file content, base64 payloads, original absolute upload paths, or provider request bodies.
 
+Phase 10 P6.1 design checks:
+
+- Confirm `docs/rikkadesk-openai-compatible-image-input-plan.md` exists.
+- Confirm the recommended prototype path is OpenAI-compatible Chat Completions content array.
+- Confirm Responses API, OpenAI Files API, OCR, PDF parsing, audio input, video input, Workspace, MCP, and tools remain deferred.
+- Confirm the design requires explicit per-send confirmation before any image is sent to a provider.
+- Confirm the design requires in-memory data URLs only and forbids base64 in `state.v1.json`, conversation parts, provider import/export, logs, and errors.
+- Confirm the design limits provider-bound image input to one current-turn PNG/JPEG/WEBP image with a 5 MB limit.
+- Confirm the design keeps GIF, document, PDF, TXT, audio, and video attachments local-only.
+- Confirm the design defers image regenerate support and does not resend historical image attachments.
+- Confirm the design requires a local synthetic capture server before optional manual real-provider testing.
+- Confirm current implementation still does not send attachments to providers.
+
 ## Test Real OpenAI-Compatible Streaming Chat
 
 1. Configure Provider Settings with a real OpenAI-compatible endpoint and a local user-entered API key.

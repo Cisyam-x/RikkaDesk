@@ -92,6 +92,14 @@ Phase 10 P5a adds model capability metadata and attachment send gating:
 - The backend guards `/messages` and `/regenerate` so any non-text message parts are saved locally and answered with a local-only attachment notice instead of calling a real provider.
 - OpenAI-compatible request bodies remain text-only; image input provider calls are still deferred to P6.
 
+Phase 10 P6.1 adds a dedicated OpenAI-compatible image input prototype design:
+
+- The design is documented in `docs/rikkadesk-openai-compatible-image-input-plan.md`.
+- P6.1 does not change code, schema, provider import/export, file APIs, or provider request builders.
+- The recommended prototype path is OpenAI-compatible Chat Completions content array, not Responses API.
+- The design requires IMAGE capability gating, explicit per-send confirmation, in-memory data URLs, and synthetic capture-server validation before any real-provider test.
+- Attachments still are not sent to providers in the current implementation.
+
 ## Phase 10 Goals And Non-Goals
 
 Long-term Phase 10 goals:
@@ -707,6 +715,15 @@ Acceptance:
 - No base64 is stored in state.
 - Text-only models are blocked.
 
+Current P6.1 design decision:
+
+- Start with a design document only.
+- Prefer Chat Completions content array for the prototype.
+- Keep Responses API and OpenAI Files API deferred.
+- Send only the current turn image, never historical images.
+- Defer image regenerate support.
+- Use synthetic capture-server validation before optional manual real-provider testing.
+
 ### P7: Docs / Release Copy / Beta Candidate
 
 Goal:
@@ -760,6 +777,7 @@ P5:
 
 P6:
 
+- `docs/rikkadesk-openai-compatible-image-input-plan.md`
 - `web-ui/src-tauri/src/mock_api.rs`
 - Provider model capability code.
 - OpenAI-compatible content part builder.
