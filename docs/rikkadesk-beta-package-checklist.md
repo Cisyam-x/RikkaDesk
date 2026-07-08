@@ -4,9 +4,9 @@ RikkaDesk is an unofficial desktop derivative / experiment based on RikkaHub. Th
 
 Do not paste real API keys into documentation, commit messages, terminal transcripts, screenshots, or issue comments.
 
-Current pushed private beta tag: `rikkadesk-v0.1.0-beta.12`.
+Current private hotfix tag: `rikkadesk-v0.1.0-beta.13`.
 
-Current hotfix candidate tag, pending explicit confirmation: `rikkadesk-v0.1.0-beta.13`.
+Previous private beta tag: `rikkadesk-v0.1.0-beta.12`.
 
 ## Current Beta Scope
 
@@ -28,7 +28,7 @@ Included:
 - Safe image/document message rendering for managed file URLs.
 - Provider model capability metadata with TEXT and IMAGE input markers.
 - Loopback-only synthetic image capture prototype for one current-turn PNG/JPEG/WEBP image.
-- beta.13 hotfix candidate fixes for Tauri production local image attachment preview/rendering and file picker stability.
+- beta.13 hotfix fixes for Tauri production local image attachment preview/rendering and file picker stability.
 
 Not included:
 
@@ -40,9 +40,9 @@ Not included:
 - SQLite, sync, multi-device backup, or production-grade migration tooling.
 - Any change to the upstream Android `app` module.
 
-## beta.13 Hotfix Candidate Scope
+## beta.13 Hotfix Scope
 
-The beta.13 hotfix candidate is a narrow follow-up to beta.12. The `rikkadesk-v0.1.0-beta.12` tag already exists and must not be moved, deleted, or overwritten.
+The beta.13 hotfix is a narrow follow-up to beta.12. The `rikkadesk-v0.1.0-beta.13` tag has been created and pushed. The `rikkadesk-v0.1.0-beta.12` tag already exists and must not be moved, deleted, or overwritten.
 
 Fixed over beta.12:
 
@@ -427,7 +427,7 @@ beta.13 hotfix live UI smoke checks:
 - Select a TEXT-only model, attach a synthetic PNG, and confirm the frontend blocks send before `/messages`.
 - Try unsupported SVG and HTML files and confirm the UI shows a friendly unsupported-format error instead of silently doing nothing.
 - Confirm `state.v1.json` does not contain `base64`, `image_url`, `input_image`, provider request bodies, local absolute paths, or key/header values.
-- Confirm no beta.13 tag is created during preflight.
+- Confirm beta.13 post-tag checks do not move or overwrite the tag.
 
 ## Test Real OpenAI-Compatible Streaming Chat
 
@@ -578,7 +578,7 @@ Before sharing a local beta installer:
 - Run `pnpm run desktop:build` from a clean working tree.
 - Keep hashes and artifact paths in the private beta notes.
 - Tell testers not to share logs containing prompts or local data.
-- For beta.13, verify `rikkadesk-v0.1.0-beta.12` still points to its original commit and create `rikkadesk-v0.1.0-beta.13` only after explicit confirmation.
+- For beta.13, verify `rikkadesk-v0.1.0-beta.12` still points to its original commit and `rikkadesk-v0.1.0-beta.13` points to the accepted hotfix docs commit.
 
 ## Known Limits
 

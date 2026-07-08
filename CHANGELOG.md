@@ -6,11 +6,11 @@ This changelog tracks the RikkaDesk desktop work in this fork. It does not repla
 
 ## 0.1.0 Private Beta Line
 
-The current pushed private beta tag is `rikkadesk-v0.1.0-beta.12`. The `beta/0.1.0` branch may contain later documentation, feature work, or hotfix candidates after that tag.
+The current private hotfix tag is `rikkadesk-v0.1.0-beta.13`. The `beta/0.1.0` branch may contain later documentation, feature work, or hotfix candidates after that tag.
 
 This beta line is not a public GitHub Release.
 
-### Unreleased / beta.13 hotfix candidate
+### `rikkadesk-v0.1.0-beta.13` - Attachment Rendering Hotfix
 
 Fixed:
 
@@ -26,7 +26,7 @@ Unchanged:
 - Local state remains `schemaVersion: 6`.
 - Provider import/export remains version 4.
 - The app/package version remains `0.1.0`.
-- `rikkadesk-v0.1.0-beta.12` must not be moved; beta.13 should be a new hotfix tag if accepted.
+- `rikkadesk-v0.1.0-beta.12` must not be moved; beta.13 is a new hotfix tag.
 - This is not a public GitHub Release.
 
 ### `rikkadesk-v0.1.0-beta.12` - Files, Attachments, And Loopback Image Capture Candidate
@@ -217,8 +217,9 @@ The `beta/0.1.0` branch included these follow-up updates after the beta.4 featur
 - Beta release copy hotfix, tagged as `rikkadesk-v0.1.0-beta.8`.
 - Provider multi-model state, UI, and import/export v2 work, tagged or planned as `rikkadesk-v0.1.0-beta.9`.
 - Provider advanced request config and import/export v3 work, tagged as `rikkadesk-v0.1.0-beta.10`.
-- Markdown rendering polish, mhchem support, raw HTML hardening, and Workbench preview sandbox hardening, planned as `rikkadesk-v0.1.0-beta.11`.
-- Local attachment skeleton, safe attachment rendering, model capability metadata, and loopback-only synthetic image capture prototype are in the beta.12 candidate branch, not yet tagged.
+- Markdown rendering polish, mhchem support, raw HTML hardening, and Workbench preview sandbox hardening, tagged as `rikkadesk-v0.1.0-beta.11`.
+- Local attachment skeleton, safe attachment rendering, model capability metadata, and loopback-only synthetic image capture prototype, tagged as `rikkadesk-v0.1.0-beta.12`.
+- Local image attachment rendering and file picker stability hotfix, tagged as `rikkadesk-v0.1.0-beta.13`.
 
 ## Security
 
@@ -233,7 +234,7 @@ The `beta/0.1.0` branch included these follow-up updates after the beta.4 featur
 
 - Only OpenAI-compatible text chat is supported.
 - Gemini, Claude, Anthropic, Vertex, and provider-specific protocols are not implemented.
-- Local file attachments and safe attachment rendering exist in the beta.12 candidate branch, but real-provider image input is not enabled by default.
+- Local file attachments and safe attachment rendering exist in the beta.13 hotfix line, but real-provider image input is not enabled by default.
 - One provider can contain multiple text models and model capability metadata, but per-model secrets, per-model Base URLs, tools, OCR/PDF parsing, and full multimodal provider requests are not implemented.
 - Stop/cancel behavior is minimal and may not abort the underlying provider HTTP request immediately.
 - JSON state is a beta prototype store, not the final database architecture.

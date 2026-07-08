@@ -1,6 +1,6 @@
-# RikkaDesk beta.13 Hotfix Candidate Release Draft
+# RikkaDesk beta.13 Hotfix Private Release Draft
 
-This document is a private beta candidate draft for RikkaDesk. Do not publish a public GitHub Release from this phase.
+This document is a private beta hotfix draft for RikkaDesk. Do not publish a public GitHub Release from this phase.
 
 ## Release Title Suggestion
 
@@ -10,19 +10,19 @@ RikkaDesk 0.1.0 Beta 13 - Private Windows Desktop Hotfix Candidate
 
 ## Tag Suggestion
 
-Current pushed private beta tag:
-
-```text
-rikkadesk-v0.1.0-beta.12
-```
-
-Candidate hotfix tag, pending explicit confirmation:
+Current private hotfix tag:
 
 ```text
 rikkadesk-v0.1.0-beta.13
 ```
 
-The `rikkadesk-v0.1.0-beta.12` tag already exists and must not be moved, deleted, or overwritten. If accepted, beta.13 should be created as a new hotfix tag pointing at the reviewed hotfix commit. Do not publish a public GitHub Release from this draft.
+Previous private beta tag:
+
+```text
+rikkadesk-v0.1.0-beta.12
+```
+
+The `rikkadesk-v0.1.0-beta.13` tag has been created and pushed. The `rikkadesk-v0.1.0-beta.12` tag already exists and must not be moved, deleted, or overwritten. Do not publish a public GitHub Release from this draft.
 
 ## Version Strategy
 
@@ -34,7 +34,7 @@ Current version files:
 Recommendation:
 
 - Keep the internal package version as `0.1.0` for this private beta line.
-- Use `RikkaDesk 0.1.0 Beta 13 hotfix candidate` in draft notes and private tester instructions.
+- Use `RikkaDesk 0.1.0 Beta 13 hotfix` in draft notes and private tester instructions.
 - Keep beta labels in Git tags and release notes unless the Windows bundler version strategy is explicitly changed later.
 - Do not publish a public prerelease until installer signing, support scope, and license obligations are reviewed.
 
@@ -46,7 +46,7 @@ Reasoning:
 
 ## Draft Release Notes
 
-RikkaDesk is an unofficial desktop derivative / experiment based on RikkaHub. This private beta candidate packages the existing `web-ui` into a Windows desktop app and adds a local desktop API layer for basic OpenAI-compatible text chat testing plus local attachment validation.
+RikkaDesk is an unofficial desktop derivative / experiment based on RikkaHub. This private beta hotfix packages the existing `web-ui` into a Windows desktop app and adds a local desktop API layer for basic OpenAI-compatible text chat testing plus local attachment validation.
 
 This beta includes:
 
@@ -267,7 +267,7 @@ Recommended private beta flow:
 1. Develop in phase branches.
 2. Merge accepted phase PRs into `beta/0.1.0`.
 3. Create private beta tags only for feature-stable checkpoints.
-4. Keep `rikkadesk-v0.1.0-beta.12` unchanged. Create `rikkadesk-v0.1.0-beta.13` only after the beta.13 hotfix candidate is accepted and a separate tag step is requested.
+4. Keep `rikkadesk-v0.1.0-beta.12` unchanged and keep `rikkadesk-v0.1.0-beta.13` pointing at the accepted beta.13 hotfix docs commit.
 5. Do not publish a public GitHub Release until signing, support scope, and license obligations are reviewed.
 
 Do not force-push `main`, `master`, or `beta/0.1.0`.

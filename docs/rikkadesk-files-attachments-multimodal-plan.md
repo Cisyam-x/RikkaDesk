@@ -4,10 +4,10 @@ Review date: 2026-07-07
 
 This document records the Phase 10 P1 safety design for files, attachments, and future multimodal input in RikkaDesk desktop. It is a design document only. It does not implement file upload, file preview, OCR, PDF parsing, multimodal provider calls, tools, Workspace, schema migration, or Tauri configuration changes.
 
-Current recommended private beta tag:
+Current private hotfix tag:
 
 ```text
-rikkadesk-v0.1.0-beta.11
+rikkadesk-v0.1.0-beta.13
 ```
 
 ## Background And Current State
@@ -139,11 +139,11 @@ Phase 10 P6.5 P0 adds the real-provider image manual gate design:
 - Loopback-only capture remains the only implemented image-send path.
 - Future real-provider image sending requires a separate P6.5 P1 code review and an explicit manual gate.
 
-Phase 10 P6.6 prepares beta.12 candidate documentation and release copy:
+Phase 10 P6.6 prepared beta.12 documentation and release copy, followed by the beta.13 hotfix tag:
 
 - README, changelog, release draft, and package checklist now describe the Phase 10 local attachment skeleton and loopback-only capture prototype.
 - The docs explicitly avoid claiming full multimodal support or real-provider image input.
-- The current stable private tag remains `rikkadesk-v0.1.0-beta.11`; beta.12 is not tagged by P6.6.
+- `rikkadesk-v0.1.0-beta.12` was tagged for the Phase 10 package candidate, and `rikkadesk-v0.1.0-beta.13` is the current private hotfix tag for local image attachment rendering and file picker stability.
 - No code, schema, provider import/export, dependency, Tauri, Android, SecretStore, or file API behavior changes are made in P6.6.
 
 ## Phase 10 Goals And Non-Goals

@@ -1,18 +1,18 @@
 # RikkaDesk beta.13 Hotfix Private Tester Handoff
 
-This note is for private testers only. RikkaDesk beta.13 is a hotfix candidate for the beta.12 private package line. It is not a public GitHub Release and is not a production-ready release.
+This note is for private testers only. RikkaDesk beta.13 is the current private hotfix tag for the beta.12 private package line. It is not a public GitHub Release and is not a production-ready release.
 
 ## Version Information
 
 - App: RikkaDesk
 - App version: 0.1.0
-- Candidate tag: `rikkadesk-v0.1.0-beta.13`
+- Current hotfix tag: `rikkadesk-v0.1.0-beta.13`
 - Previous private tag: `rikkadesk-v0.1.0-beta.12`
 - GitHub Release: not published
 - Public release: no
 - Installer signing: unsigned
 
-The `rikkadesk-v0.1.0-beta.12` tag must not be moved, deleted, or overwritten. If this hotfix is accepted, beta.13 should be created as a new tag after explicit confirmation.
+The `rikkadesk-v0.1.0-beta.13` tag has been created and pushed. The `rikkadesk-v0.1.0-beta.12` tag must not be moved, deleted, or overwritten.
 
 ## Hotfix Scope
 
@@ -31,7 +31,7 @@ beta.13 fixes the attachment smoke-test blockers found after beta.12:
 - Local state remains `schemaVersion: 6`.
 - Provider import/export remains version 4.
 - The app/package version remains `0.1.0`.
-- No public GitHub Release is created from this hotfix candidate.
+- No public GitHub Release is created from this hotfix tag.
 
 ## Recommended Test Focus
 
@@ -62,4 +62,4 @@ Required smoke checks:
 
 ## Short Message For Testers
 
-RikkaDesk 0.1.0 beta.13 is a private hotfix candidate for beta.12 attachment testing. It fixes local image preview/rendering and file picker reliability in the Windows desktop build. It is still unsigned, still private, and still does not enable real-provider image input. Use synthetic files for attachment tests and do not share API keys, logs with private content, or `mock-api/secrets/*.bin`.
+RikkaDesk 0.1.0 beta.13 is the current private hotfix tag for beta.12 attachment testing. It fixes local image preview/rendering and file picker reliability in the Windows desktop build. It is still unsigned, still private, and still does not enable real-provider image input. Use synthetic files for attachment tests and do not share API keys, logs with private content, or `mock-api/secrets/*.bin`.
