@@ -238,6 +238,10 @@ Use this checklist before any private handoff or public release decision.
 - [ ] Uninstall the app.
 - [ ] Document whether app data is retained after uninstall.
 - [ ] If app data is retained, document manual cleanup instructions for private testers.
+- [ ] Confirm manual app data cleanup starts only after RikkaDesk is closed.
+- [ ] Confirm no `RikkaDesk` process is running before deleting `%APPDATA%\com.cisyamx.rikkadesk`.
+- [ ] Confirm cleanup docs warn that deleting app data removes local provider keys.
+- [ ] Confirm `mock-api/secrets/*.bin` and app data backups are never shared, uploaded, sent to Codex / ChatGPT, or copied into the repository.
 
 ### Security Search
 

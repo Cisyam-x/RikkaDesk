@@ -123,7 +123,7 @@ Use Windows Settings:
 
 Or use the uninstaller created by the NSIS package in the install directory.
 
-Uninstalling the app may leave user data and encrypted local secret blobs in the app data directory. That is normal for many desktop apps, but beta testers should know how to clear it manually.
+Uninstalling the app may leave user data and encrypted local secret blobs in the app data directory. That is expected for the current beta and should not be treated as an uninstall failure. Whether the installer should automatically remove app data is a later release policy decision.
 
 ## App Data Directory
 
@@ -143,6 +143,42 @@ Important files:
 
 - `mock-api/state.v1.json`
 - `mock-api/secrets/*.bin`
+
+Before manually cleaning app data:
+
+- Exit RikkaDesk first.
+- Confirm no `RikkaDesk` process is still running.
+- Do not delete app data while RikkaDesk is running.
+- Remember that deleting app data removes local provider keys and you will need to enter them again.
+
+Safe process check:
+
+```powershell
+Get-Process RikkaDesk -ErrorAction SilentlyContinue
+```
+
+Direct cleanup, without reading secret blob contents:
+
+```powershell
+$AppData = Join-Path $env:APPDATA "com.cisyamx.rikkadesk"
+if (Test-Path -LiteralPath $AppData) {
+  Remove-Item -LiteralPath $AppData -Recurse -Force
+}
+```
+
+Backup instead of delete:
+
+```powershell
+$AppData = Join-Path $env:APPDATA "com.cisyamx.rikkadesk"
+$Backup = Join-Path $env:APPDATA ("com.cisyamx.rikkadesk.backup." + (Get-Date -Format "yyyyMMdd-HHmmss"))
+
+if (Test-Path -LiteralPath $AppData) {
+  Rename-Item -LiteralPath $AppData -NewName (Split-Path -Leaf $Backup)
+  Write-Host "Backed up app data to: $Backup"
+}
+```
+
+The backup directory may still contain encrypted secret blobs under `mock-api/secrets/*.bin`. Do not share backup directories, upload them to GitHub issues, send them to Codex / ChatGPT, or copy them into the repository.
 
 ## `state.v1.json`
 
@@ -191,7 +227,7 @@ It must not contain:
 
 The JSON state stores only a `secretRef`. The Rust backend uses that `secretRef` to find the encrypted local secret. The UI should only show `hasSecret: true` or `hasSecret: false`; it must never display the saved key.
 
-Do not copy these files into the repository, README, logs, screenshots, or issue reports.
+Do not copy these files into the repository, README, logs, screenshots, issue reports, Codex prompts, or ChatGPT conversations. Do not read, print, parse, or share their contents during beta verification.
 
 ## Configure Provider Settings
 

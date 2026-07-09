@@ -276,7 +276,11 @@ Before sharing any private beta installer:
 - Confirm `state.v1.json` does not contain secret values.
 - Search repository and app data for the local test key fragment.
 - Uninstall RikkaDesk.
-- Confirm whether app data remains and tell testers how to clear it manually.
+- Confirm whether app data remains.
+- If app data cleanup is needed, close RikkaDesk first and confirm no `RikkaDesk` process remains.
+- Use `$env:APPDATA\com.cisyamx.rikkadesk` as the app data root and `$env:APPDATA\com.cisyamx.rikkadesk\mock-api` as the local mock API data root.
+- Tell testers that deleting app data also deletes local provider keys and they will need to enter those keys again.
+- Remind testers that `mock-api/secrets/*.bin` files and app data backups must not be shared, uploaded to GitHub issues, sent to Codex / ChatGPT, or copied into the repository.
 
 ## Merge And Release Draft
 

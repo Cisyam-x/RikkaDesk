@@ -163,10 +163,12 @@ Current docs already state:
 - `mock-api/state.v1.json` is non-sensitive state.
 - `mock-api/secrets/*.bin` stores encrypted secret blobs and must not be shared.
 
-Small doc gap:
+P1-B cleanup polish:
 
 - The uninstall/manual cleanup section should explicitly say to close RikkaDesk before manually deleting app data.
-- This should be a later docs/checklist polish, not a Tauri metadata change.
+- It should identify `%APPDATA%\com.cisyamx.rikkadesk` as the app data root and `%APPDATA%\com.cisyamx.rikkadesk\mock-api` as the local mock API data root.
+- It should warn that `mock-api/secrets/*.bin` files and app data backups may contain encrypted local secret blobs and must not be shared.
+- This remains docs/checklist polish only, not a Tauri metadata change.
 
 ## P1-A Recommendations
 
@@ -211,6 +213,14 @@ Recommended P1-B path:
 2. Add a checklist note that manual app data cleanup must be done only after RikkaDesk is fully closed.
 3. If human confirms publisher/signing identity, prepare a separate metadata implementation PR.
 4. If no identity is confirmed, keep P1-B docs-only and move to P2 signing workflow design.
+
+P1-B conclusion:
+
+- P1-B does not change installer metadata.
+- Publisher/manufacturer remain deferred until signing identity is confirmed.
+- Installer filenames continue to omit beta tags.
+- App/package version remains `0.1.0`.
+- The next recommended phase is P2 signing workflow design.
 
 P1-A conclusion:
 
