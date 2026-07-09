@@ -372,6 +372,7 @@ Goal:
 
 - Decide local signing vs CI signing.
 - Document exact signing commands and secret handling.
+- Use [rikkadesk-phase-11-signing-workflow-design.md](rikkadesk-phase-11-signing-workflow-design.md) as the P2 signing runbook.
 
 Candidate files:
 
