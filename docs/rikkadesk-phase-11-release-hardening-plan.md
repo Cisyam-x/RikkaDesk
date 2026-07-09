@@ -428,6 +428,12 @@ Validation:
 Goal:
 
 - Standardize release candidate handoff notes and artifact hashes.
+- Use [rikkadesk-phase-11-unsigned-artifact-handoff.md](rikkadesk-phase-11-unsigned-artifact-handoff.md) as the unsigned private-beta artifact handoff runbook.
+
+Current split:
+
+- P4-A is docs-only and defines the local handoff directory, build checks, SHA256 template, installer smoke record, security search, and app data cleanup boundaries.
+- P4-B may generate local unsigned artifacts and a completed `SHA256SUMS.txt` outside the repository; those local handoff materials remain uncommitted and are not uploaded to a GitHub Release.
 
 Candidate files:
 
