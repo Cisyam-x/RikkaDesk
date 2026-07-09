@@ -430,6 +430,20 @@ function ChatInputInner({
   const [error, setError] = React.useState<string | null>(null);
   const [dragActive, setDragActive] = React.useState(false);
   const dragDepthRef = React.useRef(0);
+  const attachmentResetKey = React.useMemo(
+    () =>
+      attachments
+        .map((part) => {
+          const fileId = getPartFileId(part);
+          const mime = getManagedFileMime(part.metadata);
+          const url =
+            "url" in part && typeof part.url === "string" ? part.url : "";
+          return `${part.type}:${fileId ?? ""}:${mime ?? ""}:${url}`;
+        })
+        .join("|"),
+    [attachments],
+  );
+  const selectedModelResetKey = selectedModel?.id ?? "";
 
   const isEmpty = value.trim().length === 0 && attachments.length === 0;
 
@@ -449,6 +463,16 @@ function ChatInputInner({
       dragDepthRef.current = 0;
     }
   }, [canUpload]);
+
+  React.useEffect(() => {
+    setError(null);
+    setConfirmImageSendOpen(false);
+  }, [conversation?.id, draftKey]);
+
+  React.useEffect(() => {
+    setError(null);
+    setConfirmImageSendOpen(false);
+  }, [attachmentResetKey, selectedModelResetKey]);
 
   const uploadFiles = React.useCallback(
     async (fileList: FileList | globalThis.File[] | null) => {
@@ -895,6 +919,7 @@ function ChatInputInner({
                         }
 
                         await onRemovePart(index, part);
+                        setError(null);
                       }}
                       type="button"
                     >
