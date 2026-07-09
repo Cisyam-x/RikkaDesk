@@ -4,7 +4,9 @@ RikkaDesk is an unofficial desktop derivative / experiment based on RikkaHub. Th
 
 Do not paste real API keys into documentation, commit messages, terminal transcripts, screenshots, or issue comments.
 
-Current feature-stable private beta tag: `rikkadesk-v0.1.0-beta.11`.
+Current private hotfix tag: `rikkadesk-v0.1.0-beta.13`.
+
+Previous private beta tag: `rikkadesk-v0.1.0-beta.12`.
 
 ## Current Beta Scope
 
@@ -16,18 +18,47 @@ Included:
 - Desktop Provider Settings UI for OpenAI-compatible provider management.
 - Provider list, add/edit/delete provider, multiple models per provider, favorite model updates, Set as current model, and Test Connection.
 - Advanced request config for non-sensitive provider custom headers and safe custom body JSON.
-- Safe provider import/export v3 for multi-model provider metadata and safe advanced request config, with v1/v2 import compatibility.
+- Safe provider import/export v4 for multi-model provider metadata, model capabilities, and safe advanced request config, with v1/v2/v3 import compatibility.
 - Secret references in JSON and encrypted local secret blobs for API keys.
 - OpenAI-compatible text chat with streaming responses.
 - Mock fallback when a real provider is not configured or cannot be used.
+- Local attachment skeleton with managed file metadata.
+- Safe raster image attachments for PNG, JPEG, WEBP, and GIF.
+- TXT/PDF document chips with no inline PDF preview.
+- Safe image/document message rendering for managed file URLs.
+- Provider model capability metadata with TEXT and IMAGE input markers.
+- Loopback-only synthetic image capture prototype for one current-turn PNG/JPEG/WEBP image.
+- beta.13 hotfix fixes for Tauri production local image attachment preview/rendering and file picker stability.
 
 Not included:
 
 - Public GitHub Release publishing.
 - Gemini, Claude, Anthropic, Vertex, or provider-specific protocols.
-- Files, attachments, images, audio, tools, MCP, search, Workspace, forks, or release auto-updates.
+- Real-provider image input by default.
+- Full multimodal provider support.
+- OCR, PDF/Office parsing, audio/video input, tools, MCP, search, Workspace, forks, or release auto-updates.
 - SQLite, sync, multi-device backup, or production-grade migration tooling.
 - Any change to the upstream Android `app` module.
+
+## beta.13 Hotfix Scope
+
+The beta.13 hotfix is a narrow follow-up to beta.12. The `rikkadesk-v0.1.0-beta.13` tag has been created and pushed. The `rikkadesk-v0.1.0-beta.12` tag already exists and must not be moved, deleted, or overwritten.
+
+Fixed over beta.12:
+
+- Local image attachment draft preview and sent-message rendering in Tauri production builds.
+- Managed file URLs from `/api/files/path/{id}` resolve to the actual local mock API URL before image rendering.
+- The hidden file picker input remains stably mounted.
+- Upload detection/upload errors are caught and the file input value is always reset, so the same file can be selected again after delete or failure.
+
+Unchanged:
+
+- Real-provider image input remains disabled.
+- The loopback-only capture path remains the only implemented image-send prototype.
+- Local state remains `schemaVersion: 6`.
+- Provider import/export remains version 4.
+- The app/package version remains `0.1.0`.
+- This is not a public GitHub Release.
 
 ## Version Recommendation
 
@@ -115,11 +146,13 @@ Important files:
 
 ## `state.v1.json`
 
-`state.v1.json` stores non-sensitive local state for the desktop prototype. The filename remains `state.v1.json` even though the JSON payload may contain `schemaVersion: 4`.
+`state.v1.json` stores non-sensitive local state for the desktop prototype. The filename remains `state.v1.json` even though the JSON payload may contain `schemaVersion: 6`.
 
 Phase 8 upgrades provider state from `provider.model` to `provider.models[]`. Old beta.8 or earlier builds should not be started against a schema v3 state file; they may treat the state as unsupported and create a corrupt backup or default state. Back up app data before testing schema migration or moving between beta builds.
 
 Phase 9B upgrades provider state to `schemaVersion: 4` with `providers[].customHeaders` and `providers[].customBody`. Old beta.9 or earlier builds should not be started against a schema v4 state file; they may not understand the provider shape. Back up app data before testing schema migration or moving between beta builds.
+
+Phase 10 upgrades local desktop state to `schemaVersion: 5` with managed file metadata for the mock API file skeleton, then `schemaVersion: 6` with provider model capability metadata. Old beta.11 or earlier builds should not be started against schema v5/v6 state files. Use synthetic app data for Phase 10 file tests, or back up and restore real app data before switching builds.
 
 It may contain:
 
@@ -130,8 +163,10 @@ It may contain:
 - provider id, name, type, enabled flag
 - baseUrl
 - model ids and displayNames under `providers[].models[]`
+- model `inputModalities` and `outputModalities`
 - non-sensitive custom headers under `providers[].customHeaders`
 - safe custom body JSON under `providers[].customBody`
+- managed file metadata under `files[]`
 - assistant chatModelId
 - secretRef
 - savedAt
@@ -145,6 +180,10 @@ It must not contain:
 - `x-api-key` value
 - service account private key
 - any other sensitive credential
+- file content
+- base64 file payloads
+- original absolute upload paths
+- OCR text
 
 ## `mock-api/secrets/*.bin`
 
@@ -258,6 +297,138 @@ Workbench preview hardening:
 - Confirm Mermaid preview uses `securityLevel: "strict"`.
 - Confirm remote Mermaid CDN residual risk is documented in `docs/rikkadesk-markdown-rendering-plan.md`.
 
+## Test Local Attachment Skeleton
+
+Use synthetic app data and synthetic fixture files only. Do not use real user files, real API keys, or existing `secrets/*.bin`.
+
+Phase 10 P3 smoke checks:
+
+- Confirm the image picker accepts only PNG, JPEG, WEBP, and GIF.
+- Confirm the document picker accepts only plain text and PDF.
+- Upload a synthetic `hello.txt` and confirm a document chip appears.
+- Upload a synthetic PNG and confirm an image attachment appears.
+- Upload a synthetic PDF and confirm it appears as a document chip only, with no inline PDF preview.
+- Confirm synthetic SVG and HTML files are rejected by the frontend or safely rejected by the backend.
+- Delete a draft attachment chip and confirm `DELETE /api/files/{id}` succeeds.
+- Send a text message with synthetic image/document attachments and confirm the user message keeps the attachment parts.
+- Confirm the mock assistant reply still works and provider requests remain text-only.
+- Confirm `state.v1.json` has `schemaVersion: 5`, contains file metadata, and does not contain file contents, base64 payloads, or original absolute upload paths.
+
+Phase 10 P4 smoke checks:
+
+- Upload a synthetic PNG, send it, and confirm the message renders a safe raster image preview.
+- Delete the underlying synthetic image file and confirm the message shows an unavailable state without crashing.
+- Upload synthetic TXT and PDF files and confirm they render as document chips only.
+- Confirm document chips do not create iframe, object, embed, PDF, Office, HTML, or SVG inline previews.
+- Confirm unsafe legacy image/document URLs are blocked: `data:`, `blob:`, `file:`, `javascript:`, external HTTP(S), arbitrary relative paths, and malformed `/api/files/path/*`.
+- Confirm SVG and HTML are not previewed as active images or documents.
+- Confirm safe document links point only to controlled `/api/files/path/{id}` URLs and keep `target="_blank"` plus `rel="noopener noreferrer"`.
+- Confirm no `dangerouslySetInnerHTML`, iframe, object, or embed is introduced for attachment message parts.
+
+Phase 10 P5a smoke checks:
+
+- Confirm migrating a synthetic schema v5 state writes `schemaVersion: 6`.
+- Confirm file metadata survives the v5 to v6 migration.
+- Confirm existing provider models default to `inputModalities: ["TEXT"]` and `outputModalities: ["TEXT"]`.
+- In Provider Settings, create one text-only model and one model with Image input enabled. Save, close, reopen, and confirm the capability metadata persists.
+- Confirm the model selector/settings payload includes the configured modalities.
+- Export providers and confirm version 4 includes `inputModalities` and `outputModalities` for each model while excluding API keys, `secretRef`, local file metadata, file blobs, base64 payloads, and app data paths.
+- Import a v3 provider export and confirm imported models default to TEXT/TEXT.
+- Import a v4 provider export and confirm IMAGE input metadata is preserved.
+- Select a text-only model, attach a synthetic PNG, and confirm send is blocked before `/messages`.
+- Select an image-capable model, attach a synthetic PNG, and confirm the message is saved locally with a local-only assistant notice.
+- Attach synthetic TXT/PDF documents and confirm they remain local-only.
+- Confirm backend `/messages` and `/regenerate` do not call real providers when any non-text message part is present.
+- Confirm `state.v1.json` does not contain file content, base64 payloads, original absolute upload paths, or provider request bodies.
+
+Phase 10 P6.1 design checks:
+
+- Confirm `docs/rikkadesk-openai-compatible-image-input-plan.md` exists.
+- Confirm the recommended prototype path is OpenAI-compatible Chat Completions content array.
+- Confirm Responses API, OpenAI Files API, OCR, PDF parsing, audio input, video input, Workspace, MCP, and tools remain deferred.
+- Confirm the design requires explicit per-send confirmation before any image is sent to a provider.
+- Confirm the design requires in-memory data URLs only and forbids base64 in `state.v1.json`, conversation parts, provider import/export, logs, and errors.
+- Confirm the design limits provider-bound image input to one current-turn PNG/JPEG/WEBP image with a 5 MB limit.
+- Confirm the design keeps GIF, document, PDF, TXT, audio, and video attachments local-only.
+- Confirm the design defers image regenerate support and does not resend historical image attachments.
+- Confirm the design requires a local synthetic capture server before optional manual real-provider testing.
+- Confirm current implementation still does not send attachments to providers.
+
+Phase 10 P6.2 static checks:
+
+- Confirm text-only builder output still serializes `messages[].content` as a string.
+- Confirm the internal vision builder can serialize Chat Completions content-array messages.
+- Confirm internal `file_id` is not serialized into provider request JSON.
+- Confirm unsupported data URL prefixes are rejected, including GIF, SVG, HTML, local file URLs, managed file URLs, and external HTTP(S) URLs.
+- Confirm no runtime path calls the internal vision builder.
+- Confirm attachment messages still return the local-only attachment notice.
+- Confirm no provider call occurs for non-text message parts.
+- Confirm no image blob is read, no file-derived base64 is generated, and no image request is sent.
+
+Phase 10 P6.3 confirmation UI checks:
+
+- Confirm TEXT-only model plus image attachment is blocked before `/messages`.
+- Confirm TEXT-only model plus image attachment does not open the image confirmation dialog.
+- Confirm IMAGE-capable model plus image attachment opens the confirmation dialog.
+- Confirm Cancel keeps the draft text and attachments and does not call `/messages`.
+- Confirm Continue calls `/messages`; without loopback capture eligibility, the backend still returns the local-only attachment notice.
+- Confirm document-only attachments do not show the image confirmation dialog.
+- Confirm text-only messages do not show the image confirmation dialog.
+- Confirm P6.3 alone did not call the internal vision builder; P6.4 may call it only for loopback capture.
+- Confirm P6.3 alone did not send image requests; P6.4 may send only to loopback capture.
+- Confirm no image blob is read, no file-derived base64 is generated, and no base64 appears in state or logs.
+
+Phase 10 P6.4 synthetic capture-server checks:
+
+- Confirm TEXT-only model plus PNG is blocked before `/messages`.
+- Confirm TEXT-only model plus GIF is also blocked before `/messages`.
+- Confirm IMAGE-capable model plus PNG opens confirmation.
+- Confirm Cancel keeps draft/attachments and capture server receives no request.
+- Confirm Continue sends `/messages` with non-persistent capture intent.
+- Confirm loopback capture server receives one request for `http://127.0.0.1:9999/v1`.
+- Confirm request body has Chat Completions `messages[].content[]` array with text and `image_url` parts.
+- Confirm `image_url.url` starts with `data:image/png;base64,` for the synthetic PNG.
+- Confirm request body does not contain `/api/files/path`, `file://`, Windows paths, storage keys, or `secretRef`.
+- Confirm state does not contain base64, `image_url`, `input_image`, request body, local absolute paths, or storage keys in provider-bound data.
+- Confirm IMAGE-capable GIF does not open capture confirmation, remains local-only, and does not call capture server.
+- Confirm TXT and PDF attachments do not open image confirmation, remain local-only, and do not call capture server.
+- Confirm two provider-bound PNG/JPEG/WEBP images are blocked before `/messages` with a safe one-image prototype error.
+- Confirm non-loopback provider Base URLs are rejected or local-only even after confirmation.
+- Confirm no real provider endpoint or real API key is used.
+
+Phase 10 P6.5 P0 manual gate checks:
+
+- Confirm `docs/rikkadesk-real-provider-image-manual-gate.md` exists.
+- Confirm real-provider image send is still not enabled in code.
+- Confirm loopback-only capture remains the only implemented image-send behavior.
+- Confirm no real-provider test was run.
+- Confirm no real API key appears in docs, logs, commits, or terminal output.
+- Confirm the manual gate requires a synthetic 1x1 PNG only.
+- Confirm the manual gate forbids real user images, documents, GIF, audio, video, regenerate, and historical image resend.
+- Confirm the manual gate does not allow a "do not ask again" option.
+- Confirm the future code gate requires explicit confirmation, IMAGE capability, exactly one PNG/JPEG/WEBP image, a 5 MB limit, and a manual enable gate.
+- Confirm the state/log check protocol excludes `mock-api/secrets/**`.
+- Confirm beta.12 notes do not claim real-provider image input is generally enabled.
+
+beta.13 hotfix live UI smoke checks:
+
+- Use clean synthetic app data; restore real app data after the smoke.
+- Confirm no real API key is used and no `mock-api/secrets/*.bin` file is read.
+- Confirm plain text mock chat still works.
+- Upload a synthetic PNG and confirm the draft chip image renders instead of showing a broken image.
+- Delete the draft PNG and select the same PNG again; confirm upload fires again and the draft chip renders.
+- Send the synthetic PNG with an IMAGE-capable non-loopback provider and confirm the confirmation dialog appears.
+- Continue the confirmation and confirm the backend returns the loopback-only safe block instead of sending to a real provider.
+- Confirm the sent user message renders the local image and does not show "Image unavailable" or "图片附件不可用".
+- Restart RikkaDesk, reopen the conversation, and confirm the local image still renders.
+- Upload/send synthetic JPEG and WEBP images and confirm they render locally with the loopback-only safe block.
+- Upload/send a synthetic GIF and confirm it remains local-only and does not trigger capture confirmation.
+- Upload/send synthetic TXT and PDF files and confirm they render as document chips only.
+- Select a TEXT-only model, attach a synthetic PNG, and confirm the frontend blocks send before `/messages`.
+- Try unsupported SVG and HTML files and confirm the UI shows a friendly unsupported-format error instead of silently doing nothing.
+- Confirm `state.v1.json` does not contain `base64`, `image_url`, `input_image`, provider request bodies, local absolute paths, or key/header values.
+- Confirm beta.13 post-tag checks do not move or overwrite the tag.
+
 ## Test Real OpenAI-Compatible Streaming Chat
 
 1. Configure Provider Settings with a real OpenAI-compatible endpoint and a local user-entered API key.
@@ -370,7 +541,8 @@ Checklist:
 - Favorite and unfavorite a provider model from the model selector.
 - Use Set as current model from Provider Settings.
 - Run Test Connection for a specific model with both a valid test endpoint and an intentionally invalid endpoint when available.
-- Export providers and confirm the JSON is version 3 with `providers[].models[]`, safe `customHeaders[]`, and safe `customBody`.
+- Export providers and confirm the JSON is version 4 with `providers[].models[]`, `inputModalities`, `outputModalities`, safe `customHeaders[]`, and safe `customBody`.
+- Import a version 4 provider export with model modality metadata and safe advanced config, then confirm imported providers have `hasSecret: false`.
 - Import a version 3 provider export with multiple models and safe advanced config, then confirm imported providers have `hasSecret: false`.
 - Import a version 2 provider export with multiple models and confirm imported providers have `hasSecret: false` and no advanced config.
 - Import an older version 1 provider export and confirm it imports as a single model.
@@ -406,15 +578,19 @@ Before sharing a local beta installer:
 - Run `pnpm run desktop:build` from a clean working tree.
 - Keep hashes and artifact paths in the private beta notes.
 - Tell testers not to share logs containing prompts or local data.
+- For beta.13, verify `rikkadesk-v0.1.0-beta.12` still points to its original commit and `rikkadesk-v0.1.0-beta.13` points to the accepted hotfix docs commit.
 
 ## Known Limits
 
-- Only OpenAI-compatible text chat is supported.
+- Only OpenAI-compatible text chat is supported for real provider testing by default.
 - Streaming support handles text deltas only.
 - Stop/cancel behavior is minimal and may not abort the underlying provider request immediately.
 - Provider Settings supports multi-provider list, add, edit, delete, multiple models per provider, favorite model, Set as current model, and per-model Test Connection flows.
 - API keys are not exported or synced.
-- No file attachments, images, audio, tools, MCP, search, Workspace, forks, or multimodal provider calls.
+- Local file attachments and safe attachment rendering are implemented for the desktop beta candidate.
+- Real-provider image input is not enabled by default.
+- The image capture prototype is loopback-only and intended for synthetic local testing.
+- No OCR, PDF/Office parsing, audio/video input, tools, MCP, search, Workspace, forks, or full multimodal provider calls.
 - Local JSON state is a beta prototype store, not a final database schema.
 - Installers and `rikkadesk.exe` are unsigned unless a signing workflow is added later.
 - Windows 11 Smart App Control may block unsigned private beta builds before the app starts.

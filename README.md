@@ -4,12 +4,14 @@ RikkaDesk is an unofficial desktop derivative / experiment based on RikkaHub.
 
 RikkaDesk is a non-official desktop-oriented derivative of [RikkaHub](https://github.com/rikkahub/rikkahub). It currently focuses on making the existing RikkaHub `web-ui` usable as the foundation for a local Windows desktop app.
 
-This repository is in an early staged migration. The current prototype is experimental and is being prepared as a local/private beta, not a public production release. The current feature-stable private beta tag is `rikkadesk-v0.1.0-beta.11`.
+This repository is in an early staged migration. The current prototype is experimental and is being prepared as a local/private beta, not a public production release. The current private beta baseline is `rikkadesk-v0.1.0-beta.13`, and the current private hotfix tag is `rikkadesk-v0.1.0-beta.14`.
+
+The beta.14 hotfix keeps the app/package version at `0.1.0`. It is not a public release and does not have a public GitHub Release.
 
 > [!IMPORTANT]
 > The upstream RikkaHub feature list later in this README describes the Android upstream project. It does not mean every upstream feature is available in the current RikkaDesk desktop beta.
 
-The current RikkaDesk beta includes a local Tauri desktop shell with a Rust desktop API, JSON persistence, conversation and message management, multi-provider and multi-model Provider Settings, advanced non-sensitive provider request config, safe provider import/export, Markdown rendering polish, safer message Markdown link/image handling, and an OpenAI-compatible text streaming chat path.
+The current RikkaDesk beta includes a local Tauri desktop shell with a Rust desktop API, JSON persistence, conversation and message management, multi-provider and multi-model Provider Settings, advanced non-sensitive provider request config, safe provider import/export, Markdown rendering polish, safer message Markdown link/image handling, local file attachment skeletons, safe attachment rendering, and an OpenAI-compatible text streaming chat path.
 
 - Phase 0 is complete: the upstream architecture, `web-ui`, Web Interface, and license were reviewed without code changes.
 - Phase 1 is complete: the `web-ui` can run locally in a browser at `http://localhost:5173/`.
@@ -26,6 +28,8 @@ The current RikkaDesk beta includes a local Tauri desktop shell with a Rust desk
 - Phase 8 P1-P4 are complete: Provider state now supports `providers[].models[]`, Provider Settings can manage multiple models per provider, and provider import/export v2 handles multi-model config while retaining v1 import compatibility.
 - Phase 9B P1-P4 are complete: Provider Settings can save non-sensitive custom headers and safe custom body JSON, Test Connection and Streaming Chat share the safe OpenAI-compatible request builder, and provider import/export v3 handles safe advanced request config while retaining v1/v2 import compatibility.
 - Phase 9C P2-P4 are complete: Markdown table/code overflow polish, KaTeX mhchem chemistry formulas, message Markdown raw HTML hardening, and Workbench preview sandbox hardening are available while Mermaid in normal messages remains disabled/deferred.
+- Phase 10 P2-P6.5 P0 are complete on this branch: the local file API skeleton, attachment upload alignment, safe image/document rendering, model capability metadata, image attachment gating, loopback-only synthetic image capture prototype, and real-provider manual gate documentation are available in the beta.13 hotfix line.
+- Beta 14 UX hotfix clears transient TEXT-only image gating errors when switching chats, entering the welcome/new-chat view, changing attachments, or changing models.
 - Beta 7 hotfix is complete: long OpenAI-compatible streaming responses run in the background after message send/regenerate requests return accepted, avoiding the previous 30-second POST timeout.
 
 Current limitations:
@@ -37,7 +41,10 @@ Current limitations:
 - Message Markdown no longer explicitly enables `rehypeRaw`. Unsafe link schemes such as `javascript:`, `data:`, `file:`, `blob:`, and relative URLs are blocked by default; normal `http:`, `https:`, and `mailto:` links keep `target="_blank"` and `rel="noopener noreferrer"`.
 - Unsafe Markdown image sources are blocked by default.
 - Workbench Mermaid preview uses strict Mermaid security and a narrower iframe sandbox, but it still loads Mermaid from a remote CDN and remains a residual risk to revisit before any public release.
-- File uploads, attachments, images, audio, search, MCP, tools, Workspace, multimodal input, and other P2/P3 endpoints are intentionally deferred.
+- Local file attachments are implemented in the beta.13/beta.14 hotfix line: PNG/JPEG/WEBP/GIF images are local attachments, TXT/PDF uploads are document chips, PDF/TXT remain chip-only, and safe image/document rendering is implemented.
+- Real OpenAI-compatible provider chat remains text-only by default. Real-provider image input is not enabled for ordinary beta testing.
+- IMAGE-capable models can use a loopback-only synthetic image capture prototype for one current-turn PNG/JPEG/WEBP image. This path is for local synthetic testing only; base64 is in memory for the capture request and is not persisted to state, logs, exports, or message parts.
+- OCR, PDF/Office parsing, audio/video input, search, MCP, tools, Workspace, full multimodal provider support, sync, and cloud backup are intentionally deferred.
 - SQLite, sync, advanced migration tooling, and full upstream feature parity are not implemented.
 - JSON remains the beta prototype persistence layer.
 - Windows installers and `rikkadesk.exe` are currently unsigned, so Windows SmartScreen or similar unsigned-app warnings are expected.
@@ -54,10 +61,13 @@ What works in the current prototype:
 - The model selector can show multiple models from the same provider.
 - Provider Settings can set the current model and run a safe Test Connection request for a specific model row.
 - Provider Settings supports Advanced request config for non-sensitive custom headers and safe custom body JSON. Test Connection and Streaming Chat share the same safe request builder; Test Connection forces `max_tokens=1`, while Streaming Chat can preserve allowed custom body fields such as `max_tokens`.
-- Provider Settings can export/import non-sensitive provider metadata; export v3 includes multi-model `models[]` plus safe `customHeaders` / `customBody`, v1/v2 imports remain compatible, and exported files exclude API keys, `secretRef`, tokens, Authorization headers, `x-api-key`, cookies, DPAPI blobs, and local secret-store files, so imported providers require API keys to be re-entered.
+- Provider Settings can export/import non-sensitive provider metadata; export v4 includes multi-model `models[]`, model modality metadata, and safe `customHeaders` / `customBody`, v1/v2/v3 imports remain compatible, and exported files exclude API keys, `secretRef`, tokens, Authorization headers, `x-api-key`, cookies, DPAPI blobs, and local secret-store files, so imported providers require API keys to be re-entered.
 - Provider Settings can save non-sensitive provider config and store API keys through the desktop SecretStore / Windows DPAPI-backed secret mechanism without returning the key to the frontend.
 - Message Markdown supports GFM tables with contained horizontal overflow, inline/block math, KaTeX mhchem chemistry formulas, code blocks, code copy/download/preview actions, and safer link/image handling.
 - Workbench preview uses a narrower iframe sandbox, and Mermaid preview uses `securityLevel: "strict"`; Mermaid in normal message Markdown remains disabled/deferred.
+- Local attachments can be uploaded to the desktop mock API: PNG/JPEG/WEBP/GIF images remain local attachments, TXT/PDF files render as document chips, and unsafe or missing files degrade safely.
+- Provider models carry TEXT/IMAGE input capability metadata. TEXT-only models block image attachments, while IMAGE-capable models may use the loopback-only synthetic capture prototype.
+- The loopback-only synthetic image capture prototype sends at most one current-turn PNG/JPEG/WEBP image to a local capture server after confirmation. It does not enable real-provider image input.
 - If `127.0.0.1:8080` is already in use, the local API falls back to a random loopback port and the frontend reads it through the Tauri command `get_api_base_url`.
 
 ## RikkaDesk Development
@@ -120,6 +130,8 @@ Security and compliance:
 
 - Do not write API keys, tokens, passwords, private user data, or conversation data into source files.
 - Do not put API keys in `state.v1.json`; JSON state should contain only `secretRef` for provider secrets.
+- Do not paste real API keys into docs, issues, screenshots, prompts, or logs. Real keys should only be entered into the local Provider Settings UI by the human tester.
+- Do not copy or share `mock-api/secrets/*.bin`.
 - This project is derived from RikkaHub. Keep the upstream license notice in mind and review [NOTICE.md](NOTICE.md) plus [LICENSE](LICENSE) before using, modifying, or distributing this project.
 - Commercial use or avoiding AGPL obligations may require upstream authorization according to the original RikkaHub license terms.
 

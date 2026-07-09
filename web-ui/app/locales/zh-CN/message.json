@@ -6,6 +6,12 @@
     "deep_thinking": "深度思考",
     "thinking_seconds": "思考了 {{seconds}} 秒"
   },
+  "attachment_part": {
+    "attachment": "附件",
+    "image_alt": "图片附件",
+    "image_blocked": "图片附件已被阻止。",
+    "image_unavailable": "图片附件不可用。"
+  },
   "chat_message": {
     "copy_image": "图片",
     "copy_video": "视频",

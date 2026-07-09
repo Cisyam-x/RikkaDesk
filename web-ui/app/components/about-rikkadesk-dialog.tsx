@@ -13,13 +13,17 @@ import {
 } from "~/components/ui/dialog";
 
 const RIKKADESK_VERSION = "0.1.0";
-const RIKKADESK_FEATURE_TAG = "rikkadesk-v0.1.0-beta.11";
+const RIKKADESK_PRIVATE_BETA_LINE = "Private Beta";
+const RIKKADESK_CURRENT_BASELINE_TAG = "rikkadesk-v0.1.0-beta.13";
+const RIKKADESK_CURRENT_HOTFIX_TAG = "rikkadesk-v0.1.0-beta.14";
+const RIKKADESK_CURRENT_BUILD = "beta.14 UX hotfix";
 
 const SUPPORT_KEYS = [
   "openai_streaming",
   "conversation_management",
   "provider_settings",
   "provider_multi_model",
+  "model_switching_favorites",
   "provider_advanced_request_config",
   "test_connection",
   "provider_import_export",
@@ -28,15 +32,25 @@ const SUPPORT_KEYS = [
   "mhchem_chemistry",
   "markdown_link_image_hardening",
   "workbench_preview_sandbox",
+  "local_attachment_skeleton",
+  "local_image_attachments",
+  "document_chips",
+  "model_capabilities",
+  "text_only_image_blocking",
+  "loopback_image_capture",
 ] as const;
 
 const UNSUPPORTED_KEYS = [
-  "files",
-  "media",
-  "search",
-  "tools",
+  "real_provider_image_input",
+  "full_multimodal_provider",
+  "ocr",
+  "pdf_office_parsing",
+  "audio_video_input",
   "workspace",
-  "multimodal",
+  "tools_search",
+  "auto_update",
+  "code_signing",
+  "public_release_support",
 ] as const;
 
 const DOC_PATHS = [
@@ -80,11 +94,31 @@ export function AboutRikkaDeskDialog({ open, onOpenChange }: AboutRikkaDeskDialo
               </div>
               <div>
                 <dt className="text-xs font-medium text-muted-foreground">
-                  {t("about_rikkadesk.feature_tag_label")}
+                  {t("about_rikkadesk.private_line_label")}
+                </dt>
+                <dd className="mt-1 font-mono text-foreground">{RIKKADESK_PRIVATE_BETA_LINE}</dd>
+              </div>
+              <div>
+                <dt className="text-xs font-medium text-muted-foreground">
+                  {t("about_rikkadesk.current_baseline_label")}
                 </dt>
                 <dd className="mt-1 break-all font-mono text-foreground">
-                  {RIKKADESK_FEATURE_TAG}
+                  {RIKKADESK_CURRENT_BASELINE_TAG}
                 </dd>
+              </div>
+              <div>
+                <dt className="text-xs font-medium text-muted-foreground">
+                  {t("about_rikkadesk.current_hotfix_tag_label")}
+                </dt>
+                <dd className="mt-1 break-all font-mono text-foreground">
+                  {RIKKADESK_CURRENT_HOTFIX_TAG}
+                </dd>
+              </div>
+              <div>
+                <dt className="text-xs font-medium text-muted-foreground">
+                  {t("about_rikkadesk.current_build_label")}
+                </dt>
+                <dd className="mt-1 font-mono text-foreground">{RIKKADESK_CURRENT_BUILD}</dd>
               </div>
             </dl>
           </section>

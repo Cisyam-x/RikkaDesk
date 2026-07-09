@@ -6,9 +6,87 @@ This changelog tracks the RikkaDesk desktop work in this fork. It does not repla
 
 ## 0.1.0 Private Beta Line
 
-The current feature-stable private beta tag is planned as `rikkadesk-v0.1.0-beta.11`. The `beta/0.1.0` branch may contain later documentation or feature work after that tag.
+The current private beta baseline is `rikkadesk-v0.1.0-beta.13`, and the current private hotfix tag is `rikkadesk-v0.1.0-beta.14`.
 
 This beta line is not a public GitHub Release.
+
+### `rikkadesk-v0.1.0-beta.14` - UX Hotfix
+
+Status:
+
+- Private hotfix tag for the beta.14 UX copy and composer validation fix.
+- `rikkadesk-v0.1.0-beta.13` remains the current private beta baseline and must not be moved.
+- This is not a public GitHub Release.
+
+Fixed:
+
+- Clear the TEXT-only image attachment validation error when switching conversations, entering the welcome/new-chat view, changing attachments, or changing models.
+- Avoid carrying the composer red validation message from one chat context into another.
+
+Updated:
+
+- Refresh About RikkaDesk copy for the beta.14 hotfix line.
+- Show `rikkadesk-v0.1.0-beta.13` as the current private baseline and `beta.14 UX hotfix` as the current build.
+- Move local files/attachments and local image attachments into Current support.
+- Clarify that real-provider image input is still not enabled by default, while local PNG/JPEG/WEBP/GIF image attachments are supported.
+
+Unchanged:
+
+- Real-provider image input remains disabled by default.
+- The loopback-only capture path remains the only implemented image-send prototype.
+- Local state remains `schemaVersion: 6`.
+- Provider import/export remains version 4.
+- The app/package version remains `0.1.0`.
+
+### `rikkadesk-v0.1.0-beta.13` - Attachment Rendering Hotfix
+
+Fixed:
+
+- Fix local image attachment draft preview and sent-message rendering in Tauri production builds.
+- Resolve managed file URLs from `/api/files/path/{id}` to the actual local mock API URL before image rendering.
+- Keep the hidden file picker input stably mounted so repeated upload attempts do not silently lose the file input.
+- Catch upload detection/upload errors and always reset the file input value, allowing the same file to be selected again after delete or failure.
+
+Unchanged:
+
+- Real-provider image input remains disabled.
+- The loopback-only capture path remains the only implemented image-send prototype.
+- Local state remains `schemaVersion: 6`.
+- Provider import/export remains version 4.
+- The app/package version remains `0.1.0`.
+- `rikkadesk-v0.1.0-beta.12` must not be moved; beta.13 is a new hotfix tag.
+- This is not a public GitHub Release.
+
+### `rikkadesk-v0.1.0-beta.12` - Files, Attachments, And Loopback Image Capture Candidate
+
+Added:
+
+- Add a local attachment skeleton for managed files.
+- Add safe PNG/JPEG/WEBP/GIF image attachments and TXT/PDF document chips.
+- Add safe image/document message rendering for managed file URLs.
+- Add provider model capability metadata with TEXT and IMAGE input markers.
+- Add IMAGE-capable model confirmation UI.
+- Add a loopback-only synthetic image capture prototype for one current-turn PNG/JPEG/WEBP image.
+- Add real-provider image manual gate documentation.
+
+Changed:
+
+- Provider import/export is version 4 with model modality metadata.
+- Local state schema is 6.
+- Attachment workflows are documented as local-first and provider-safe.
+
+Security:
+
+- File blobs are stored under app data and referenced by managed file IDs.
+- State must not contain file contents, base64 payloads, original absolute paths, provider request bodies, or API keys.
+- Loopback capture keeps data URLs in memory for the request only and does not persist them.
+- Real-provider image input remains disabled unless a later manual gate implementation is reviewed.
+
+Known limits:
+
+- Real-provider image input is not enabled in the beta.12 default scope.
+- OCR, PDF/Office parsing, audio/video input, Workspace, MCP/tools, search, and full multimodal provider support remain unsupported.
+- Installers are unsigned.
 
 ### `rikkadesk-v0.1.0-beta.11` - Markdown Rendering Hardening
 
@@ -167,7 +245,9 @@ The `beta/0.1.0` branch included these follow-up updates after the beta.4 featur
 - Beta release copy hotfix, tagged as `rikkadesk-v0.1.0-beta.8`.
 - Provider multi-model state, UI, and import/export v2 work, tagged or planned as `rikkadesk-v0.1.0-beta.9`.
 - Provider advanced request config and import/export v3 work, tagged as `rikkadesk-v0.1.0-beta.10`.
-- Markdown rendering polish, mhchem support, raw HTML hardening, and Workbench preview sandbox hardening, planned as `rikkadesk-v0.1.0-beta.11`.
+- Markdown rendering polish, mhchem support, raw HTML hardening, and Workbench preview sandbox hardening, tagged as `rikkadesk-v0.1.0-beta.11`.
+- Local attachment skeleton, safe attachment rendering, model capability metadata, and loopback-only synthetic image capture prototype, tagged as `rikkadesk-v0.1.0-beta.12`.
+- Local image attachment rendering and file picker stability hotfix, tagged as `rikkadesk-v0.1.0-beta.13`.
 
 ## Security
 
@@ -182,8 +262,8 @@ The `beta/0.1.0` branch included these follow-up updates after the beta.4 featur
 
 - Only OpenAI-compatible text chat is supported.
 - Gemini, Claude, Anthropic, Vertex, and provider-specific protocols are not implemented.
-- Files, attachments, images, audio, tools, MCP, search, Workspace, forks, and multimodal requests are not implemented.
-- One provider can contain multiple text models, but per-model secrets, per-model Base URLs, tools, and multimodal abilities are not implemented.
+- Local file attachments and safe attachment rendering exist in the beta.13 hotfix line, but real-provider image input is not enabled by default.
+- One provider can contain multiple text models and model capability metadata, but per-model secrets, per-model Base URLs, tools, OCR/PDF parsing, and full multimodal provider requests are not implemented.
 - Stop/cancel behavior is minimal and may not abort the underlying provider HTTP request immediately.
 - JSON state is a beta prototype store, not the final database architecture.
 - Windows installers are unsigned.

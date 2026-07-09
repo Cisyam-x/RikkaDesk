@@ -23,6 +23,7 @@ export interface UploadedFileDto {
   url: string;
   fileName: string;
   mime: string;
+  sizeBytes?: number;
   size: number;
 }
 

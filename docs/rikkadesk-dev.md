@@ -244,6 +244,6 @@ Recommended next steps:
 
 - Keep the mock fallback as a protocol safety net while hardening the real provider path.
 - Verify unsigned Windows installer behavior with local beta testers.
-- Keep `rikkadesk-v0.1.0-beta.11` as the current feature-stable private beta tag once Phase 9C is validated.
+- Treat `rikkadesk-v0.1.0-beta.13` as the current private hotfix tag after the Phase 10 attachment rendering hotfix.
 - Decide whether a future public prerelease should use `0.1.0` or a beta label in release notes/artifact naming.
 - Keep P2/P3 features deferred until provider settings, persistence, and streaming behavior are stable.

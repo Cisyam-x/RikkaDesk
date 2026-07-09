@@ -6,6 +6,12 @@
     "deep_thinking": "Deep Thinking",
     "thinking_seconds": "Thought for {{seconds}} seconds"
   },
+  "attachment_part": {
+    "attachment": "Attachment",
+    "image_alt": "Image attachment",
+    "image_blocked": "Image attachment is blocked.",
+    "image_unavailable": "Image attachment is unavailable."
+  },
   "chat_message": {
     "copy_image": "Image",
     "copy_video": "Video",

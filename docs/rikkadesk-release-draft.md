@@ -1,22 +1,34 @@
-# RikkaDesk 0.1.0 Beta 11 Release Draft
+# RikkaDesk beta.14 UX Hotfix Private Release Draft
 
-This document is a private release draft for RikkaDesk. Do not publish a public GitHub Release from this phase.
+This document is a private beta hotfix draft for RikkaDesk. Do not publish a public GitHub Release from this phase.
 
 ## Release Title Suggestion
 
 ```text
-RikkaDesk 0.1.0 Beta 11 - Private Windows Desktop Candidate
+RikkaDesk 0.1.0 Beta 14 - Private Windows Desktop UX Hotfix
 ```
 
 ## Tag Suggestion
 
-Current feature-stable private beta tag:
+Current private beta baseline:
 
 ```text
-rikkadesk-v0.1.0-beta.11
+rikkadesk-v0.1.0-beta.13
 ```
 
-The `beta/0.1.0` branch should use this tag after Phase 9C Markdown rendering and Workbench preview hardening testing is accepted. Do not publish a public GitHub Release from this draft.
+Current private hotfix tag:
+
+```text
+rikkadesk-v0.1.0-beta.14
+```
+
+Previous private beta tag:
+
+```text
+rikkadesk-v0.1.0-beta.12
+```
+
+The `rikkadesk-v0.1.0-beta.13` baseline tag must not be moved, deleted, or overwritten. `rikkadesk-v0.1.0-beta.14` is the beta.14 private hotfix tag. Do not publish a public GitHub Release from this draft.
 
 ## Version Strategy
 
@@ -28,7 +40,7 @@ Current version files:
 Recommendation:
 
 - Keep the internal package version as `0.1.0` for this private beta line.
-- Use `RikkaDesk 0.1.0 Beta 11` in release notes and private tester instructions.
+- Use `RikkaDesk 0.1.0 Beta 14 UX hotfix` in draft notes and private tester instructions.
 - Keep beta labels in Git tags and release notes unless the Windows bundler version strategy is explicitly changed later.
 - Do not publish a public prerelease until installer signing, support scope, and license obligations are reviewed.
 
@@ -40,9 +52,33 @@ Reasoning:
 
 ## Draft Release Notes
 
-RikkaDesk is an unofficial desktop derivative / experiment based on RikkaHub. This private beta packages the existing `web-ui` into a Windows desktop app and adds a local desktop API layer for basic OpenAI-compatible text chat testing.
+RikkaDesk is an unofficial desktop derivative / experiment based on RikkaHub. This private beta hotfix packages the existing `web-ui` into a Windows desktop app and adds a local desktop API layer for basic OpenAI-compatible text chat testing plus local attachment validation.
 
 This beta includes:
+
+Beta.14 UX hotfix delta over beta.13:
+
+- Clear the TEXT-only image attachment validation error when switching conversations, entering the welcome/new-chat view, changing attachments, or changing models.
+- Keep TEXT-only image attachment gating intact while preventing the red composer validation message from leaking across chat contexts.
+- Refresh About RikkaDesk copy to show `rikkadesk-v0.1.0-beta.13` as the current private baseline and `beta.14 UX hotfix` as the current build.
+- Move local files/attachments, PNG/JPEG/WEBP/GIF local image attachments, TXT/PDF document chips, TEXT/IMAGE model capability markers, and loopback-only synthetic image capture into Current support.
+- Clarify that real-provider image input remains disabled by default and full multimodal provider support remains unsupported.
+- Keep local state at `schemaVersion: 6`.
+- Keep provider import/export at version 4.
+- Keep the app package version at `0.1.0`.
+- Do not create a public GitHub Release from this private hotfix.
+
+Beta.13 hotfix delta over beta.12:
+
+- Fix local image attachment draft preview and sent-message rendering in Tauri production builds.
+- Resolve `/api/files/path/{id}` to the actual local mock API URL for managed image rendering.
+- Keep the hidden file picker input stably mounted so upload actions do not silently lose the input element.
+- Catch upload detection/upload failures and always reset the file input value so the same file can be selected again.
+- Keep real-provider image input disabled.
+- Keep the loopback-only capture path as the only implemented image-send prototype.
+- Keep local state at `schemaVersion: 6`.
+- Keep provider import/export at version 4.
+- Keep the app package version at `0.1.0`.
 
 - Tauri v2 Windows desktop shell.
 - Local Rust API bound to `127.0.0.1`.
@@ -62,7 +98,8 @@ This beta includes:
 - Favorite model updates through the local settings API.
 - Set as current model from each Provider Settings model row.
 - Test Connection for a specific OpenAI-compatible model row using a safe non-streaming `/chat/completions` probe.
-- Provider state schema v4 with `providers[].models[]`, `providers[].customHeaders`, `providers[].customBody`, and migration from earlier provider schema shapes.
+- Provider config includes `providers[].models[]`, `providers[].customHeaders`, `providers[].customBody`, and migration from earlier provider schema shapes.
+- Local state schema v6 includes managed file metadata and provider model capability metadata.
 - Advanced provider request config for non-sensitive custom headers and safe custom body JSON.
 - Shared OpenAI-compatible request builder for Test Connection and Streaming Chat:
   - Test Connection forces `max_tokens=1`
@@ -70,7 +107,7 @@ This beta includes:
 - OpenAI-compatible text chat with streaming responses.
 - Secret reference design where JSON stores `secretRef`, not the API key.
 - Windows encrypted local secret blobs under app data.
-- Safe provider import/export v3 for multi-model metadata and safe advanced request config, with v1/v2 import compatibility.
+- Safe provider import/export v4 for multi-model metadata, model modality metadata, and safe advanced request config, with v1/v2/v3 import compatibility.
 - Markdown table overflow polish for wide GFM tables inside message content.
 - Markdown/code block overflow and header layout polish.
 - KaTeX mhchem support for chemistry formulas.
@@ -85,6 +122,18 @@ This beta includes:
   - Workbench preview iframe no longer uses `allow-same-origin`
   - Workbench Mermaid uses `securityLevel: "strict"`
 - Mermaid rendering in normal message Markdown remains disabled/deferred.
+- Local file/attachment skeleton:
+  - managed file metadata and app-data blob storage
+  - PNG/JPEG/WEBP/GIF image attachments
+  - TXT/PDF document chips
+  - PDF/TXT remain chip-only
+  - unsafe or missing image/document parts degrade safely
+- Provider model capability metadata for TEXT and IMAGE input markers.
+- TEXT-only models block image attachments.
+- IMAGE-capable models can use a loopback-only synthetic image capture prototype.
+- Loopback capture sends only one current-turn PNG/JPEG/WEBP image to a local capture server after confirmation.
+- Loopback capture uses an in-memory data URL for the request only; base64 is not persisted to state, logs, exports, or message parts.
+- Real-provider image input remains disabled by default and is covered only by manual gate documentation.
 - Windows MSI and NSIS installer artifacts.
 
 This beta is intended for local/private validation only.
@@ -110,8 +159,12 @@ Recommended artifact for manual beta testing:
 3. Complete the installer.
 4. Start RikkaDesk.
 5. Open Provider Settings from the sidebar.
-6. Configure an OpenAI-compatible provider if real-provider testing is needed.
-7. Use Test Connection before sending a real chat message when possible.
+6. Configure an OpenAI-compatible provider if human-only text streaming testing is needed.
+7. Use Test Connection before sending a real text chat message when possible.
+8. Use synthetic app data for Phase 10 attachment and loopback capture tests.
+9. Do not use real user files for attachment tests.
+10. Do not run a real-provider image input test from this draft.
+11. For beta.14 UX hotfix validation, include beta.13 image attachment checks plus TEXT-only composer validation error clearing across chat switch, welcome/new-chat view, attachment changes, and model changes.
 
 The installer is currently unsigned. Windows SmartScreen or unsigned publisher warnings are expected until signing is added.
 
@@ -124,6 +177,10 @@ The installer is currently unsigned. Windows SmartScreen or unsigned publisher w
 - Test Connection should return only safe success/failure results and must not expose API keys, Authorization headers, or full request bodies.
 - Provider import/export must export non-sensitive provider config only and must not export keys, reusable local `secretRef` values, tokens, DPAPI blobs, or local secret-store files.
 - API key fields in docs or API shapes are field names only; they are not secret values.
+- Do not use real user files for attachment or image capture tests.
+- Do not run real-provider image input tests in this phase.
+- Do not copy or share `mock-api/secrets/*.bin`.
+- Loopback capture must not persist base64, request bodies, local paths, or storage keys.
 - When validating with a real provider, search only for a short key fragment and never paste the full key into terminal history.
 
 Security check examples:
@@ -141,10 +198,14 @@ Expected result:
 
 ## Known Limits
 
-- Only OpenAI-compatible text chat is supported.
+- Only OpenAI-compatible text chat is supported for real provider testing by default.
 - No Gemini, Claude, Anthropic, Vertex, or provider-specific protocols.
-- No files, attachments, images, audio, tools, MCP, search, Workspace, forks, or multimodal provider calls.
-- One provider can contain multiple text models, but per-model secrets, per-model Base URLs, provider-specific protocols, tools, and multimodal abilities are not implemented.
+- Local attachments and safe attachment rendering are implemented for the desktop beta hotfix line.
+- Real-provider image input is not enabled by default.
+- The image capture prototype is loopback-only and intended for synthetic local testing.
+- Beta.13 does not broaden image sending beyond the loopback-only synthetic capture prototype.
+- No OCR, PDF/Office parsing, audio/video input, tools, MCP, search, Workspace, forks, or full multimodal provider calls.
+- One provider can contain multiple text models and model capability metadata, but per-model secrets, per-model Base URLs, provider-specific protocols, tools, and full multimodal abilities are not implemented.
 - Provider import/export supports non-sensitive provider metadata only; imported providers require API keys to be entered again.
 - Mermaid in normal message Markdown remains disabled/deferred.
 - Workbench Mermaid preview still loads Mermaid from a remote CDN and should be revisited before public release.
@@ -190,8 +251,8 @@ Before sharing any private beta installer:
 - Confirm Set as current model updates the model selector for a specific model row.
 - Confirm Test Connection succeeds with a valid provider/model row and fails safely with an invalid provider or model.
 - Confirm Test Connection and Streaming Chat both use the safe custom request config behavior.
-- Confirm provider export writes version 3 JSON with `providers[].models[]`, safe `customHeaders[]`, and safe `customBody`.
-- Confirm provider import works for version 3 advanced exports, version 2 multi-model exports, and older version 1 single-model exports.
+- Confirm provider export writes version 4 JSON with `providers[].models[]`, model modality metadata, safe `customHeaders[]`, and safe `customBody`.
+- Confirm provider import works for version 4 modality exports, version 3 advanced exports, version 2 multi-model exports, and older version 1 single-model exports.
 - Confirm provider exports do not include API keys, `secretRef`, tokens, Authorization headers, `x-api-key`, cookies, DPAPI blobs, local secret-store files, or internal model ids.
 - Confirm wide Markdown tables scroll inside the message content area.
 - Confirm code block copy, download, and preview actions still work.
@@ -200,6 +261,13 @@ Before sharing any private beta installer:
 - Confirm the Markdown XSS fixture does not execute in message bubbles.
 - Confirm Workbench HTML/SVG preview sandbox values are empty.
 - Confirm Workbench Mermaid preview uses `allow-scripts`, does not use `allow-same-origin`, and runs with `securityLevel: "strict"`.
+- Upload synthetic PNG/JPEG/WEBP/GIF images and confirm they remain local attachments.
+- Upload synthetic TXT/PDF files and confirm they render as document chips only.
+- Confirm unsafe or missing image/document parts degrade safely.
+- Confirm TEXT-only models block image attachments.
+- Confirm IMAGE-capable models can run the loopback-only synthetic capture path with one current-turn PNG/JPEG/WEBP image.
+- Confirm loopback capture does not persist base64, `image_url`, request bodies, local paths, storage keys, or API keys.
+- Confirm real-provider image input remains disabled.
 - Confirm `hasSecret: true` only after a local key is saved.
 - Send a text-only test message.
 - Confirm streaming text appears when a real provider is configured.
@@ -217,7 +285,7 @@ Recommended private beta flow:
 1. Develop in phase branches.
 2. Merge accepted phase PRs into `beta/0.1.0`.
 3. Create private beta tags only for feature-stable checkpoints.
-4. Keep `rikkadesk-v0.1.0-beta.11` as the current feature-stable beta tag once Phase 9C is validated.
+4. Keep `rikkadesk-v0.1.0-beta.12` unchanged and keep `rikkadesk-v0.1.0-beta.13` pointing at the accepted beta.13 hotfix docs commit. Do not move existing private beta tags.
 5. Do not publish a public GitHub Release until signing, support scope, and license obligations are reviewed.
 
 Do not force-push `main`, `master`, or `beta/0.1.0`.

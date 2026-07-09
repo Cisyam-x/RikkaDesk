@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
     fs as std_fs, io,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::PathBuf,
     ptr,
     sync::{
@@ -14,7 +14,7 @@ use std::{
 
 use async_stream::stream;
 use axum::{
-    extract::{rejection::JsonRejection, Path, Query, State},
+    extract::{rejection::JsonRejection, DefaultBodyLimit, Multipart, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -45,18 +45,28 @@ const PREFERRED_ADDR: &str = "127.0.0.1:8080";
 const PERSIST_DIR_NAME: &str = "mock-api";
 const STATE_FILE_NAME: &str = "state.v1.json";
 const STATE_TMP_FILE_NAME: &str = "state.v1.json.tmp";
-const STATE_SCHEMA_VERSION: u32 = 4;
+const STATE_SCHEMA_VERSION: u32 = 6;
+const FILE_METADATA_STATE_SCHEMA_VERSION: u32 = 5;
+const CUSTOM_REQUEST_CONFIG_STATE_SCHEMA_VERSION: u32 = 4;
 const MULTI_MODEL_STATE_SCHEMA_VERSION: u32 = 3;
 const PREVIOUS_STATE_SCHEMA_VERSION: u32 = 2;
 const LEGACY_STATE_SCHEMA_VERSION: u32 = 1;
 const SECRETS_DIR_NAME: &str = "secrets";
+const FILES_DIR_NAME: &str = "files";
+const FILE_BLOBS_DIR_NAME: &str = "blobs";
+const FILE_UPLOAD_MAX_ITEMS: usize = 5;
+const FILE_UPLOAD_MAX_BYTES: usize = 20 * 1024 * 1024;
+const FILE_UPLOAD_TOTAL_MAX_BYTES: usize = FILE_UPLOAD_MAX_ITEMS * FILE_UPLOAD_MAX_BYTES;
+const FILE_DISPLAY_NAME_MAX_CHARS: usize = 160;
+const PROVIDER_IMAGE_INPUT_MAX_BYTES: usize = 5 * 1024 * 1024;
 #[cfg(not(windows))]
 const SECRET_SERVICE_NAME: &str = "RikkaDesk";
 const OPENAI_COMPATIBLE_PROVIDER_TYPE: &str = "openai-compatible";
 const PROVIDER_SECRET_REF_PREFIX: &str = "rikkadesk:provider:";
 const OPENAI_TEST_TIMEOUT_SECS: u64 = 60;
-const PROVIDER_IMPORT_EXPORT_VERSION: u32 = 3;
-const PREVIOUS_PROVIDER_IMPORT_EXPORT_VERSION: u32 = 2;
+const PROVIDER_IMPORT_EXPORT_VERSION: u32 = 4;
+const CUSTOM_PROVIDER_IMPORT_EXPORT_VERSION: u32 = 3;
+const MULTI_MODEL_PROVIDER_IMPORT_EXPORT_VERSION: u32 = 2;
 const LEGACY_PROVIDER_IMPORT_EXPORT_VERSION: u32 = 1;
 const PROVIDER_IMPORT_MAX_ITEMS: usize = 50;
 const PROVIDER_IMPORT_MAX_NAME_LEN: usize = 120;
@@ -68,11 +78,23 @@ const PROVIDER_CUSTOM_HEADER_MAX_ITEMS: usize = 32;
 const PROVIDER_CUSTOM_HEADER_MAX_NAME_LEN: usize = 128;
 const PROVIDER_CUSTOM_HEADER_MAX_VALUE_LEN: usize = 1024;
 const PROVIDER_CUSTOM_BODY_MAX_BYTES: usize = 16 * 1024;
+const MODEL_MODALITY_TEXT: &str = "TEXT";
+const MODEL_MODALITY_IMAGE: &str = "IMAGE";
 const MOCK_ASSISTANT_ID: &str = "mock-assistant";
 const MOCK_MODEL_ID: &str = "mock-chat";
 const MOCK_PROVIDER_ID: &str = "mock-provider";
 const MOCK_WELCOME_CONVERSATION_ID: &str = "mock-welcome";
 const MOCK_REPLY_TEXT: &str = "这是 RikkaDesk Mock 后端返回的测试回复。";
+const LOCAL_ATTACHMENT_REPLY_TEXT: &str =
+    "附件已保存到本地会话。当前 beta 暂不支持将附件发送给模型服务。";
+const LOCAL_IMAGE_CAPTURE_CONFIG_REQUIRED_TEXT: &str =
+    "图片输入捕获测试需要配置本地 loopback capture provider 和测试密钥。";
+const LOCAL_IMAGE_CAPTURE_LOOPBACK_REQUIRED_TEXT: &str =
+    "图片输入捕获测试只允许本机 loopback capture provider。附件已保存在本地会话，未发送给模型服务。";
+const LOCAL_IMAGE_CAPTURE_CAPABILITY_REQUIRED_TEXT: &str =
+    "当前模型未启用图片输入能力。附件已保存在本地会话，未发送给模型服务。";
+const LOCAL_IMAGE_CAPTURE_UNSUPPORTED_TEXT: &str =
+    "当前图片输入捕获测试只支持一张 PNG、JPEG 或 WEBP 图片。附件已保存在本地会话，未发送给模型服务。";
 
 #[derive(Clone)]
 pub struct MockApiHandle {
@@ -309,6 +331,16 @@ impl MockPersistence {
         &self.state_path
     }
 
+    fn file_blobs_dir(&self) -> PathBuf {
+        self.state_dir
+            .join(FILES_DIR_NAME)
+            .join(FILE_BLOBS_DIR_NAME)
+    }
+
+    fn file_blob_path(&self, storage_key: &str) -> Option<PathBuf> {
+        is_safe_storage_key(storage_key).then(|| self.file_blobs_dir().join(storage_key))
+    }
+
     async fn save(&self, persisted: &PersistedMockState) -> PersistenceResult<()> {
         fs::create_dir_all(&self.state_dir).await?;
 
@@ -337,6 +369,31 @@ struct PersistedMockState {
     conversations: HashMap<String, ConversationDto>,
     #[serde(default)]
     providers: Vec<DesktopProviderConfig>,
+    #[serde(default)]
+    files: Vec<ManagedFileMetadata>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedFileMetadata {
+    id: u64,
+    storage_key: String,
+    display_name: String,
+    mime: String,
+    size_bytes: u64,
+    sha256: Option<String>,
+    kind: String,
+    relative_path: String,
+    created_at: String,
+    updated_at: String,
+    source: String,
+    deleted_at: Option<String>,
+}
+
+impl ManagedFileMetadata {
+    fn url(&self) -> String {
+        format!("/api/files/path/{}", self.id)
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -368,6 +425,10 @@ impl DesktopProviderConfig {
         } else {
             self.legacy_model = None;
         }
+
+        for model in &mut self.models {
+            model.normalize_modalities();
+        }
     }
 
     fn primary_model(&self) -> Option<&DesktopProviderModelConfig> {
@@ -392,8 +453,8 @@ impl DesktopProviderConfig {
                     "modelId": model.model_id,
                     "displayName": model.display_name,
                     "type": "CHAT",
-                    "inputModalities": ["TEXT"],
-                    "outputModalities": ["TEXT"],
+                    "inputModalities": model.input_modalities.clone(),
+                    "outputModalities": model.output_modalities.clone(),
                     "abilities": []
                 })
             })
@@ -417,6 +478,83 @@ struct DesktopProviderModelConfig {
     id: String,
     model_id: String,
     display_name: String,
+    #[serde(default = "default_input_modalities")]
+    input_modalities: Vec<String>,
+    #[serde(default = "default_output_modalities")]
+    output_modalities: Vec<String>,
+}
+
+impl DesktopProviderModelConfig {
+    fn normalize_modalities(&mut self) {
+        self.input_modalities = normalize_input_modalities(Some(&self.input_modalities))
+            .unwrap_or_else(|_| default_input_modalities());
+        self.output_modalities = normalize_output_modalities(Some(&self.output_modalities))
+            .unwrap_or_else(|_| default_output_modalities());
+    }
+}
+
+fn default_input_modalities() -> Vec<String> {
+    vec![MODEL_MODALITY_TEXT.to_string()]
+}
+
+fn default_output_modalities() -> Vec<String> {
+    vec![MODEL_MODALITY_TEXT.to_string()]
+}
+
+fn normalize_input_modalities(modalities: Option<&Vec<String>>) -> Result<Vec<String>, String> {
+    let Some(modalities) = modalities else {
+        return Ok(default_input_modalities());
+    };
+
+    if modalities.is_empty() {
+        return Err("Model input capabilities must include Text".to_string());
+    }
+
+    let mut has_text = false;
+    let mut has_image = false;
+    for modality in modalities {
+        let normalized = modality.trim().to_ascii_uppercase();
+        if normalized.is_empty() || normalized.len() > 32 {
+            return Err("Model input capability is invalid".to_string());
+        }
+        match normalized.as_str() {
+            MODEL_MODALITY_TEXT => has_text = true,
+            MODEL_MODALITY_IMAGE => has_image = true,
+            _ => return Err("Model input capability is not supported".to_string()),
+        }
+    }
+
+    if !has_text {
+        return Err("Model input capabilities must include Text".to_string());
+    }
+
+    let mut result = vec![MODEL_MODALITY_TEXT.to_string()];
+    if has_image {
+        result.push(MODEL_MODALITY_IMAGE.to_string());
+    }
+    Ok(result)
+}
+
+fn normalize_output_modalities(modalities: Option<&Vec<String>>) -> Result<Vec<String>, String> {
+    let Some(modalities) = modalities else {
+        return Ok(default_output_modalities());
+    };
+
+    if modalities.is_empty() {
+        return Err("Model output capabilities must include Text".to_string());
+    }
+
+    for modality in modalities {
+        let normalized = modality.trim().to_ascii_uppercase();
+        if normalized.is_empty() || normalized.len() > 32 {
+            return Err("Model output capability is invalid".to_string());
+        }
+        if normalized != MODEL_MODALITY_TEXT {
+            return Err("Model output capability is not supported".to_string());
+        }
+    }
+
+    Ok(default_output_modalities())
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -474,6 +612,8 @@ struct UpsertDesktopProviderModelRequest {
     id: Option<String>,
     model_id: String,
     display_name: Option<String>,
+    input_modalities: Option<Vec<String>>,
+    output_modalities: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -504,6 +644,70 @@ struct DesktopProviderResponse {
     has_secret: bool,
     custom_headers: Vec<DesktopProviderCustomHeaderConfig>,
     custom_body: Option<Value>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UploadFilesResponse {
+    files: Vec<UploadedFileResponse>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UploadedFileResponse {
+    id: u64,
+    file_name: String,
+    mime: String,
+    size_bytes: u64,
+    size: u64,
+    url: String,
+}
+
+impl UploadedFileResponse {
+    fn from_metadata(metadata: &ManagedFileMetadata) -> Self {
+        Self {
+            id: metadata.id,
+            file_name: metadata.display_name.clone(),
+            mime: metadata.mime.clone(),
+            size_bytes: metadata.size_bytes,
+            size: metadata.size_bytes,
+            url: metadata.url(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedFileResponse {
+    id: u64,
+    file_name: String,
+    mime: String,
+    size_bytes: u64,
+    size: u64,
+    kind: String,
+    created_at: String,
+    updated_at: String,
+    source: String,
+    deleted_at: Option<String>,
+    url: String,
+}
+
+impl ManagedFileResponse {
+    fn from_metadata(metadata: &ManagedFileMetadata) -> Self {
+        Self {
+            id: metadata.id,
+            file_name: metadata.display_name.clone(),
+            mime: metadata.mime.clone(),
+            size_bytes: metadata.size_bytes,
+            size: metadata.size_bytes,
+            kind: metadata.kind.clone(),
+            created_at: metadata.created_at.clone(),
+            updated_at: metadata.updated_at.clone(),
+            source: metadata.source.clone(),
+            deleted_at: metadata.deleted_at.clone(),
+            url: metadata.url(),
+        }
+    }
 }
 
 impl DesktopProviderResponse {
@@ -545,11 +749,22 @@ struct ValidatedProviderImportItem {
 struct ValidatedProviderImportModel {
     model_id: String,
     display_name: String,
+    input_modalities: Vec<String>,
+    output_modalities: Vec<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ProviderExportModel {
+    model_id: String,
+    display_name: String,
+    input_modalities: Vec<String>,
+    output_modalities: Vec<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProviderExportModelLegacy {
     model_id: String,
     display_name: String,
 }
@@ -577,7 +792,21 @@ struct ProviderExportItemV2 {
     name: String,
     base_url: String,
     has_secret: bool,
-    models: Vec<ProviderExportModel>,
+    models: Vec<ProviderExportModelLegacy>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProviderExportItemV3 {
+    #[serde(rename = "type")]
+    provider_type: String,
+    enabled: bool,
+    name: String,
+    base_url: String,
+    has_secret: bool,
+    models: Vec<ProviderExportModelLegacy>,
+    custom_headers: Vec<DesktopProviderCustomHeaderConfig>,
+    custom_body: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -593,7 +822,7 @@ struct ProviderExportItemV1 {
     has_secret: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ProviderExportDocument {
     version: u32,
@@ -629,7 +858,7 @@ struct ProviderExportDocumentV3 {
     version: u32,
     app: String,
     exported_at: String,
-    providers: Vec<ProviderExportItem>,
+    providers: Vec<ProviderExportItemV3>,
 }
 
 #[derive(Serialize)]
@@ -689,6 +918,8 @@ struct ProviderImportConfirmModel {
     id: String,
     model_id: String,
     display_name: String,
+    input_modalities: Vec<String>,
+    output_modalities: Vec<String>,
 }
 
 struct OpenAiChatConfig {
@@ -697,12 +928,52 @@ struct OpenAiChatConfig {
     api_key: String,
     custom_headers: Vec<DesktopProviderCustomHeaderConfig>,
     custom_body: Option<Value>,
+    input_modalities: Vec<String>,
 }
 
 #[derive(Clone, Serialize)]
 struct OpenAiChatMessage {
     role: String,
     content: String,
+}
+
+struct ManagedImageProviderInput {
+    file_id: u64,
+    mime: String,
+    bytes: Vec<u8>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone)]
+enum OpenAiCompatibleMessageContent {
+    Text(String),
+    Parts(Vec<OpenAiCompatibleContentPart>),
+}
+
+#[allow(dead_code)]
+#[derive(Clone)]
+enum OpenAiCompatibleContentPart {
+    Text(String),
+    ImageUrl {
+        data_url: String,
+        detail: OpenAiImageDetail,
+        file_id: u64,
+    },
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+enum OpenAiImageDetail {
+    Auto,
+    Low,
+    High,
+}
+
+#[allow(dead_code)]
+#[derive(Clone)]
+struct OpenAiCompatibleChatMessage {
+    role: String,
+    content: OpenAiCompatibleMessageContent,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -819,6 +1090,8 @@ struct SendMessageRequest {
     parts: Vec<Value>,
     mode_injection_ids: Option<Vec<String>>,
     lorebook_ids: Option<Vec<String>>,
+    image_input_confirmed: Option<bool>,
+    image_input_mode: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -868,6 +1141,7 @@ struct MockApiState {
     settings: RwLock<Value>,
     conversations: RwLock<HashMap<String, ConversationDto>>,
     providers: RwLock<Vec<DesktopProviderConfig>>,
+    files: RwLock<Vec<ManagedFileMetadata>>,
     generating_flags: RwLock<HashSet<String>>,
     conversation_txs: RwLock<HashMap<String, broadcast::Sender<SsePayload>>>,
     settings_tx: broadcast::Sender<SsePayload>,
@@ -886,6 +1160,7 @@ impl MockApiState {
         let initial_id_seq = persisted
             .id_seq
             .max(max_persisted_id_seq(&persisted.conversations))
+            .max(max_persisted_file_id(&persisted.files))
             .max(1);
         let (settings_tx, _) = broadcast::channel(64);
         let (list_tx, _) = broadcast::channel(64);
@@ -899,6 +1174,7 @@ impl MockApiState {
             settings: RwLock::new(persisted.settings),
             conversations: RwLock::new(persisted.conversations),
             providers: RwLock::new(persisted.providers),
+            files: RwLock::new(persisted.files),
             generating_flags: RwLock::new(HashSet::new()),
             conversation_txs: RwLock::new(HashMap::new()),
             settings_tx,
@@ -916,6 +1192,10 @@ impl MockApiState {
         let id = self.id_seq.fetch_add(1, Ordering::Relaxed) + 1;
         format!("{prefix}-{id}")
     }
+
+    fn next_file_id(&self) -> u64 {
+        self.id_seq.fetch_add(1, Ordering::Relaxed) + 1
+    }
 }
 
 pub async fn start(app_data_dir: PathBuf) -> Result<MockApiHandle, Box<dyn std::error::Error>> {
@@ -932,6 +1212,9 @@ pub async fn start(app_data_dir: PathBuf) -> Result<MockApiHandle, Box<dyn std::
         .route("/api/conversations/paged", get(conversations_paged))
         .route("/api/conversations/stream", get(conversations_stream))
         .route("/api/ai-icon", get(ai_icon))
+        .route("/api/files/upload", post(upload_files))
+        .route("/api/files/path/{id}", get(file_path))
+        .route("/api/files/{id}", get(file_metadata).delete(delete_file))
         .route(
             "/api/desktop/providers",
             get(desktop_providers).post(upsert_desktop_provider),
@@ -992,6 +1275,9 @@ pub async fn start(app_data_dir: PathBuf) -> Result<MockApiHandle, Box<dyn std::
             post(update_favorite_models),
         )
         .fallback(not_implemented)
+        .layer(DefaultBodyLimit::max(
+            FILE_UPLOAD_TOTAL_MAX_BYTES + 1024 * 1024,
+        ))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
@@ -1046,8 +1332,26 @@ async fn load_persisted_state(persistence: &MockPersistence) -> PersistedMockSta
             ensure_current_model_exists(&mut persisted.settings);
             persisted
         }
+        Ok(persisted) if persisted.schema_version == FILE_METADATA_STATE_SCHEMA_VERSION => {
+            let mut migrated = migrate_v5_to_v6(persisted);
+            sync_settings_with_desktop_providers(&mut migrated.settings, &migrated.providers);
+            ensure_current_model_exists(&mut migrated.settings);
+            if let Err(error) = persistence.save(&migrated).await {
+                eprintln!("RikkaDesk mock API failed to save migrated state: {error}");
+            }
+            migrated
+        }
+        Ok(persisted) if persisted.schema_version == CUSTOM_REQUEST_CONFIG_STATE_SCHEMA_VERSION => {
+            let mut migrated = migrate_v4_to_v6(persisted);
+            sync_settings_with_desktop_providers(&mut migrated.settings, &migrated.providers);
+            ensure_current_model_exists(&mut migrated.settings);
+            if let Err(error) = persistence.save(&migrated).await {
+                eprintln!("RikkaDesk mock API failed to save migrated state: {error}");
+            }
+            migrated
+        }
         Ok(persisted) if persisted.schema_version == MULTI_MODEL_STATE_SCHEMA_VERSION => {
-            let mut migrated = migrate_v3_to_v4(persisted);
+            let mut migrated = migrate_v3_to_v6(persisted);
             sync_settings_with_desktop_providers(&mut migrated.settings, &migrated.providers);
             ensure_current_model_exists(&mut migrated.settings);
             if let Err(error) = persistence.save(&migrated).await {
@@ -1056,7 +1360,7 @@ async fn load_persisted_state(persistence: &MockPersistence) -> PersistedMockSta
             migrated
         }
         Ok(persisted) if persisted.schema_version == PREVIOUS_STATE_SCHEMA_VERSION => {
-            let mut migrated = migrate_v2_to_v4(persisted);
+            let mut migrated = migrate_v2_to_v6(persisted);
             sync_settings_with_desktop_providers(&mut migrated.settings, &migrated.providers);
             ensure_current_model_exists(&mut migrated.settings);
             if let Err(error) = persistence.save(&migrated).await {
@@ -1065,7 +1369,7 @@ async fn load_persisted_state(persistence: &MockPersistence) -> PersistedMockSta
             migrated
         }
         Ok(persisted) if persisted.schema_version == LEGACY_STATE_SCHEMA_VERSION => {
-            let mut migrated = migrate_v1_to_v4(persisted);
+            let mut migrated = migrate_v1_to_v6(persisted);
             sync_settings_with_desktop_providers(&mut migrated.settings, &migrated.providers);
             ensure_current_model_exists(&mut migrated.settings);
             if let Err(error) = persistence.save(&migrated).await {
@@ -1119,10 +1423,12 @@ async fn persist_mock_state(state: &Arc<MockApiState>) {
     let settings = state.settings.read().await.clone();
     let conversations = state.conversations.read().await.clone();
     let providers = state.providers.read().await.clone();
+    let files = state.files.read().await.clone();
     let id_seq = state
         .id_seq
         .load(Ordering::Relaxed)
         .max(max_persisted_id_seq(&conversations))
+        .max(max_persisted_file_id(&files))
         .max(1);
 
     let persisted = PersistedMockState {
@@ -1132,6 +1438,7 @@ async fn persist_mock_state(state: &Arc<MockApiState>) {
         settings,
         conversations,
         providers,
+        files,
     };
 
     if let Err(error) = state.persistence.save(&persisted).await {
@@ -1208,6 +1515,8 @@ async fn confirm_desktop_provider_import(
                 id: state.next_id("desktop-model"),
                 model_id: model.model_id.clone(),
                 display_name: model.display_name.clone(),
+                input_modalities: model.input_modalities.clone(),
+                output_modalities: model.output_modalities.clone(),
             })
             .collect::<Vec<_>>();
         let imported_models = models
@@ -1216,6 +1525,8 @@ async fn confirm_desktop_provider_import(
                 id: model.id.clone(),
                 model_id: model.model_id.clone(),
                 display_name: model.display_name.clone(),
+                input_modalities: model.input_modalities.clone(),
+                output_modalities: model.output_modalities.clone(),
             })
             .collect::<Vec<_>>();
         let config = DesktopProviderConfig {
@@ -1591,6 +1902,9 @@ async fn send_message(
     let model_id = current_model_id(&state, &assistant_id).await;
     let created_at = now_iso();
     let user_text = first_text_part(&payload.parts);
+    let user_has_non_text_parts = has_non_text_parts(&payload.parts);
+    let request_parts = payload.parts.clone();
+    let capture_intent = is_capture_local_image_intent(&payload);
 
     let updated_after_user_message = {
         let mut conversations = state.conversations.write().await;
@@ -1630,6 +1944,40 @@ async fn send_message(
     persist_mock_state(&state).await;
     broadcast_conversation_snapshot(&state, &updated_after_user_message).await;
     broadcast_list_invalidate(&state).await;
+
+    if user_has_non_text_parts {
+        if capture_intent {
+            match start_local_image_capture_prototype(
+                &state,
+                &id,
+                &assistant_id,
+                &model_id,
+                user_text.clone(),
+                &request_parts,
+                now,
+            )
+            .await
+            {
+                Ok(true) => return Json(json!({ "status": "accepted" })),
+                Ok(false) => {}
+                Err(error) => {
+                    append_assistant_reply(&state, &id, &assistant_id, &model_id, error, now).await;
+                    return Json(json!({ "status": "accepted" }));
+                }
+            }
+        }
+
+        append_assistant_reply(
+            &state,
+            &id,
+            &assistant_id,
+            &model_id,
+            LOCAL_ATTACHMENT_REPLY_TEXT.to_string(),
+            now,
+        )
+        .await;
+        return Json(json!({ "status": "accepted" }));
+    }
 
     let real_chat_config = if user_text.is_some() {
         match resolve_openai_chat_config(&state, &model_id).await {
@@ -1681,6 +2029,58 @@ async fn send_message(
     spawn_openai_stream_generation(state.clone(), id, assistant_message_id, config, messages);
 
     Json(json!({ "status": "accepted" }))
+}
+
+fn is_capture_local_image_intent(payload: &SendMessageRequest) -> bool {
+    payload.image_input_confirmed == Some(true)
+        && payload.image_input_mode.as_deref() == Some("capture-local")
+}
+
+async fn start_local_image_capture_prototype(
+    state: &Arc<MockApiState>,
+    conversation_id: &str,
+    assistant_id: &str,
+    model_id: &str,
+    user_text: Option<String>,
+    parts: &[Value],
+    now: u64,
+) -> Result<bool, String> {
+    let image_file_ids = provider_bound_image_file_ids(parts)?;
+    let Some(file_id) = image_file_ids.first().copied() else {
+        return Ok(false);
+    };
+
+    let config = resolve_openai_chat_config(state, model_id)
+        .await
+        .map_err(|_| LOCAL_IMAGE_CAPTURE_CONFIG_REQUIRED_TEXT.to_string())?
+        .ok_or_else(|| LOCAL_IMAGE_CAPTURE_CONFIG_REQUIRED_TEXT.to_string())?;
+
+    if !is_loopback_provider_base_url(&config.base_url) {
+        return Err(LOCAL_IMAGE_CAPTURE_LOOPBACK_REQUIRED_TEXT.to_string());
+    }
+    if !config
+        .input_modalities
+        .iter()
+        .any(|modality| modality == MODEL_MODALITY_IMAGE)
+    {
+        return Err(LOCAL_IMAGE_CAPTURE_CAPABILITY_REQUIRED_TEXT.to_string());
+    }
+
+    let image = managed_file_for_provider_image_input(state, file_id).await?;
+    let messages = openai_vision_messages_for_current_turn(user_text, image)?;
+    let assistant_message_id =
+        append_empty_streaming_assistant_reply(state, conversation_id, assistant_id, model_id, now)
+            .await;
+    start_generation(state, conversation_id).await;
+    spawn_openai_vision_capture_generation(
+        state.clone(),
+        conversation_id.to_string(),
+        assistant_message_id,
+        config,
+        messages,
+    );
+
+    Ok(true)
 }
 
 async fn stop_conversation(
@@ -1864,7 +2264,7 @@ async fn regenerate_message(
     let assistant_id = current_assistant_id(&state).await;
     let model_id = current_model_id(&state, &assistant_id).await;
 
-    let prepared = {
+    let (prepared, last_user_has_non_text_parts) = {
         let mut conversations = state.conversations.write().await;
         let Some(conversation) = conversations.get_mut(&id) else {
             return not_found_response("Conversation not found");
@@ -1908,7 +2308,8 @@ async fn regenerate_message(
             return bad_request_response("No user text message is available to regenerate from.");
         };
 
-        if text_from_parts(&last_user_message.parts).is_none() {
+        let last_user_has_non_text_parts = has_non_text_parts(&last_user_message.parts);
+        if !last_user_has_non_text_parts && text_from_parts(&last_user_message.parts).is_none() {
             return bad_request_response(
                 "Phase 6A currently supports regenerating text-only chat.",
             );
@@ -1916,12 +2317,25 @@ async fn regenerate_message(
 
         conversation.update_at = now_millis();
         conversation.is_generating = true;
-        conversation.clone()
+        (conversation.clone(), last_user_has_non_text_parts)
     };
 
     persist_mock_state(&state).await;
     broadcast_conversation_snapshot(&state, &prepared).await;
     broadcast_list_invalidate(&state).await;
+
+    if last_user_has_non_text_parts {
+        append_assistant_reply(
+            &state,
+            &id,
+            &assistant_id,
+            &model_id,
+            LOCAL_ATTACHMENT_REPLY_TEXT.to_string(),
+            now,
+        )
+        .await;
+        return Json(json!({ "status": "accepted" })).into_response();
+    }
 
     let real_chat_config = match resolve_openai_chat_config(&state, &model_id).await {
         Ok(config) => config,
@@ -2052,6 +2466,294 @@ async fn not_implemented() -> impl IntoResponse {
     )
 }
 
+struct PreparedFileUpload {
+    metadata: ManagedFileMetadata,
+    bytes: Vec<u8>,
+}
+
+async fn upload_files(
+    State(state): State<Arc<MockApiState>>,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    let mut prepared = Vec::new();
+    let mut total_bytes = 0usize;
+
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(_) => return bad_request_response("Invalid file upload"),
+        };
+
+        if field.name() != Some("files") {
+            continue;
+        }
+
+        if prepared.len() >= FILE_UPLOAD_MAX_ITEMS {
+            return bad_request_response("Too many files");
+        }
+
+        let display_name = sanitize_upload_file_name(field.file_name());
+        let bytes = match field.bytes().await {
+            Ok(bytes) => bytes,
+            Err(_) => return bad_request_response("Invalid file upload"),
+        };
+        let size = bytes.len();
+
+        if size > FILE_UPLOAD_MAX_BYTES {
+            return bad_request_response("File is too large");
+        }
+
+        total_bytes = match total_bytes.checked_add(size) {
+            Some(total_bytes) => total_bytes,
+            None => return bad_request_response("Upload is too large"),
+        };
+        if total_bytes > FILE_UPLOAD_TOTAL_MAX_BYTES {
+            return bad_request_response("Upload is too large");
+        }
+
+        let mime = match detect_safe_upload_mime(&bytes, &display_name) {
+            Ok(mime) => mime,
+            Err(message) => return bad_request_response(message),
+        };
+        let kind = upload_kind_for_mime(mime);
+        let id = state.next_file_id();
+        let storage_key = storage_key_for_file(id);
+        let now = now_iso();
+        let metadata = ManagedFileMetadata {
+            id,
+            storage_key: storage_key.clone(),
+            display_name,
+            mime: mime.to_string(),
+            size_bytes: size as u64,
+            sha256: None,
+            kind: kind.to_string(),
+            relative_path: format!("{FILES_DIR_NAME}/{FILE_BLOBS_DIR_NAME}/{storage_key}"),
+            created_at: now.clone(),
+            updated_at: now,
+            source: "upload".to_string(),
+            deleted_at: None,
+        };
+
+        prepared.push(PreparedFileUpload {
+            metadata,
+            bytes: bytes.to_vec(),
+        });
+    }
+
+    if prepared.is_empty() {
+        return bad_request_response("No files were uploaded");
+    }
+
+    if save_prepared_file_uploads(&state, &prepared).await.is_err() {
+        return internal_error_response("File upload failed");
+    }
+
+    let uploaded = {
+        let mut files = state.files.write().await;
+        let uploaded = prepared
+            .iter()
+            .map(|upload| UploadedFileResponse::from_metadata(&upload.metadata))
+            .collect::<Vec<_>>();
+        files.extend(prepared.into_iter().map(|upload| upload.metadata));
+        uploaded
+    };
+
+    persist_mock_state(&state).await;
+
+    Json(UploadFilesResponse { files: uploaded }).into_response()
+}
+
+async fn file_metadata(
+    State(state): State<Arc<MockApiState>>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    let metadata = {
+        let files = state.files.read().await;
+        files
+            .iter()
+            .find(|file| file.id == id && file.deleted_at.is_none())
+            .cloned()
+    };
+
+    match metadata {
+        Some(metadata) => Json(ManagedFileResponse::from_metadata(&metadata)).into_response(),
+        None => not_found_response("File not found"),
+    }
+}
+
+async fn file_path(
+    State(state): State<Arc<MockApiState>>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    let metadata = {
+        let files = state.files.read().await;
+        files
+            .iter()
+            .find(|file| file.id == id && file.deleted_at.is_none())
+            .cloned()
+    };
+
+    let Some(metadata) = metadata else {
+        return not_found_response("File not found");
+    };
+
+    let Some(path) = state.persistence.file_blob_path(&metadata.storage_key) else {
+        return internal_error_response("File is unavailable");
+    };
+
+    let bytes = match fs::read(path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return not_found_response("File not found")
+        }
+        Err(_) => return internal_error_response("File is unavailable"),
+    };
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(&metadata.mime)
+            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+    );
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    if !metadata.mime.starts_with("image/") {
+        let file_name = safe_header_file_name(&metadata.display_name);
+        if let Ok(value) = HeaderValue::from_str(&format!("attachment; filename=\"{file_name}\"")) {
+            headers.insert(header::CONTENT_DISPOSITION, value);
+        }
+    }
+
+    (headers, bytes).into_response()
+}
+
+async fn delete_file(
+    State(state): State<Arc<MockApiState>>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    let metadata = {
+        let files = state.files.read().await;
+        files
+            .iter()
+            .find(|file| file.id == id && file.deleted_at.is_none())
+            .cloned()
+    };
+
+    let Some(metadata) = metadata else {
+        return not_found_response("File not found");
+    };
+
+    if let Some(path) = state.persistence.file_blob_path(&metadata.storage_key) {
+        match fs::remove_file(path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return internal_error_response("File delete failed"),
+        }
+    }
+
+    {
+        let now = now_iso();
+        let mut files = state.files.write().await;
+        if let Some(file) = files.iter_mut().find(|file| file.id == id) {
+            file.deleted_at = Some(now.clone());
+            file.updated_at = now;
+        }
+    }
+
+    persist_mock_state(&state).await;
+
+    Json(json!({ "status": "deleted" })).into_response()
+}
+
+async fn save_prepared_file_uploads(
+    state: &Arc<MockApiState>,
+    uploads: &[PreparedFileUpload],
+) -> Result<(), ()> {
+    let blobs_dir = state.persistence.file_blobs_dir();
+    fs::create_dir_all(&blobs_dir).await.map_err(|_| ())?;
+
+    let mut written = Vec::new();
+    for upload in uploads {
+        let Some(path) = state
+            .persistence
+            .file_blob_path(&upload.metadata.storage_key)
+        else {
+            cleanup_uploaded_blobs(written).await;
+            return Err(());
+        };
+        let tmp_path = path.with_extension("tmp");
+        if fs::write(&tmp_path, &upload.bytes).await.is_err() {
+            let _ = fs::remove_file(&tmp_path).await;
+            cleanup_uploaded_blobs(written).await;
+            return Err(());
+        }
+        if fs::rename(&tmp_path, &path).await.is_err() {
+            let _ = fs::remove_file(&tmp_path).await;
+            cleanup_uploaded_blobs(written).await;
+            return Err(());
+        }
+        written.push(path);
+    }
+
+    Ok(())
+}
+
+async fn cleanup_uploaded_blobs(paths: Vec<PathBuf>) {
+    for path in paths {
+        let _ = fs::remove_file(path).await;
+    }
+}
+
+async fn managed_file_for_provider_image_input(
+    state: &Arc<MockApiState>,
+    file_id: u64,
+) -> Result<ManagedImageProviderInput, String> {
+    let metadata = {
+        let files = state.files.read().await;
+        files
+            .iter()
+            .find(|file| file.id == file_id && file.deleted_at.is_none())
+            .cloned()
+    }
+    .ok_or_else(|| "Image attachment is unavailable".to_string())?;
+
+    if !is_safe_storage_key(&metadata.storage_key) {
+        return Err("Image attachment is unavailable".to_string());
+    }
+    if !is_provider_image_mime(&metadata.mime) {
+        return Err(LOCAL_IMAGE_CAPTURE_UNSUPPORTED_TEXT.to_string());
+    }
+    if metadata.size_bytes > PROVIDER_IMAGE_INPUT_MAX_BYTES as u64 {
+        return Err("Image attachment is too large for capture testing".to_string());
+    }
+
+    let Some(path) = state.persistence.file_blob_path(&metadata.storage_key) else {
+        return Err("Image attachment is unavailable".to_string());
+    };
+    let bytes = fs::read(path)
+        .await
+        .map_err(|_| "Image attachment is unavailable".to_string())?;
+    if bytes.len() > PROVIDER_IMAGE_INPUT_MAX_BYTES {
+        return Err("Image attachment is too large for capture testing".to_string());
+    }
+
+    let detected = detect_safe_upload_mime(&bytes, &metadata.display_name)
+        .map_err(|_| "Image attachment type is not supported for capture testing".to_string())?;
+    if detected != metadata.mime || !is_provider_image_mime(detected) {
+        return Err("Image attachment type is not supported for capture testing".to_string());
+    }
+
+    Ok(ManagedImageProviderInput {
+        file_id,
+        mime: metadata.mime,
+        bytes,
+    })
+}
+
 async fn desktop_provider_responses(
     state: &Arc<MockApiState>,
 ) -> Result<Vec<DesktopProviderResponse>, String> {
@@ -2107,6 +2809,8 @@ async fn provider_export_items(
                             .map(|model| ProviderExportModel {
                                 model_id: model.model_id.clone(),
                                 display_name: model.display_name.clone(),
+                                input_modalities: model.input_modalities.clone(),
+                                output_modalities: model.output_modalities.clone(),
                             })
                             .collect(),
                         custom_headers,
@@ -2139,15 +2843,20 @@ fn validate_provider_import_document(
                 .map_err(|_| bad_request_response("Invalid provider import document"))?;
             validate_provider_import_document_v1(&document)
         }
-        PREVIOUS_PROVIDER_IMPORT_EXPORT_VERSION => {
+        MULTI_MODEL_PROVIDER_IMPORT_EXPORT_VERSION => {
             let document = serde_json::from_value::<ProviderExportDocumentV2>(document.clone())
                 .map_err(|_| bad_request_response("Invalid provider import document"))?;
             validate_provider_import_document_v2(&document)
         }
-        PROVIDER_IMPORT_EXPORT_VERSION => {
+        CUSTOM_PROVIDER_IMPORT_EXPORT_VERSION => {
             let document = serde_json::from_value::<ProviderExportDocumentV3>(document.clone())
                 .map_err(|_| bad_request_response("Invalid provider import document"))?;
             validate_provider_import_document_v3(&document)
+        }
+        PROVIDER_IMPORT_EXPORT_VERSION => {
+            let document = serde_json::from_value::<ProviderExportDocument>(document.clone())
+                .map_err(|_| bad_request_response("Invalid provider import document"))?;
+            validate_provider_import_document_v4(&document)
         }
         _ => Err(bad_request_response(
             "Unsupported provider import document version",
@@ -2177,7 +2886,7 @@ fn validate_provider_import_document_v1(
 fn validate_provider_import_document_v2(
     document: &ProviderExportDocumentV2,
 ) -> Result<Vec<ValidatedProviderImportItem>, Response> {
-    if document.version != PREVIOUS_PROVIDER_IMPORT_EXPORT_VERSION {
+    if document.version != MULTI_MODEL_PROVIDER_IMPORT_EXPORT_VERSION {
         return Err(bad_request_response(
             "Unsupported provider import document version",
         ));
@@ -2196,7 +2905,7 @@ fn validate_provider_import_document_v2(
 fn validate_provider_import_document_v3(
     document: &ProviderExportDocumentV3,
 ) -> Result<Vec<ValidatedProviderImportItem>, Response> {
-    if document.version != PROVIDER_IMPORT_EXPORT_VERSION {
+    if document.version != CUSTOM_PROVIDER_IMPORT_EXPORT_VERSION {
         return Err(bad_request_response(
             "Unsupported provider import document version",
         ));
@@ -2209,6 +2918,25 @@ fn validate_provider_import_document_v3(
         .iter()
         .enumerate()
         .map(|(index, provider)| validate_provider_import_item_v3(index + 1, provider))
+        .collect()
+}
+
+fn validate_provider_import_document_v4(
+    document: &ProviderExportDocument,
+) -> Result<Vec<ValidatedProviderImportItem>, Response> {
+    if document.version != PROVIDER_IMPORT_EXPORT_VERSION {
+        return Err(bad_request_response(
+            "Unsupported provider import document version",
+        ));
+    }
+
+    validate_provider_import_count(document.providers.len())?;
+
+    document
+        .providers
+        .iter()
+        .enumerate()
+        .map(|(index, provider)| validate_provider_import_item_v4(index + 1, provider))
         .collect()
 }
 
@@ -2228,6 +2956,8 @@ fn validate_provider_import_item_v1(
     let models = vec![ProviderExportModel {
         model_id: provider.model_id.clone(),
         display_name: provider.display_name.clone(),
+        input_modalities: default_input_modalities(),
+        output_modalities: default_output_modalities(),
     }];
     validate_provider_import_item(
         position,
@@ -2246,6 +2976,7 @@ fn validate_provider_import_item_v2(
     position: usize,
     provider: &ProviderExportItemV2,
 ) -> Result<ValidatedProviderImportItem, Response> {
+    let models = legacy_provider_export_models(&provider.models);
     validate_provider_import_item(
         position,
         &provider.provider_type,
@@ -2253,13 +2984,31 @@ fn validate_provider_import_item_v2(
         &provider.name,
         &provider.base_url,
         provider.has_secret,
-        &provider.models,
+        &models,
         &[],
         None,
     )
 }
 
 fn validate_provider_import_item_v3(
+    position: usize,
+    provider: &ProviderExportItemV3,
+) -> Result<ValidatedProviderImportItem, Response> {
+    let models = legacy_provider_export_models(&provider.models);
+    validate_provider_import_item(
+        position,
+        &provider.provider_type,
+        provider.enabled,
+        &provider.name,
+        &provider.base_url,
+        provider.has_secret,
+        &models,
+        &provider.custom_headers,
+        provider.custom_body.as_ref(),
+    )
+}
+
+fn validate_provider_import_item_v4(
     position: usize,
     provider: &ProviderExportItem,
 ) -> Result<ValidatedProviderImportItem, Response> {
@@ -2274,6 +3023,18 @@ fn validate_provider_import_item_v3(
         &provider.custom_headers,
         provider.custom_body.as_ref(),
     )
+}
+
+fn legacy_provider_export_models(models: &[ProviderExportModelLegacy]) -> Vec<ProviderExportModel> {
+    models
+        .iter()
+        .map(|model| ProviderExportModel {
+            model_id: model.model_id.clone(),
+            display_name: model.display_name.clone(),
+            input_modalities: default_input_modalities(),
+            output_modalities: default_output_modalities(),
+        })
+        .collect()
 }
 
 fn validate_provider_import_item(
@@ -2399,6 +3160,18 @@ fn validate_provider_import_models(
         validated.push(ValidatedProviderImportModel {
             model_id: model_id.to_string(),
             display_name: display_name.to_string(),
+            input_modalities: normalize_input_modalities(Some(&model.input_modalities))
+                .map_err(|_| {
+                    bad_request_response(&format!(
+                        "Provider {provider_position} model {model_position} input capabilities are invalid"
+                    ))
+                })?,
+            output_modalities: normalize_output_modalities(Some(&model.output_modalities))
+                .map_err(|_| {
+                    bad_request_response(&format!(
+                        "Provider {provider_position} model {model_position} output capabilities are invalid"
+                    ))
+                })?,
         });
     }
 
@@ -2420,6 +3193,8 @@ fn provider_import_preview_item(
             .map(|model| ProviderExportModel {
                 model_id: model.model_id.clone(),
                 display_name: model.display_name.clone(),
+                input_modalities: model.input_modalities.clone(),
+                output_modalities: model.output_modalities.clone(),
             })
             .collect(),
         advanced_config: provider_import_advanced_summary(provider),
@@ -2440,6 +3215,62 @@ fn is_supported_provider_base_url(value: &str) -> bool {
         Ok(url) => matches!(url.scheme(), "http" | "https") && url.host_str().is_some(),
         Err(_) => false,
     }
+}
+
+fn is_loopback_provider_base_url(base_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url.trim()) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.trim_matches(['[', ']']);
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+
+    host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+fn provider_bound_image_file_ids(parts: &[Value]) -> Result<Vec<u64>, String> {
+    let mut file_ids = Vec::new();
+    for part in parts {
+        if part.get("type").and_then(Value::as_str) != Some("image") {
+            continue;
+        }
+
+        let Some(metadata) = part.get("metadata").and_then(Value::as_object) else {
+            return Err("Image attachment metadata is missing".to_string());
+        };
+        let mime = metadata
+            .get("mime")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if mime == "image/gif" {
+            continue;
+        }
+        if !is_provider_image_mime(mime) {
+            return Err(LOCAL_IMAGE_CAPTURE_UNSUPPORTED_TEXT.to_string());
+        }
+        let Some(file_id) = metadata.get("fileId").and_then(Value::as_u64) else {
+            return Err("Image attachment metadata is missing".to_string());
+        };
+        file_ids.push(file_id);
+    }
+
+    if file_ids.len() > 1 {
+        return Err("Only one image can be sent in this prototype.".to_string());
+    }
+
+    Ok(file_ids)
+}
+
+fn is_provider_image_mime(mime: &str) -> bool {
+    matches!(mime, "image/png" | "image/jpeg" | "image/webp")
 }
 
 fn field_is_too_long(value: &str, max_chars: usize) -> bool {
@@ -2633,13 +3464,16 @@ async fn resolve_openai_chat_config(
                         provider.secret_ref.clone(),
                         provider.custom_headers.clone(),
                         provider.custom_body.clone(),
+                        model.input_modalities.clone(),
                     )
                 })
             })
         })
     };
 
-    let Some((base_url, model_id, secret_ref, custom_headers, custom_body)) = config else {
+    let Some((base_url, model_id, secret_ref, custom_headers, custom_body, input_modalities)) =
+        config
+    else {
         return Ok(None);
     };
 
@@ -2663,6 +3497,7 @@ async fn resolve_openai_chat_config(
         api_key,
         custom_headers,
         custom_body,
+        input_modalities,
     }))
 }
 
@@ -2718,6 +3553,7 @@ async fn resolve_openai_chat_config_for_provider(
         api_key,
         custom_headers: provider.custom_headers.clone(),
         custom_body: provider.custom_body.clone(),
+        input_modalities: model.input_modalities.clone(),
     }))
 }
 
@@ -2749,6 +3585,175 @@ fn build_openai_chat_request_body(
     }
 
     Ok(Value::Object(body))
+}
+
+#[allow(dead_code)]
+fn build_openai_vision_chat_request_body(
+    config: &OpenAiChatConfig,
+    messages: Vec<OpenAiCompatibleChatMessage>,
+    stream: bool,
+    kind: OpenAiRequestKind,
+) -> Result<Value, String> {
+    let mut body = if let Some(custom_body) = config.custom_body.as_ref() {
+        let validated = validate_custom_body_value(custom_body)?;
+        validated
+            .as_object()
+            .cloned()
+            .ok_or_else(|| "Custom body must be a JSON object".to_string())?
+    } else {
+        Map::new()
+    };
+
+    let messages = messages
+        .iter()
+        .map(openai_compatible_message_to_value)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    body.insert("model".to_string(), json!(config.model_id.clone()));
+    body.insert("messages".to_string(), Value::Array(messages));
+    body.insert("stream".to_string(), json!(stream));
+
+    if kind == OpenAiRequestKind::TestConnection {
+        body.insert("max_tokens".to_string(), json!(1));
+    }
+
+    Ok(Value::Object(body))
+}
+
+#[allow(dead_code)]
+fn openai_compatible_message_to_value(
+    message: &OpenAiCompatibleChatMessage,
+) -> Result<Value, String> {
+    let content = match &message.content {
+        OpenAiCompatibleMessageContent::Text(text) => Value::String(text.clone()),
+        OpenAiCompatibleMessageContent::Parts(parts) => {
+            let parts = parts
+                .iter()
+                .map(openai_compatible_content_part_to_value)
+                .collect::<Result<Vec<_>, _>>()?;
+            Value::Array(parts)
+        }
+    };
+
+    Ok(json!({
+        "role": message.role.clone(),
+        "content": content,
+    }))
+}
+
+#[allow(dead_code)]
+fn openai_compatible_content_part_to_value(
+    part: &OpenAiCompatibleContentPart,
+) -> Result<Value, String> {
+    match part {
+        OpenAiCompatibleContentPart::Text(text) => Ok(json!({
+            "type": "text",
+            "text": text,
+        })),
+        OpenAiCompatibleContentPart::ImageUrl {
+            data_url,
+            detail,
+            file_id: _,
+        } => {
+            if !is_supported_image_data_url(data_url) {
+                return Err("Image data URL is not supported".to_string());
+            }
+
+            Ok(json!({
+                "type": "image_url",
+                "image_url": {
+                    "url": data_url,
+                    "detail": openai_image_detail_value(*detail),
+                }
+            }))
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn openai_image_detail_value(detail: OpenAiImageDetail) -> &'static str {
+    match detail {
+        OpenAiImageDetail::Auto => "auto",
+        OpenAiImageDetail::Low => "low",
+        OpenAiImageDetail::High => "high",
+    }
+}
+
+#[allow(dead_code)]
+fn is_supported_image_data_url(value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+
+    [
+        "data:image/png;base64,",
+        "data:image/jpeg;base64,",
+        "data:image/webp;base64,",
+    ]
+    .iter()
+    .any(|prefix| value.starts_with(prefix))
+}
+
+fn image_data_url(mime: &str, bytes: &[u8]) -> Result<String, String> {
+    if !is_provider_image_mime(mime) {
+        return Err("Image attachment type is not supported for capture testing".to_string());
+    }
+    if bytes.len() > PROVIDER_IMAGE_INPUT_MAX_BYTES {
+        return Err("Image attachment is too large for capture testing".to_string());
+    }
+
+    Ok(format!(
+        "data:{mime};base64,{}",
+        base64_encode_for_data_url(bytes)
+    ))
+}
+
+fn base64_encode_for_data_url(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+
+        output.push(TABLE[(b0 >> 2) as usize] as char);
+        output.push(TABLE[(((b0 & 0b0000_0011) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            output.push(TABLE[(((b1 & 0b0000_1111) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            output.push('=');
+        }
+        if chunk.len() > 2 {
+            output.push(TABLE[(b2 & 0b0011_1111) as usize] as char);
+        } else {
+            output.push('=');
+        }
+    }
+    output
+}
+
+fn openai_vision_messages_for_current_turn(
+    user_text: Option<String>,
+    image: ManagedImageProviderInput,
+) -> Result<Vec<OpenAiCompatibleChatMessage>, String> {
+    let text = user_text
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "Describe this image.".to_string());
+    let data_url = image_data_url(&image.mime, &image.bytes)?;
+
+    Ok(vec![OpenAiCompatibleChatMessage {
+        role: "user".to_string(),
+        content: OpenAiCompatibleMessageContent::Parts(vec![
+            OpenAiCompatibleContentPart::Text(text),
+            OpenAiCompatibleContentPart::ImageUrl {
+                data_url,
+                detail: OpenAiImageDetail::Auto,
+                file_id: image.file_id,
+            },
+        ]),
+    }])
 }
 
 fn apply_openai_custom_headers(
@@ -2838,6 +3843,37 @@ fn spawn_openai_stream_generation(
     });
 }
 
+fn spawn_openai_vision_capture_generation(
+    state: Arc<MockApiState>,
+    conversation_id: String,
+    assistant_message_id: String,
+    config: OpenAiChatConfig,
+    messages: Vec<OpenAiCompatibleChatMessage>,
+) {
+    tokio::spawn(async move {
+        let stream_result = stream_openai_compatible_vision_capture(
+            &state,
+            &conversation_id,
+            &assistant_message_id,
+            &config,
+            messages,
+        )
+        .await;
+
+        if let Err(error) = stream_result {
+            append_text_to_assistant_message(
+                &state,
+                &conversation_id,
+                &assistant_message_id,
+                &error,
+            )
+            .await;
+        }
+
+        finish_streaming_assistant_reply(&state, &conversation_id, &assistant_message_id).await;
+    });
+}
+
 async fn stream_openai_compatible_chat(
     state: &Arc<MockApiState>,
     conversation_id: &str,
@@ -2866,6 +3902,70 @@ async fn stream_openai_compatible_chat(
             status.as_u16(),
             status.canonical_reason().unwrap_or("HTTP error")
         ));
+    }
+
+    let mut buffer = String::new();
+    while let Some(chunk) = response.chunk().await.map_err(safe_reqwest_error)? {
+        if !is_generation_active(state, conversation_id).await {
+            return Ok(());
+        }
+
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(line_end) = buffer.find('\n') {
+            let line = buffer[..line_end].trim_end_matches('\r').to_string();
+            buffer.drain(..=line_end);
+            if handle_openai_stream_line(state, conversation_id, assistant_message_id, &line)
+                .await?
+            {
+                return Ok(());
+            }
+            if !is_generation_active(state, conversation_id).await {
+                return Ok(());
+            }
+        }
+    }
+
+    if !buffer.trim().is_empty()
+        && handle_openai_stream_line(state, conversation_id, assistant_message_id, &buffer).await?
+    {
+        return Ok(());
+    }
+
+    if !is_generation_active(state, conversation_id).await {
+        Ok(())
+    } else {
+        Err("stream ended before DONE".to_string())
+    }
+}
+
+async fn stream_openai_compatible_vision_capture(
+    state: &Arc<MockApiState>,
+    conversation_id: &str,
+    assistant_message_id: &str,
+    config: &OpenAiChatConfig,
+    messages: Vec<OpenAiCompatibleChatMessage>,
+) -> Result<(), String> {
+    let body = build_openai_vision_chat_request_body(
+        config,
+        messages,
+        true,
+        OpenAiRequestKind::StreamingChat,
+    )?;
+
+    let request = state
+        .http_client
+        .post(openai_chat_completions_url(&config.base_url));
+    let request = apply_openai_custom_headers(request, &config.custom_headers)?;
+    let mut response = request
+        .bearer_auth(&config.api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(safe_reqwest_error)?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(safe_http_status_error(status));
     }
 
     let mut buffer = String::new();
@@ -3233,7 +4333,7 @@ fn build_models_from_multi_request(
             )));
         }
 
-        let record_id = request
+        let requested_record_id = request
             .id
             .as_deref()
             .map(str::trim)
@@ -3247,16 +4347,22 @@ fn build_models_from_multi_request(
                     )))
                 }
             })
-            .transpose()?
-            .or_else(|| {
-                existing.and_then(|provider| {
+            .transpose()?;
+
+        let existing_model = existing.and_then(|provider| {
+            requested_record_id
+                .as_ref()
+                .and_then(|record_id| provider.models.iter().find(|model| model.id == *record_id))
+                .or_else(|| {
                     provider
                         .models
                         .iter()
                         .find(|model| model.model_id == model_id)
-                        .map(|model| model.id.clone())
                 })
-            })
+        });
+
+        let record_id = requested_record_id
+            .or_else(|| existing_model.map(|model| model.id.clone()))
             .unwrap_or_else(|| state.next_id("desktop-model"));
 
         if !seen_record_ids.insert(record_id.clone()) {
@@ -3265,10 +4371,31 @@ fn build_models_from_multi_request(
             )));
         }
 
+        let input_modalities = if let Some(modalities) = request.input_modalities.as_ref() {
+            normalize_input_modalities(Some(modalities)).map_err(|message| {
+                bad_request_response(&format!("Provider model {position}: {message}"))
+            })?
+        } else {
+            existing_model
+                .map(|model| model.input_modalities.clone())
+                .unwrap_or_else(default_input_modalities)
+        };
+        let output_modalities = if let Some(modalities) = request.output_modalities.as_ref() {
+            normalize_output_modalities(Some(modalities)).map_err(|message| {
+                bad_request_response(&format!("Provider model {position}: {message}"))
+            })?
+        } else {
+            existing_model
+                .map(|model| model.output_modalities.clone())
+                .unwrap_or_else(default_output_modalities)
+        };
+
         models.push(DesktopProviderModelConfig {
             id: record_id,
             model_id: model_id.to_string(),
             display_name: display_name.to_string(),
+            input_modalities,
+            output_modalities,
         });
     }
 
@@ -3321,11 +4448,14 @@ fn build_models_from_singular_request(
         model.id = model_record_id;
         model.model_id = model_id;
         model.display_name = display_name;
+        model.normalize_modalities();
     } else {
         models.push(DesktopProviderModelConfig {
             id: model_record_id,
             model_id,
             display_name,
+            input_modalities: default_input_modalities(),
+            output_modalities: default_output_modalities(),
         });
     }
 
@@ -3662,24 +4792,43 @@ fn default_persisted_state() -> PersistedMockState {
         settings: default_settings(),
         conversations,
         providers: Vec::new(),
+        files: Vec::new(),
     }
 }
 
-fn migrate_v1_to_v4(mut persisted: PersistedMockState) -> PersistedMockState {
+fn migrate_v1_to_v6(mut persisted: PersistedMockState) -> PersistedMockState {
     persisted.schema_version = STATE_SCHEMA_VERSION;
     persisted.saved_at = now_millis();
     persisted.providers = Vec::new();
+    persisted.files = Vec::new();
     persisted
 }
 
-fn migrate_v2_to_v4(mut persisted: PersistedMockState) -> PersistedMockState {
+fn migrate_v2_to_v6(mut persisted: PersistedMockState) -> PersistedMockState {
     persisted.schema_version = STATE_SCHEMA_VERSION;
     persisted.saved_at = now_millis();
     normalize_desktop_providers(&mut persisted.providers);
+    persisted.files = Vec::new();
     persisted
 }
 
-fn migrate_v3_to_v4(mut persisted: PersistedMockState) -> PersistedMockState {
+fn migrate_v3_to_v6(mut persisted: PersistedMockState) -> PersistedMockState {
+    persisted.schema_version = STATE_SCHEMA_VERSION;
+    persisted.saved_at = now_millis();
+    normalize_desktop_providers(&mut persisted.providers);
+    persisted.files = Vec::new();
+    persisted
+}
+
+fn migrate_v4_to_v6(mut persisted: PersistedMockState) -> PersistedMockState {
+    persisted.schema_version = STATE_SCHEMA_VERSION;
+    persisted.saved_at = now_millis();
+    normalize_desktop_providers(&mut persisted.providers);
+    persisted.files = Vec::new();
+    persisted
+}
+
+fn migrate_v5_to_v6(mut persisted: PersistedMockState) -> PersistedMockState {
     persisted.schema_version = STATE_SCHEMA_VERSION;
     persisted.saved_at = now_millis();
     normalize_desktop_providers(&mut persisted.providers);
@@ -3886,6 +5035,169 @@ fn is_safe_config_id(id: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':'))
 }
 
+fn is_safe_storage_key(storage_key: &str) -> bool {
+    !storage_key.is_empty()
+        && storage_key.len() <= 128
+        && storage_key
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+}
+
+fn storage_key_for_file(id: u64) -> String {
+    format!("file-{id}-{}", now_millis())
+}
+
+fn sanitize_upload_file_name(file_name: Option<&str>) -> String {
+    let file_name = file_name
+        .unwrap_or("upload.bin")
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("upload.bin");
+    let mut sanitized = file_name
+        .chars()
+        .filter(|ch| {
+            !ch.is_control() && !matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+        })
+        .collect::<String>()
+        .trim()
+        .to_string();
+
+    if sanitized.is_empty() {
+        sanitized = "upload.bin".to_string();
+    }
+
+    truncate_chars(&sanitized, FILE_DISPLAY_NAME_MAX_CHARS)
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
+fn safe_header_file_name(file_name: &str) -> String {
+    let value = sanitize_upload_file_name(Some(file_name));
+    let sanitized = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii() && !ch.is_control() && !matches!(ch, '"' | '\\') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "download.bin".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn detect_safe_upload_mime(bytes: &[u8], display_name: &str) -> Result<&'static str, &'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return Ok("image/png");
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Ok("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Ok("image/gif");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Ok("image/webp");
+    }
+    if bytes.starts_with(b"%PDF-") {
+        return Ok("application/pdf");
+    }
+    if is_utf8_plain_text(bytes) {
+        if is_dangerous_text_upload(bytes, display_name) {
+            return Err("File type is not supported");
+        }
+        return Ok("text/plain");
+    }
+
+    Err("File type is not supported")
+}
+
+fn is_utf8_plain_text(bytes: &[u8]) -> bool {
+    !bytes.contains(&0) && std::str::from_utf8(bytes).is_ok()
+}
+
+fn is_dangerous_text_upload(bytes: &[u8], display_name: &str) -> bool {
+    if has_dangerous_upload_extension(display_name) {
+        return true;
+    }
+
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return true;
+    };
+    let lower = text
+        .trim_start_matches('\u{feff}')
+        .trim_start()
+        .chars()
+        .take(1024)
+        .collect::<String>()
+        .to_ascii_lowercase();
+
+    lower.starts_with("<svg")
+        || lower.starts_with("<!doctype html")
+        || lower.starts_with("<html")
+        || lower.starts_with("<script")
+        || lower.contains("<script")
+        || lower.contains("<svg")
+        || lower.contains("<iframe")
+        || lower.contains("<object")
+        || lower.contains("<embed")
+}
+
+fn has_dangerous_upload_extension(display_name: &str) -> bool {
+    let extension = display_name
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase());
+    matches!(
+        extension.as_deref(),
+        Some(
+            "svg"
+                | "html"
+                | "htm"
+                | "js"
+                | "mjs"
+                | "cjs"
+                | "jsx"
+                | "ts"
+                | "tsx"
+                | "vbs"
+                | "ps1"
+                | "bat"
+                | "cmd"
+                | "sh"
+                | "exe"
+                | "dll"
+                | "msi"
+                | "zip"
+                | "rar"
+                | "7z"
+                | "doc"
+                | "docx"
+                | "xls"
+                | "xlsx"
+                | "ppt"
+                | "pptx"
+        )
+    )
+}
+
+fn upload_kind_for_mime(mime: &str) -> &'static str {
+    if mime.starts_with("image/") {
+        "image"
+    } else {
+        "document"
+    }
+}
+
+fn max_persisted_file_id(files: &[ManagedFileMetadata]) -> u64 {
+    files.iter().map(|file| file.id).max().unwrap_or(1)
+}
+
 fn max_persisted_id_seq(conversations: &HashMap<String, ConversationDto>) -> u64 {
     let mut max_id = 1;
 
@@ -4053,6 +5365,12 @@ fn first_text_part(parts: &[Value]) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn has_non_text_parts(parts: &[Value]) -> bool {
+    parts
+        .iter()
+        .any(|part| part.get("type").and_then(Value::as_str) != Some("text"))
+}
+
 fn text_from_parts(parts: &[Value]) -> Option<String> {
     let text = parts
         .iter()
@@ -4199,4 +5517,253 @@ fn now_millis() -> u64 {
 
 fn now_iso() -> String {
     Utc::now().to_rfc3339()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn openai_vision_test_config(custom_body: Option<Value>) -> OpenAiChatConfig {
+        OpenAiChatConfig {
+            base_url: "http://127.0.0.1:9999/v1".to_string(),
+            model_id: "vision-test-model".to_string(),
+            api_key: "test-key".to_string(),
+            custom_headers: Vec::new(),
+            custom_body,
+            input_modalities: vec![
+                MODEL_MODALITY_TEXT.to_string(),
+                MODEL_MODALITY_IMAGE.to_string(),
+            ],
+        }
+    }
+
+    fn openai_vision_test_message(data_url: &str) -> OpenAiCompatibleChatMessage {
+        OpenAiCompatibleChatMessage {
+            role: "user".to_string(),
+            content: OpenAiCompatibleMessageContent::Parts(vec![
+                OpenAiCompatibleContentPart::Text("Describe this image".to_string()),
+                OpenAiCompatibleContentPart::ImageUrl {
+                    data_url: data_url.to_string(),
+                    detail: OpenAiImageDetail::Auto,
+                    file_id: 123,
+                },
+            ]),
+        }
+    }
+
+    #[test]
+    fn openai_vision_builder_serializes_content_array() {
+        let config = openai_vision_test_config(None);
+        let body = build_openai_vision_chat_request_body(
+            &config,
+            vec![openai_vision_test_message("data:image/png;base64,AAAA")],
+            true,
+            OpenAiRequestKind::StreamingChat,
+        )
+        .expect("vision request body should build");
+
+        assert_eq!(body["model"], json!("vision-test-model"));
+        assert_eq!(body["stream"], json!(true));
+
+        let content = body["messages"][0]["content"]
+            .as_array()
+            .expect("vision message content should be an array");
+        assert_eq!(content[0]["type"], json!("text"));
+        assert_eq!(content[0]["text"], json!("Describe this image"));
+        assert_eq!(content[1]["type"], json!("image_url"));
+        assert_eq!(
+            content[1]["image_url"]["url"]
+                .as_str()
+                .expect("image URL should be a string")
+                .starts_with("data:image/png;base64,"),
+            true
+        );
+        assert_eq!(content[1]["image_url"]["detail"], json!("auto"));
+    }
+
+    #[test]
+    fn openai_vision_builder_does_not_serialize_internal_file_id() {
+        let config = openai_vision_test_config(None);
+        let body = build_openai_vision_chat_request_body(
+            &config,
+            vec![openai_vision_test_message("data:image/jpeg;base64,AAAA")],
+            true,
+            OpenAiRequestKind::StreamingChat,
+        )
+        .expect("vision request body should build");
+
+        let serialized = serde_json::to_string(&body).expect("body should serialize");
+        assert!(!serialized.contains("file_id"));
+        assert!(!serialized.contains("storageKey"));
+        assert!(!serialized.contains("/api/files/path"));
+        assert!(!serialized.contains("file://"));
+        assert!(!serialized.contains("123"));
+    }
+
+    #[test]
+    fn openai_vision_builder_rejects_unsupported_data_url() {
+        let config = openai_vision_test_config(None);
+        for value in [
+            "data:image/svg+xml;base64,AAAA",
+            "data:image/gif;base64,AAAA",
+            "data:text/html;base64,AAAA",
+            "file:///C:/test.png",
+            "/api/files/path/1",
+            "https://example.com/image.png",
+            "",
+        ] {
+            let result = build_openai_vision_chat_request_body(
+                &config,
+                vec![openai_vision_test_message(value)],
+                true,
+                OpenAiRequestKind::StreamingChat,
+            );
+            assert!(result.is_err(), "{value} should be rejected");
+        }
+    }
+
+    #[test]
+    fn openai_vision_text_builder_still_serializes_string_content() {
+        let config = openai_vision_test_config(None);
+        let body = build_openai_chat_request_body(
+            &config,
+            vec![OpenAiChatMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            true,
+            OpenAiRequestKind::StreamingChat,
+        )
+        .expect("text request body should build");
+
+        assert_eq!(body["messages"][0]["content"], json!("hello"));
+        assert!(body["messages"][0]["content"].as_array().is_none());
+    }
+
+    #[test]
+    fn loopback_base_url_allows_localhost() {
+        for value in [
+            "http://127.0.0.1:9999/v1",
+            "http://localhost:9999/v1",
+            "http://[::1]:9999/v1",
+            "https://127.0.0.1:9999/v1",
+        ] {
+            assert!(
+                is_loopback_provider_base_url(value),
+                "{value} should be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn loopback_base_url_rejects_public_and_private_hosts() {
+        for value in [
+            "https://api.openai.com/v1",
+            "http://example.com/v1",
+            "http://192.168.1.10:9999/v1",
+            "http://10.0.0.1:9999/v1",
+            "http://172.16.0.1:9999/v1",
+            "http://0.0.0.0:9999/v1",
+            "file:///C:/test",
+            "/v1",
+            "",
+        ] {
+            assert!(
+                !is_loopback_provider_base_url(value),
+                "{value} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn loopback_base_url_rejects_private_networks() {
+        for value in [
+            "http://192.168.0.2:9999/v1",
+            "http://10.1.2.3:9999/v1",
+            "http://172.16.0.1:9999/v1",
+            "http://172.31.255.254:9999/v1",
+            "http://0.0.0.0:9999/v1",
+        ] {
+            assert!(
+                !is_loopback_provider_base_url(value),
+                "{value} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_bound_image_file_ids_ignores_gif() {
+        let parts = vec![json!({
+            "type": "image",
+            "metadata": {
+                "fileId": 42,
+                "mime": "image/gif"
+            }
+        })];
+
+        let file_ids =
+            provider_bound_image_file_ids(&parts).expect("gif should not be provider-bound");
+
+        assert!(file_ids.is_empty());
+    }
+
+    #[test]
+    fn provider_bound_image_file_ids_rejects_multiple_provider_images() {
+        let parts = vec![
+            json!({
+                "type": "image",
+                "metadata": {
+                    "fileId": 1,
+                    "mime": "image/png"
+                }
+            }),
+            json!({
+                "type": "image",
+                "metadata": {
+                    "fileId": 2,
+                    "mime": "image/webp"
+                }
+            }),
+        ];
+
+        let result = provider_bound_image_file_ids(&parts);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn provider_bound_image_file_ids_rejects_missing_metadata() {
+        let parts = vec![json!({
+            "type": "image",
+            "url": "/api/files/path/1"
+        })];
+
+        let result = provider_bound_image_file_ids(&parts);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn image_data_url_rejects_gif() {
+        let result = image_data_url("image/gif", b"GIF89a");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn image_data_url_rejects_oversized_bytes() {
+        let bytes = vec![0; PROVIDER_IMAGE_INPUT_MAX_BYTES + 1];
+        let result = image_data_url("image/png", &bytes);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn base64_encoder_known_value() {
+        assert_eq!(base64_encode_for_data_url(b""), "");
+        assert_eq!(base64_encode_for_data_url(b"f"), "Zg==");
+        assert_eq!(base64_encode_for_data_url(b"fo"), "Zm8=");
+        assert_eq!(base64_encode_for_data_url(b"foo"), "Zm9v");
+        assert_eq!(base64_encode_for_data_url(b"hello"), "aGVsbG8=");
+    }
 }
