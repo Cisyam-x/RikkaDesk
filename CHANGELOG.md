@@ -6,9 +6,37 @@ This changelog tracks the RikkaDesk desktop work in this fork. It does not repla
 
 ## 0.1.0 Private Beta Line
 
-The current private hotfix tag is `rikkadesk-v0.1.0-beta.13`. The `beta/0.1.0` branch may contain later documentation, feature work, or hotfix candidates after that tag.
+The current pushed private hotfix tag is `rikkadesk-v0.1.0-beta.13`. The current branch contains a beta.14 UX hotfix candidate after that tag; no beta.14 tag or public GitHub Release has been created yet.
 
 This beta line is not a public GitHub Release.
+
+### `rikkadesk-v0.1.0-beta.14` - UX Hotfix Candidate
+
+Status:
+
+- Candidate only; the tag has not been created.
+- `rikkadesk-v0.1.0-beta.13` remains the current pushed private hotfix tag and must not be moved.
+- This is not a public GitHub Release.
+
+Fixed:
+
+- Clear the TEXT-only image attachment validation error when switching conversations, entering the welcome/new-chat view, changing attachments, or changing models.
+- Avoid carrying the composer red validation message from one chat context into another.
+
+Updated:
+
+- Refresh About RikkaDesk copy for the beta.14 candidate line.
+- Show `rikkadesk-v0.1.0-beta.13` as the current private baseline and `beta.14 UX hotfix candidate` as the current build.
+- Move local files/attachments and local image attachments into Current support.
+- Clarify that real-provider image input is still not enabled by default, while local PNG/JPEG/WEBP/GIF image attachments are supported.
+
+Unchanged:
+
+- Real-provider image input remains disabled by default.
+- The loopback-only capture path remains the only implemented image-send prototype.
+- Local state remains `schemaVersion: 6`.
+- Provider import/export remains version 4.
+- The app/package version remains `0.1.0`.
 
 ### `rikkadesk-v0.1.0-beta.13` - Attachment Rendering Hotfix
 

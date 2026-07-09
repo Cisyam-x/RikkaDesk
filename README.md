@@ -4,9 +4,9 @@ RikkaDesk is an unofficial desktop derivative / experiment based on RikkaHub.
 
 RikkaDesk is a non-official desktop-oriented derivative of [RikkaHub](https://github.com/rikkahub/rikkahub). It currently focuses on making the existing RikkaHub `web-ui` usable as the foundation for a local Windows desktop app.
 
-This repository is in an early staged migration. The current prototype is experimental and is being prepared as a local/private beta, not a public production release. The current feature-stable private beta tag remains `rikkadesk-v0.1.0-beta.11`.
+This repository is in an early staged migration. The current prototype is experimental and is being prepared as a local/private beta, not a public production release. The current pushed private hotfix tag is `rikkadesk-v0.1.0-beta.13`.
 
-The current branch contains beta.12 candidate documentation and Phase 10 local attachment work, but no beta.12 tag or public GitHub Release has been published.
+The current branch contains a beta.14 UX hotfix candidate after beta.13. The candidate tag would be `rikkadesk-v0.1.0-beta.14`, but no beta.14 tag or public GitHub Release has been created yet.
 
 > [!IMPORTANT]
 > The upstream RikkaHub feature list later in this README describes the Android upstream project. It does not mean every upstream feature is available in the current RikkaDesk desktop beta.
@@ -28,7 +28,8 @@ The current RikkaDesk beta includes a local Tauri desktop shell with a Rust desk
 - Phase 8 P1-P4 are complete: Provider state now supports `providers[].models[]`, Provider Settings can manage multiple models per provider, and provider import/export v2 handles multi-model config while retaining v1 import compatibility.
 - Phase 9B P1-P4 are complete: Provider Settings can save non-sensitive custom headers and safe custom body JSON, Test Connection and Streaming Chat share the safe OpenAI-compatible request builder, and provider import/export v3 handles safe advanced request config while retaining v1/v2 import compatibility.
 - Phase 9C P2-P4 are complete: Markdown table/code overflow polish, KaTeX mhchem chemistry formulas, message Markdown raw HTML hardening, and Workbench preview sandbox hardening are available while Mermaid in normal messages remains disabled/deferred.
-- Phase 10 P2-P6.5 P0 are complete on this branch: the local file API skeleton, attachment upload alignment, safe image/document rendering, model capability metadata, image attachment gating, loopback-only synthetic image capture prototype, and real-provider manual gate documentation are available for beta.12 candidate validation.
+- Phase 10 P2-P6.5 P0 are complete on this branch: the local file API skeleton, attachment upload alignment, safe image/document rendering, model capability metadata, image attachment gating, loopback-only synthetic image capture prototype, and real-provider manual gate documentation are available in the beta.13 hotfix line.
+- Beta 14 UX hotfix candidate work clears transient TEXT-only image gating errors when switching chats, entering the welcome/new-chat view, changing attachments, or changing models.
 - Beta 7 hotfix is complete: long OpenAI-compatible streaming responses run in the background after message send/regenerate requests return accepted, avoiding the previous 30-second POST timeout.
 
 Current limitations:
@@ -40,7 +41,7 @@ Current limitations:
 - Message Markdown no longer explicitly enables `rehypeRaw`. Unsafe link schemes such as `javascript:`, `data:`, `file:`, `blob:`, and relative URLs are blocked by default; normal `http:`, `https:`, and `mailto:` links keep `target="_blank"` and `rel="noopener noreferrer"`.
 - Unsafe Markdown image sources are blocked by default.
 - Workbench Mermaid preview uses strict Mermaid security and a narrower iframe sandbox, but it still loads Mermaid from a remote CDN and remains a residual risk to revisit before any public release.
-- Local file attachments are implemented for beta.12 candidate validation: PNG/JPEG/WEBP/GIF images are local attachments, TXT/PDF uploads are document chips, PDF/TXT remain chip-only, and safe image/document rendering is implemented.
+- Local file attachments are implemented in the beta.13 hotfix line and beta.14 candidate: PNG/JPEG/WEBP/GIF images are local attachments, TXT/PDF uploads are document chips, PDF/TXT remain chip-only, and safe image/document rendering is implemented.
 - Real OpenAI-compatible provider chat remains text-only by default. Real-provider image input is not enabled for ordinary beta testing.
 - IMAGE-capable models can use a loopback-only synthetic image capture prototype for one current-turn PNG/JPEG/WEBP image. This path is for local synthetic testing only; base64 is in memory for the capture request and is not persisted to state, logs, exports, or message parts.
 - OCR, PDF/Office parsing, audio/video input, search, MCP, tools, Workspace, full multimodal provider support, sync, and cloud backup are intentionally deferred.
