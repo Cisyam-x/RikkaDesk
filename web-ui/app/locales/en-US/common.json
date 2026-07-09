@@ -194,6 +194,7 @@
     "feature_tag_label": "Current private baseline",
     "private_line_label": "Private beta line",
     "current_baseline_label": "Current private baseline",
+    "current_hotfix_tag_label": "Current private hotfix tag",
     "current_build_label": "Current build",
     "support_title": "Current support",
     "support": {

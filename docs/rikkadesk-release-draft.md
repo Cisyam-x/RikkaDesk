@@ -5,18 +5,18 @@ This document is a private beta hotfix draft for RikkaDesk. Do not publish a pub
 ## Release Title Suggestion
 
 ```text
-RikkaDesk 0.1.0 Beta 14 - Private Windows Desktop UX Hotfix Candidate
+RikkaDesk 0.1.0 Beta 14 - Private Windows Desktop UX Hotfix
 ```
 
 ## Tag Suggestion
 
-Current pushed private hotfix tag:
+Current private beta baseline:
 
 ```text
 rikkadesk-v0.1.0-beta.13
 ```
 
-Candidate tag if this hotfix is accepted:
+Current private hotfix tag:
 
 ```text
 rikkadesk-v0.1.0-beta.14
@@ -28,7 +28,7 @@ Previous private beta tag:
 rikkadesk-v0.1.0-beta.12
 ```
 
-The `rikkadesk-v0.1.0-beta.13` tag has been created and pushed. The `rikkadesk-v0.1.0-beta.14` tag has not been created yet. Existing tags must not be moved, deleted, or overwritten. Do not publish a public GitHub Release from this draft.
+The `rikkadesk-v0.1.0-beta.13` baseline tag must not be moved, deleted, or overwritten. `rikkadesk-v0.1.0-beta.14` is the beta.14 private hotfix tag. Do not publish a public GitHub Release from this draft.
 
 ## Version Strategy
 
@@ -40,7 +40,7 @@ Current version files:
 Recommendation:
 
 - Keep the internal package version as `0.1.0` for this private beta line.
-- Use `RikkaDesk 0.1.0 Beta 14 UX hotfix candidate` in draft notes and private tester instructions until the beta.14 tag is explicitly created.
+- Use `RikkaDesk 0.1.0 Beta 14 UX hotfix` in draft notes and private tester instructions.
 - Keep beta labels in Git tags and release notes unless the Windows bundler version strategy is explicitly changed later.
 - Do not publish a public prerelease until installer signing, support scope, and license obligations are reviewed.
 
@@ -52,21 +52,21 @@ Reasoning:
 
 ## Draft Release Notes
 
-RikkaDesk is an unofficial desktop derivative / experiment based on RikkaHub. This private beta hotfix candidate packages the existing `web-ui` into a Windows desktop app and adds a local desktop API layer for basic OpenAI-compatible text chat testing plus local attachment validation.
+RikkaDesk is an unofficial desktop derivative / experiment based on RikkaHub. This private beta hotfix packages the existing `web-ui` into a Windows desktop app and adds a local desktop API layer for basic OpenAI-compatible text chat testing plus local attachment validation.
 
 This beta includes:
 
-Beta.14 UX hotfix candidate delta over beta.13:
+Beta.14 UX hotfix delta over beta.13:
 
 - Clear the TEXT-only image attachment validation error when switching conversations, entering the welcome/new-chat view, changing attachments, or changing models.
 - Keep TEXT-only image attachment gating intact while preventing the red composer validation message from leaking across chat contexts.
-- Refresh About RikkaDesk copy to show `rikkadesk-v0.1.0-beta.13` as the current private baseline and `beta.14 UX hotfix candidate` as the current build.
+- Refresh About RikkaDesk copy to show `rikkadesk-v0.1.0-beta.13` as the current private baseline and `beta.14 UX hotfix` as the current build.
 - Move local files/attachments, PNG/JPEG/WEBP/GIF local image attachments, TXT/PDF document chips, TEXT/IMAGE model capability markers, and loopback-only synthetic image capture into Current support.
 - Clarify that real-provider image input remains disabled by default and full multimodal provider support remains unsupported.
 - Keep local state at `schemaVersion: 6`.
 - Keep provider import/export at version 4.
 - Keep the app package version at `0.1.0`.
-- Do not create a public GitHub Release from this candidate.
+- Do not create a public GitHub Release from this private hotfix.
 
 Beta.13 hotfix delta over beta.12:
 
@@ -200,7 +200,7 @@ Expected result:
 
 - Only OpenAI-compatible text chat is supported for real provider testing by default.
 - No Gemini, Claude, Anthropic, Vertex, or provider-specific protocols.
-- Local attachments and safe attachment rendering are implemented for the desktop beta candidate.
+- Local attachments and safe attachment rendering are implemented for the desktop beta hotfix line.
 - Real-provider image input is not enabled by default.
 - The image capture prototype is loopback-only and intended for synthetic local testing.
 - Beta.13 does not broaden image sending beyond the loopback-only synthetic capture prototype.
@@ -285,7 +285,7 @@ Recommended private beta flow:
 1. Develop in phase branches.
 2. Merge accepted phase PRs into `beta/0.1.0`.
 3. Create private beta tags only for feature-stable checkpoints.
-4. Keep `rikkadesk-v0.1.0-beta.12` unchanged and keep `rikkadesk-v0.1.0-beta.13` pointing at the accepted beta.13 hotfix docs commit. Create `rikkadesk-v0.1.0-beta.14` only after beta.14 preflight is explicitly approved.
+4. Keep `rikkadesk-v0.1.0-beta.12` unchanged and keep `rikkadesk-v0.1.0-beta.13` pointing at the accepted beta.13 hotfix docs commit. Do not move existing private beta tags.
 5. Do not publish a public GitHub Release until signing, support scope, and license obligations are reviewed.
 
 Do not force-push `main`, `master`, or `beta/0.1.0`.

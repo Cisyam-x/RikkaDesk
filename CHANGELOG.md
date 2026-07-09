@@ -6,16 +6,16 @@ This changelog tracks the RikkaDesk desktop work in this fork. It does not repla
 
 ## 0.1.0 Private Beta Line
 
-The current pushed private hotfix tag is `rikkadesk-v0.1.0-beta.13`. The current branch contains a beta.14 UX hotfix candidate after that tag; no beta.14 tag or public GitHub Release has been created yet.
+The current private beta baseline is `rikkadesk-v0.1.0-beta.13`, and the current private hotfix tag is `rikkadesk-v0.1.0-beta.14`.
 
 This beta line is not a public GitHub Release.
 
-### `rikkadesk-v0.1.0-beta.14` - UX Hotfix Candidate
+### `rikkadesk-v0.1.0-beta.14` - UX Hotfix
 
 Status:
 
-- Candidate only; the tag has not been created.
-- `rikkadesk-v0.1.0-beta.13` remains the current pushed private hotfix tag and must not be moved.
+- Private hotfix tag for the beta.14 UX copy and composer validation fix.
+- `rikkadesk-v0.1.0-beta.13` remains the current private beta baseline and must not be moved.
 - This is not a public GitHub Release.
 
 Fixed:
@@ -25,8 +25,8 @@ Fixed:
 
 Updated:
 
-- Refresh About RikkaDesk copy for the beta.14 candidate line.
-- Show `rikkadesk-v0.1.0-beta.13` as the current private baseline and `beta.14 UX hotfix candidate` as the current build.
+- Refresh About RikkaDesk copy for the beta.14 hotfix line.
+- Show `rikkadesk-v0.1.0-beta.13` as the current private baseline and `beta.14 UX hotfix` as the current build.
 - Move local files/attachments and local image attachments into Current support.
 - Clarify that real-provider image input is still not enabled by default, while local PNG/JPEG/WEBP/GIF image attachments are supported.
 

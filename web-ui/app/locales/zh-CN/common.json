@@ -194,6 +194,7 @@
     "feature_tag_label": "当前私测基线",
     "private_line_label": "私测线",
     "current_baseline_label": "当前私测基线",
+    "current_hotfix_tag_label": "当前私测 hotfix tag",
     "current_build_label": "当前构建",
     "support_title": "当前支持",
     "support": {

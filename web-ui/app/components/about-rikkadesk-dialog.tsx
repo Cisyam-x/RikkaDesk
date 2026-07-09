@@ -15,7 +15,8 @@ import {
 const RIKKADESK_VERSION = "0.1.0";
 const RIKKADESK_PRIVATE_BETA_LINE = "Private Beta";
 const RIKKADESK_CURRENT_BASELINE_TAG = "rikkadesk-v0.1.0-beta.13";
-const RIKKADESK_CURRENT_BUILD = "beta.14 UX hotfix candidate";
+const RIKKADESK_CURRENT_HOTFIX_TAG = "rikkadesk-v0.1.0-beta.14";
+const RIKKADESK_CURRENT_BUILD = "beta.14 UX hotfix";
 
 const SUPPORT_KEYS = [
   "openai_streaming",
@@ -103,6 +104,14 @@ export function AboutRikkaDeskDialog({ open, onOpenChange }: AboutRikkaDeskDialo
                 </dt>
                 <dd className="mt-1 break-all font-mono text-foreground">
                   {RIKKADESK_CURRENT_BASELINE_TAG}
+                </dd>
+              </div>
+              <div>
+                <dt className="text-xs font-medium text-muted-foreground">
+                  {t("about_rikkadesk.current_hotfix_tag_label")}
+                </dt>
+                <dd className="mt-1 break-all font-mono text-foreground">
+                  {RIKKADESK_CURRENT_HOTFIX_TAG}
                 </dd>
               </div>
               <div>
