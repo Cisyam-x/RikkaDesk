@@ -241,3 +241,28 @@ P2 conclusion:
 - Signing workflow design is ready for review.
 - Actual signing must wait for human approval of certificate subject, certificate type, key custody, timestamp policy, and signing operator.
 - RikkaDesk should continue private beta distribution as unsigned until P3/P4 signing validation is explicitly approved.
+
+## Current Decision: Defer P3
+
+RikkaDesk should not enter P3 signing smoke now.
+
+Reasoning:
+
+- Current distribution is small-scope private beta / self-test only.
+- No GitHub Release is being created.
+- No public broad distribution is planned for this checkpoint.
+- Certificate cost and custody overhead are not justified for the current scope.
+- Unsigned installer risk is already documented in the private beta docs.
+- P3 should be entered only when public release, broad distribution, enterprise use, or existing approved certificate material makes signing necessary.
+
+Current path:
+
+- Continue with unsigned private beta artifacts.
+- Keep documenting SmartScreen / Smart App Control risk.
+- Do not ask testers to disable Windows security features.
+- Keep beta tags and private handoff notes as the traceability mechanism.
+
+Next recommended phase:
+
+- Phase 11 P4 unsigned artifact handoff / SHA256SUMS / release checklist.
+- P4 should standardize artifact paths, post-build hashes, installer smoke records, app data cleanup notes, and no-Release private handoff wording.

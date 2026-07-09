@@ -395,6 +395,19 @@ Goal:
 
 - Only if certificate/material exists, sign a local test artifact.
 
+Current decision:
+
+- P3 signing smoke is deferred for the current private beta.
+- The private beta will continue with unsigned artifacts while distribution remains small-scope and private.
+- Signing is required before public release, broad distribution, enterprise use, or any workflow that asks testers to trust RikkaDesk as a published Windows app.
+- Do not enter P3 unless certificate material already exists or a public/broad distribution requirement is approved.
+
+Free or lower-cost options to research later:
+
+- Microsoft Store MSIX distribution path.
+- SignPath Foundation for qualifying open-source projects.
+- Self-signed certificate only for local development, managed machines, or explicitly controlled test environments; self-signed certificates are not suitable for public distribution trust.
+
 Preconditions:
 
 - Certificate ownership approved.
