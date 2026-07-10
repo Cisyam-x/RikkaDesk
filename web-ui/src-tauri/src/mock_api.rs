@@ -1,9 +1,11 @@
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
-    fs as std_fs, io,
+    error::Error,
+    fmt, fs as std_fs,
+    io::{self, Write},
     net::{IpAddr, SocketAddr},
-    path::PathBuf,
+    path::{Path as FilePath, PathBuf},
     ptr,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -11,6 +13,9 @@ use std::{
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(windows)]
+use std::{ffi::OsStr, os::windows::ffi::OsStrExt};
 
 use async_stream::stream;
 use axum::{
@@ -30,7 +35,7 @@ use serde_json::{json, Map, Value};
 use tokio::{
     fs,
     net::TcpListener,
-    sync::{broadcast, RwLock},
+    sync::{broadcast, Mutex, RwLock},
 };
 use tower_http::cors::{Any, CorsLayer};
 #[cfg(windows)]
@@ -39,12 +44,13 @@ use windows_sys::Win32::{
     Security::Cryptography::{
         CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
     },
+    Storage::FileSystem::ReplaceFileW,
 };
 
 const PREFERRED_ADDR: &str = "127.0.0.1:8080";
 const PERSIST_DIR_NAME: &str = "mock-api";
 const STATE_FILE_NAME: &str = "state.v1.json";
-const STATE_TMP_FILE_NAME: &str = "state.v1.json.tmp";
+const STATE_TMP_FILE_PREFIX: &str = "state.v1.json.tmp";
 const STATE_SCHEMA_VERSION: u32 = 6;
 const FILE_METADATA_STATE_SCHEMA_VERSION: u32 = 5;
 const CUSTOM_REQUEST_CONFIG_STATE_SCHEMA_VERSION: u32 = 4;
@@ -107,8 +113,48 @@ impl MockApiHandle {
     }
 }
 
-type PersistenceResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+type PersistenceResult<T> = Result<T, PersistenceError>;
 type SecretStoreResult<T> = Result<T, String>;
+
+#[derive(Debug)]
+struct PersistenceError {
+    stage: &'static str,
+    source: Box<dyn Error + Send + Sync>,
+}
+
+impl PersistenceError {
+    fn new<E>(stage: &'static str, source: E) -> Self
+    where
+        E: Error + Send + Sync + 'static,
+    {
+        Self {
+            stage,
+            source: Box::new(source),
+        }
+    }
+
+    fn stage(&self) -> &'static str {
+        self.stage
+    }
+}
+
+impl fmt::Display for PersistenceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "state persistence failed during {}", self.stage)
+    }
+}
+
+impl Error for PersistenceError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+impl From<io::Error> for PersistenceError {
+    fn from(error: io::Error) -> Self {
+        Self::new("filesystem operation", error)
+    }
+}
 
 trait SecretStore: Send + Sync {
     fn set_secret(&self, secret_ref: &str, value: &str) -> SecretStoreResult<()>;
@@ -314,16 +360,26 @@ fn secret_io_error(error: io::Error) -> String {
 struct MockPersistence {
     state_dir: PathBuf,
     state_path: PathBuf,
+    save_lock: Arc<Mutex<()>>,
+    temp_seq: Arc<AtomicU64>,
+    file_ops: Arc<dyn StateFileOps>,
 }
 
 impl MockPersistence {
     fn new(app_data_dir: PathBuf) -> Self {
+        Self::new_with_file_ops(app_data_dir, Arc::new(RealStateFileOps))
+    }
+
+    fn new_with_file_ops(app_data_dir: PathBuf, file_ops: Arc<dyn StateFileOps>) -> Self {
         let state_dir = app_data_dir.join(PERSIST_DIR_NAME);
         let state_path = state_dir.join(STATE_FILE_NAME);
 
         Self {
             state_dir,
             state_path,
+            save_lock: Arc::new(Mutex::new(())),
+            temp_seq: Arc::new(AtomicU64::new(1)),
+            file_ops,
         }
     }
 
@@ -341,22 +397,170 @@ impl MockPersistence {
         is_safe_storage_key(storage_key).then(|| self.file_blobs_dir().join(storage_key))
     }
 
-    async fn save(&self, persisted: &PersistedMockState) -> PersistenceResult<()> {
-        fs::create_dir_all(&self.state_dir).await?;
+    async fn save<T>(&self, persisted: &T) -> PersistenceResult<()>
+    where
+        T: Serialize + ?Sized,
+    {
+        let _save_guard = self.save_lock.lock().await;
+        self.save_locked(persisted).await
+    }
 
-        let tmp_path = self.state_dir.join(STATE_TMP_FILE_NAME);
-        let data = serde_json::to_vec_pretty(persisted)?;
-        fs::write(&tmp_path, data).await?;
+    async fn save_locked<T>(&self, persisted: &T) -> PersistenceResult<()>
+    where
+        T: Serialize + ?Sized,
+    {
+        let data = serde_json::to_vec_pretty(persisted)
+            .map_err(|error| PersistenceError::new("serialization", error))?;
+        let temp_path = self.next_temp_path();
+        let state_dir = self.state_dir.clone();
+        let state_path = self.state_path.clone();
+        let file_ops = self.file_ops.clone();
 
-        match fs::remove_file(&self.state_path).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(Box::new(error)),
-        }
+        tokio::task::spawn_blocking(move || {
+            write_state_file_atomically(
+                file_ops.as_ref(),
+                &state_dir,
+                &state_path,
+                &temp_path,
+                &data,
+            )
+        })
+        .await
+        .map_err(|error| PersistenceError::new("blocking writer", error))?
+    }
 
-        fs::rename(&tmp_path, &self.state_path).await?;
+    fn next_temp_path(&self) -> PathBuf {
+        let sequence = self.temp_seq.fetch_add(1, Ordering::Relaxed);
+        self.state_dir.join(format!(
+            "{STATE_TMP_FILE_PREFIX}.{}.{}",
+            std::process::id(),
+            sequence
+        ))
+    }
+}
+
+trait StateFileOps: Send + Sync {
+    fn create_dir_all(&self, path: &FilePath) -> io::Result<()>;
+    fn create_temp(&self, path: &FilePath) -> io::Result<std_fs::File>;
+    fn write_all(&self, file: &mut std_fs::File, data: &[u8]) -> io::Result<()>;
+    fn flush(&self, file: &mut std_fs::File) -> io::Result<()>;
+    fn sync_all(&self, file: &std_fs::File) -> io::Result<()>;
+    fn replace(&self, replacement: &FilePath, target: &FilePath) -> io::Result<()>;
+    fn remove_file(&self, path: &FilePath) -> io::Result<()>;
+}
+
+struct RealStateFileOps;
+
+impl StateFileOps for RealStateFileOps {
+    fn create_dir_all(&self, path: &FilePath) -> io::Result<()> {
+        std_fs::create_dir_all(path)
+    }
+
+    fn create_temp(&self, path: &FilePath) -> io::Result<std_fs::File> {
+        std_fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(path)
+    }
+
+    fn write_all(&self, file: &mut std_fs::File, data: &[u8]) -> io::Result<()> {
+        file.write_all(data)
+    }
+
+    fn flush(&self, file: &mut std_fs::File) -> io::Result<()> {
+        file.flush()
+    }
+
+    fn sync_all(&self, file: &std_fs::File) -> io::Result<()> {
+        file.sync_all()
+    }
+
+    fn replace(&self, replacement: &FilePath, target: &FilePath) -> io::Result<()> {
+        replace_state_file(replacement, target)
+    }
+
+    fn remove_file(&self, path: &FilePath) -> io::Result<()> {
+        std_fs::remove_file(path)
+    }
+}
+
+fn write_state_file_atomically(
+    file_ops: &dyn StateFileOps,
+    state_dir: &FilePath,
+    state_path: &FilePath,
+    temp_path: &FilePath,
+    data: &[u8],
+) -> PersistenceResult<()> {
+    file_ops
+        .create_dir_all(state_dir)
+        .map_err(|error| PersistenceError::new("state directory creation", error))?;
+
+    let mut temp_file = file_ops
+        .create_temp(temp_path)
+        .map_err(|error| PersistenceError::new("temp file creation", error))?;
+
+    let write_result = (|| {
+        file_ops
+            .write_all(&mut temp_file, data)
+            .map_err(|error| PersistenceError::new("temp file write", error))?;
+        file_ops
+            .flush(&mut temp_file)
+            .map_err(|error| PersistenceError::new("temp file flush", error))?;
+        file_ops
+            .sync_all(&temp_file)
+            .map_err(|error| PersistenceError::new("temp file sync", error))?;
+        Ok(())
+    })();
+
+    drop(temp_file);
+
+    if let Err(error) = write_result {
+        let _ = file_ops.remove_file(temp_path);
+        return Err(error);
+    }
+
+    if let Err(error) = file_ops.replace(temp_path, state_path) {
+        let _ = file_ops.remove_file(temp_path);
+        return Err(PersistenceError::new("state file replacement", error));
+    }
+
+    Ok(())
+}
+
+#[cfg(windows)]
+fn replace_state_file(replacement: &FilePath, target: &FilePath) -> io::Result<()> {
+    if !target.exists() {
+        return std_fs::rename(replacement, target);
+    }
+
+    let target_wide = wide_path(target.as_os_str());
+    let replacement_wide = wide_path(replacement.as_os_str());
+    let result = unsafe {
+        ReplaceFileW(
+            target_wide.as_ptr(),
+            replacement_wide.as_ptr(),
+            ptr::null(),
+            0,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
+
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
         Ok(())
     }
+}
+
+#[cfg(windows)]
+fn wide_path(value: &OsStr) -> Vec<u16> {
+    value.encode_wide().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(not(windows))]
+fn replace_state_file(replacement: &FilePath, target: &FilePath) -> io::Result<()> {
+    std_fs::rename(replacement, target)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1419,7 +1623,8 @@ async fn backup_corrupt_state(persistence: &MockPersistence) -> PersistenceResul
     Ok(())
 }
 
-async fn persist_mock_state(state: &Arc<MockApiState>) {
+async fn persist_mock_state(state: &Arc<MockApiState>) -> PersistenceResult<()> {
+    let _save_guard = state.persistence.save_lock.lock().await;
     let settings = state.settings.read().await.clone();
     let conversations = state.conversations.read().await.clone();
     let providers = state.providers.read().await.clone();
@@ -1441,9 +1646,25 @@ async fn persist_mock_state(state: &Arc<MockApiState>) {
         files,
     };
 
-    if let Err(error) = state.persistence.save(&persisted).await {
-        eprintln!("RikkaDesk mock API failed to save state: {error}");
-    }
+    state.persistence.save_locked(&persisted).await
+}
+
+async fn persist_state_for_request(state: &Arc<MockApiState>) -> Result<(), Response> {
+    persist_mock_state(state)
+        .await
+        .map_err(|error| persistence_error_response("request", &error))
+}
+
+fn persistence_error_response(context: &'static str, error: &PersistenceError) -> Response {
+    log_persistence_error(context, error);
+    internal_error_response("Local state could not be saved")
+}
+
+fn log_persistence_error(context: &'static str, error: &PersistenceError) {
+    eprintln!(
+        "RikkaDesk state persistence failed in {context} during {}",
+        error.stage()
+    );
 }
 
 async fn desktop_providers(State(state): State<Arc<MockApiState>>) -> impl IntoResponse {
@@ -1568,7 +1789,9 @@ async fn confirm_desktop_provider_import(
             sync_settings_with_desktop_providers(&mut settings, &providers);
         }
 
-        persist_mock_state(&state).await;
+        if let Err(response) = persist_state_for_request(&state).await {
+            return response;
+        }
         broadcast_settings_update(&state).await;
     }
 
@@ -1628,7 +1851,9 @@ async fn upsert_desktop_provider(
                 ensure_current_model_exists(&mut settings);
             }
 
-            persist_mock_state(&state).await;
+            if let Err(response) = persist_state_for_request(&state).await {
+                return response;
+            }
             broadcast_settings_update(&state).await;
 
             let has_secret = match state.secret_store.has_secret(&provider.secret_ref) {
@@ -1731,7 +1956,9 @@ async fn delete_desktop_provider(
         ensure_current_model_exists(&mut settings);
     }
 
-    persist_mock_state(&state).await;
+    if let Err(response) = persist_state_for_request(&state).await {
+        return response;
+    }
     broadcast_settings_update(&state).await;
     broadcast_list_invalidate(&state).await;
 
@@ -1941,7 +2168,9 @@ async fn send_message(
         conversation.clone()
     };
 
-    persist_mock_state(&state).await;
+    if let Err(response) = persist_state_for_request(&state).await {
+        return response;
+    }
     broadcast_conversation_snapshot(&state, &updated_after_user_message).await;
     broadcast_list_invalidate(&state).await;
 
@@ -1958,16 +2187,24 @@ async fn send_message(
             )
             .await
             {
-                Ok(true) => return Json(json!({ "status": "accepted" })),
+                Ok(true) => return Json(json!({ "status": "accepted" })).into_response(),
                 Ok(false) => {}
-                Err(error) => {
-                    append_assistant_reply(&state, &id, &assistant_id, &model_id, error, now).await;
-                    return Json(json!({ "status": "accepted" }));
+                Err(LocalImageCaptureStartError::User(error)) => {
+                    if let Err(error) =
+                        append_assistant_reply(&state, &id, &assistant_id, &model_id, error, now)
+                            .await
+                    {
+                        return persistence_error_response("append capture reply", &error);
+                    }
+                    return Json(json!({ "status": "accepted" })).into_response();
+                }
+                Err(LocalImageCaptureStartError::Persistence(error)) => {
+                    return persistence_error_response("start image capture", &error);
                 }
             }
         }
 
-        append_assistant_reply(
+        if let Err(error) = append_assistant_reply(
             &state,
             &id,
             &assistant_id,
@@ -1975,15 +2212,18 @@ async fn send_message(
             LOCAL_ATTACHMENT_REPLY_TEXT.to_string(),
             now,
         )
-        .await;
-        return Json(json!({ "status": "accepted" }));
+        .await
+        {
+            return persistence_error_response("append attachment reply", &error);
+        }
+        return Json(json!({ "status": "accepted" })).into_response();
     }
 
     let real_chat_config = if user_text.is_some() {
         match resolve_openai_chat_config(&state, &model_id).await {
             Ok(config) => config,
             Err(error) => {
-                append_assistant_reply(
+                if let Err(persistence_error) = append_assistant_reply(
                     &state,
                     &id,
                     &assistant_id,
@@ -1991,8 +2231,14 @@ async fn send_message(
                     format!("Real provider request failed: {error}"),
                     now,
                 )
-                .await;
-                return Json(json!({ "status": "accepted" }));
+                .await
+                {
+                    return persistence_error_response(
+                        "append provider error reply",
+                        &persistence_error,
+                    );
+                }
+                return Json(json!({ "status": "accepted" })).into_response();
             }
         }
     } else {
@@ -2005,13 +2251,17 @@ async fn send_message(
         } else {
             MOCK_REPLY_TEXT.to_string()
         };
-        append_assistant_reply(&state, &id, &assistant_id, &model_id, reply_text, now).await;
-        return Json(json!({ "status": "accepted" }));
+        if let Err(error) =
+            append_assistant_reply(&state, &id, &assistant_id, &model_id, reply_text, now).await
+        {
+            return persistence_error_response("append mock reply", &error);
+        }
+        return Json(json!({ "status": "accepted" })).into_response();
     };
 
     let messages = openai_messages_from_conversation(&updated_after_user_message);
     if messages.is_empty() {
-        append_assistant_reply(
+        if let Err(error) = append_assistant_reply(
             &state,
             &id,
             &assistant_id,
@@ -2019,21 +2269,40 @@ async fn send_message(
             "Phase 3E currently supports text-only chat.".to_string(),
             now,
         )
-        .await;
-        return Json(json!({ "status": "accepted" }));
+        .await
+        {
+            return persistence_error_response("append text-only reply", &error);
+        }
+        return Json(json!({ "status": "accepted" })).into_response();
     }
 
     let assistant_message_id =
-        append_empty_streaming_assistant_reply(&state, &id, &assistant_id, &model_id, now).await;
+        match append_empty_streaming_assistant_reply(&state, &id, &assistant_id, &model_id, now)
+            .await
+        {
+            Ok(message_id) => message_id,
+            Err(error) => return persistence_error_response("start streaming reply", &error),
+        };
     start_generation(&state, &id).await;
     spawn_openai_stream_generation(state.clone(), id, assistant_message_id, config, messages);
 
-    Json(json!({ "status": "accepted" }))
+    Json(json!({ "status": "accepted" })).into_response()
 }
 
 fn is_capture_local_image_intent(payload: &SendMessageRequest) -> bool {
     payload.image_input_confirmed == Some(true)
         && payload.image_input_mode.as_deref() == Some("capture-local")
+}
+
+enum LocalImageCaptureStartError {
+    User(String),
+    Persistence(PersistenceError),
+}
+
+impl From<String> for LocalImageCaptureStartError {
+    fn from(error: String) -> Self {
+        Self::User(error)
+    }
 }
 
 async fn start_local_image_capture_prototype(
@@ -2044,7 +2313,7 @@ async fn start_local_image_capture_prototype(
     user_text: Option<String>,
     parts: &[Value],
     now: u64,
-) -> Result<bool, String> {
+) -> Result<bool, LocalImageCaptureStartError> {
     let image_file_ids = provider_bound_image_file_ids(parts)?;
     let Some(file_id) = image_file_ids.first().copied() else {
         return Ok(false);
@@ -2056,21 +2325,26 @@ async fn start_local_image_capture_prototype(
         .ok_or_else(|| LOCAL_IMAGE_CAPTURE_CONFIG_REQUIRED_TEXT.to_string())?;
 
     if !is_loopback_provider_base_url(&config.base_url) {
-        return Err(LOCAL_IMAGE_CAPTURE_LOOPBACK_REQUIRED_TEXT.to_string());
+        return Err(LOCAL_IMAGE_CAPTURE_LOOPBACK_REQUIRED_TEXT
+            .to_string()
+            .into());
     }
     if !config
         .input_modalities
         .iter()
         .any(|modality| modality == MODEL_MODALITY_IMAGE)
     {
-        return Err(LOCAL_IMAGE_CAPTURE_CAPABILITY_REQUIRED_TEXT.to_string());
+        return Err(LOCAL_IMAGE_CAPTURE_CAPABILITY_REQUIRED_TEXT
+            .to_string()
+            .into());
     }
 
     let image = managed_file_for_provider_image_input(state, file_id).await?;
     let messages = openai_vision_messages_for_current_turn(user_text, image)?;
     let assistant_message_id =
         append_empty_streaming_assistant_reply(state, conversation_id, assistant_id, model_id, now)
-            .await;
+            .await
+            .map_err(LocalImageCaptureStartError::Persistence)?;
     start_generation(state, conversation_id).await;
     spawn_openai_vision_capture_generation(
         state.clone(),
@@ -2099,12 +2373,14 @@ async fn stop_conversation(
     };
 
     if let Some(conversation) = maybe_updated {
-        persist_mock_state(&state).await;
+        if let Err(response) = persist_state_for_request(&state).await {
+            return response;
+        }
         broadcast_conversation_snapshot(&state, &conversation).await;
         broadcast_list_invalidate(&state).await;
     }
 
-    Json(json!({ "status": "stopped" }))
+    Json(json!({ "status": "stopped" })).into_response()
 }
 
 async fn update_conversation_title(
@@ -2128,7 +2404,9 @@ async fn update_conversation_title(
         conversation.clone()
     };
 
-    persist_mock_state(&state).await;
+    if let Err(response) = persist_state_for_request(&state).await {
+        return response;
+    }
     broadcast_conversation_snapshot(&state, &updated).await;
     broadcast_list_invalidate(&state).await;
 
@@ -2149,7 +2427,9 @@ async fn toggle_conversation_pin(
         conversation.clone()
     };
 
-    persist_mock_state(&state).await;
+    if let Err(response) = persist_state_for_request(&state).await {
+        return response;
+    }
     broadcast_conversation_snapshot(&state, &updated).await;
     broadcast_list_invalidate(&state).await;
 
@@ -2172,7 +2452,9 @@ async fn delete_conversation(
     stop_generation(&state, &id).await;
     state.conversation_txs.write().await.remove(&id);
 
-    persist_mock_state(&state).await;
+    if let Err(response) = persist_state_for_request(&state).await {
+        return response;
+    }
     broadcast_list_invalidate(&state).await;
 
     Json(json!({ "status": "deleted" })).into_response()
@@ -2208,7 +2490,9 @@ async fn edit_message(
         conversation.clone()
     };
 
-    persist_mock_state(&state).await;
+    if let Err(response) = persist_state_for_request(&state).await {
+        return response;
+    }
     broadcast_conversation_snapshot(&state, &updated).await;
     broadcast_list_invalidate(&state).await;
 
@@ -2248,7 +2532,9 @@ async fn delete_message(
         conversation.clone()
     };
 
-    persist_mock_state(&state).await;
+    if let Err(response) = persist_state_for_request(&state).await {
+        return response;
+    }
     broadcast_conversation_snapshot(&state, &updated).await;
     broadcast_list_invalidate(&state).await;
 
@@ -2320,12 +2606,14 @@ async fn regenerate_message(
         (conversation.clone(), last_user_has_non_text_parts)
     };
 
-    persist_mock_state(&state).await;
+    if let Err(response) = persist_state_for_request(&state).await {
+        return response;
+    }
     broadcast_conversation_snapshot(&state, &prepared).await;
     broadcast_list_invalidate(&state).await;
 
     if last_user_has_non_text_parts {
-        append_assistant_reply(
+        if let Err(error) = append_assistant_reply(
             &state,
             &id,
             &assistant_id,
@@ -2333,14 +2621,17 @@ async fn regenerate_message(
             LOCAL_ATTACHMENT_REPLY_TEXT.to_string(),
             now,
         )
-        .await;
+        .await
+        {
+            return persistence_error_response("append attachment reply", &error);
+        }
         return Json(json!({ "status": "accepted" })).into_response();
     }
 
     let real_chat_config = match resolve_openai_chat_config(&state, &model_id).await {
         Ok(config) => config,
         Err(error) => {
-            append_assistant_reply(
+            if let Err(persistence_error) = append_assistant_reply(
                 &state,
                 &id,
                 &assistant_id,
@@ -2348,13 +2639,19 @@ async fn regenerate_message(
                 format!("Real provider request failed: {error}"),
                 now,
             )
-            .await;
+            .await
+            {
+                return persistence_error_response(
+                    "append provider error reply",
+                    &persistence_error,
+                );
+            }
             return Json(json!({ "status": "accepted" })).into_response();
         }
     };
 
     let Some(config) = real_chat_config else {
-        append_assistant_reply(
+        if let Err(error) = append_assistant_reply(
             &state,
             &id,
             &assistant_id,
@@ -2362,13 +2659,16 @@ async fn regenerate_message(
             MOCK_REPLY_TEXT.to_string(),
             now,
         )
-        .await;
+        .await
+        {
+            return persistence_error_response("append mock reply", &error);
+        }
         return Json(json!({ "status": "accepted" })).into_response();
     };
 
     let messages = openai_messages_from_conversation(&prepared);
     if messages.is_empty() {
-        append_assistant_reply(
+        if let Err(error) = append_assistant_reply(
             &state,
             &id,
             &assistant_id,
@@ -2376,12 +2676,20 @@ async fn regenerate_message(
             "Phase 6A currently supports regenerating text-only chat.".to_string(),
             now,
         )
-        .await;
+        .await
+        {
+            return persistence_error_response("append text-only reply", &error);
+        }
         return Json(json!({ "status": "accepted" })).into_response();
     }
 
     let assistant_message_id =
-        append_empty_streaming_assistant_reply(&state, &id, &assistant_id, &model_id, now).await;
+        match append_empty_streaming_assistant_reply(&state, &id, &assistant_id, &model_id, now)
+            .await
+        {
+            Ok(message_id) => message_id,
+            Err(error) => return persistence_error_response("start streaming reply", &error),
+        };
     start_generation(&state, &id).await;
     spawn_openai_stream_generation(state.clone(), id, assistant_message_id, config, messages);
 
@@ -2397,11 +2705,13 @@ async fn update_assistant(
         settings["assistantId"] = json!(payload.assistant_id);
     }
 
-    persist_mock_state(&state).await;
+    if let Err(response) = persist_state_for_request(&state).await {
+        return response;
+    }
     broadcast_settings_update(&state).await;
     broadcast_list_invalidate(&state).await;
 
-    Json(json!({ "status": "ok" }))
+    Json(json!({ "status": "ok" })).into_response()
 }
 
 async fn update_assistant_model(
@@ -2426,10 +2736,12 @@ async fn update_assistant_model(
         }
     }
 
-    persist_mock_state(&state).await;
+    if let Err(response) = persist_state_for_request(&state).await {
+        return response;
+    }
     broadcast_settings_update(&state).await;
 
-    Json(json!({ "status": "ok" }))
+    Json(json!({ "status": "ok" })).into_response()
 }
 
 async fn update_favorite_models(
@@ -2450,10 +2762,12 @@ async fn update_favorite_models(
         settings["favoriteModels"] = json!(model_ids);
     }
 
-    persist_mock_state(&state).await;
+    if let Err(response) = persist_state_for_request(&state).await {
+        return response;
+    }
     broadcast_settings_update(&state).await;
 
-    Json(json!({ "status": "ok" }))
+    Json(json!({ "status": "ok" })).into_response()
 }
 
 async fn not_implemented() -> impl IntoResponse {
@@ -2559,7 +2873,9 @@ async fn upload_files(
         uploaded
     };
 
-    persist_mock_state(&state).await;
+    if let Err(response) = persist_state_for_request(&state).await {
+        return response;
+    }
 
     Json(UploadFilesResponse { files: uploaded }).into_response()
 }
@@ -2664,7 +2980,9 @@ async fn delete_file(
         }
     }
 
-    persist_mock_state(&state).await;
+    if let Err(response) = persist_state_for_request(&state).await {
+        return response;
+    }
 
     Json(json!({ "status": "deleted" })).into_response()
 }
@@ -3284,7 +3602,7 @@ async fn append_assistant_reply(
     model_id: &str,
     reply_text: String,
     now: u64,
-) {
+) -> PersistenceResult<()> {
     let updated = {
         let mut conversations = state.conversations.write().await;
         let conversation = conversations
@@ -3318,9 +3636,10 @@ async fn append_assistant_reply(
         conversation.clone()
     };
 
-    persist_mock_state(state).await;
+    persist_mock_state(state).await?;
     broadcast_conversation_snapshot(state, &updated).await;
     broadcast_list_invalidate(state).await;
+    Ok(())
 }
 
 async fn append_empty_streaming_assistant_reply(
@@ -3329,7 +3648,7 @@ async fn append_empty_streaming_assistant_reply(
     assistant_id: &str,
     model_id: &str,
     now: u64,
-) -> String {
+) -> PersistenceResult<String> {
     let message_id = state.next_id("msg");
     let updated = {
         let mut conversations = state.conversations.write().await;
@@ -3364,10 +3683,10 @@ async fn append_empty_streaming_assistant_reply(
         conversation.clone()
     };
 
-    persist_mock_state(state).await;
+    persist_mock_state(state).await?;
     broadcast_conversation_snapshot(state, &updated).await;
     broadcast_list_invalidate(state).await;
-    message_id
+    Ok(message_id)
 }
 
 async fn append_text_to_assistant_message(
@@ -3401,13 +3720,13 @@ async fn finish_streaming_assistant_reply(
     state: &Arc<MockApiState>,
     conversation_id: &str,
     assistant_message_id: &str,
-) {
+) -> PersistenceResult<()> {
     stop_generation(state, conversation_id).await;
 
     let updated = {
         let mut conversations = state.conversations.write().await;
         let Some(conversation) = conversations.get_mut(conversation_id) else {
-            return;
+            return Ok(());
         };
         if let Some(message) = find_message_mut(conversation, assistant_message_id) {
             if text_from_parts(&message.parts).is_none() {
@@ -3420,9 +3739,10 @@ async fn finish_streaming_assistant_reply(
         conversation.clone()
     };
 
-    persist_mock_state(state).await;
+    persist_mock_state(state).await?;
     broadcast_conversation_snapshot(state, &updated).await;
     broadcast_list_invalidate(state).await;
+    Ok(())
 }
 
 async fn start_generation(state: &Arc<MockApiState>, conversation_id: &str) {
@@ -3839,7 +4159,11 @@ fn spawn_openai_stream_generation(
             .await;
         }
 
-        finish_streaming_assistant_reply(&state, &conversation_id, &assistant_message_id).await;
+        if let Err(error) =
+            finish_streaming_assistant_reply(&state, &conversation_id, &assistant_message_id).await
+        {
+            log_persistence_error("finish text stream", &error);
+        }
     });
 }
 
@@ -3870,7 +4194,11 @@ fn spawn_openai_vision_capture_generation(
             .await;
         }
 
-        finish_streaming_assistant_reply(&state, &conversation_id, &assistant_message_id).await;
+        if let Err(error) =
+            finish_streaming_assistant_reply(&state, &conversation_id, &assistant_message_id).await
+        {
+            log_persistence_error("finish image capture stream", &error);
+        }
     });
 }
 
@@ -5522,6 +5850,332 @@ fn now_iso() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static TEST_TEMP_SEQ: AtomicU64 = AtomicU64::new(1);
+
+    struct SyntheticTempDir {
+        path: PathBuf,
+    }
+
+    impl SyntheticTempDir {
+        fn new(label: &str) -> Self {
+            let sequence = TEST_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "rikkadesk-state-persist-{label}-{}-{sequence}",
+                std::process::id()
+            ));
+            std_fs::create_dir_all(&path).expect("synthetic temp directory should be created");
+            Self { path }
+        }
+    }
+
+    impl Drop for SyntheticTempDir {
+        fn drop(&mut self) {
+            let _ = std_fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum TestFailureStage {
+        Write,
+        Flush,
+        Sync,
+        Replace,
+    }
+
+    struct FaultingStateFileOps {
+        stage: TestFailureStage,
+    }
+
+    impl FaultingStateFileOps {
+        fn failure(&self) -> io::Error {
+            io::Error::new(io::ErrorKind::Other, "synthetic persistence failure")
+        }
+    }
+
+    impl StateFileOps for FaultingStateFileOps {
+        fn create_dir_all(&self, path: &FilePath) -> io::Result<()> {
+            RealStateFileOps.create_dir_all(path)
+        }
+
+        fn create_temp(&self, path: &FilePath) -> io::Result<std_fs::File> {
+            RealStateFileOps.create_temp(path)
+        }
+
+        fn write_all(&self, file: &mut std_fs::File, data: &[u8]) -> io::Result<()> {
+            if self.stage == TestFailureStage::Write {
+                return Err(self.failure());
+            }
+            RealStateFileOps.write_all(file, data)
+        }
+
+        fn flush(&self, file: &mut std_fs::File) -> io::Result<()> {
+            if self.stage == TestFailureStage::Flush {
+                return Err(self.failure());
+            }
+            RealStateFileOps.flush(file)
+        }
+
+        fn sync_all(&self, file: &std_fs::File) -> io::Result<()> {
+            if self.stage == TestFailureStage::Sync {
+                return Err(self.failure());
+            }
+            RealStateFileOps.sync_all(file)
+        }
+
+        fn replace(&self, replacement: &FilePath, target: &FilePath) -> io::Result<()> {
+            if self.stage == TestFailureStage::Replace {
+                return Err(self.failure());
+            }
+            RealStateFileOps.replace(replacement, target)
+        }
+
+        fn remove_file(&self, path: &FilePath) -> io::Result<()> {
+            RealStateFileOps.remove_file(path)
+        }
+    }
+
+    struct FailingSerialize;
+
+    impl Serialize for FailingSerialize {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(serde::ser::Error::custom("synthetic serialization failure"))
+        }
+    }
+
+    struct TestSecretStore;
+
+    impl SecretStore for TestSecretStore {
+        fn set_secret(&self, _secret_ref: &str, _value: &str) -> SecretStoreResult<()> {
+            Ok(())
+        }
+
+        fn get_secret(&self, _secret_ref: &str) -> SecretStoreResult<Option<String>> {
+            Ok(None)
+        }
+
+        fn delete_secret(&self, _secret_ref: &str) -> SecretStoreResult<()> {
+            Ok(())
+        }
+    }
+
+    fn test_persistence(temp: &SyntheticTempDir) -> MockPersistence {
+        MockPersistence::new(temp.path.clone())
+    }
+
+    fn faulting_test_persistence(
+        temp: &SyntheticTempDir,
+        stage: TestFailureStage,
+    ) -> MockPersistence {
+        MockPersistence::new_with_file_ops(
+            temp.path.clone(),
+            Arc::new(FaultingStateFileOps { stage }),
+        )
+    }
+
+    fn read_test_state(persistence: &MockPersistence) -> Value {
+        let data = std_fs::read(persistence.state_path()).expect("state file should exist");
+        serde_json::from_slice(&data).expect("state file should contain valid JSON")
+    }
+
+    fn state_temp_files(persistence: &MockPersistence) -> Vec<PathBuf> {
+        let Ok(entries) = std_fs::read_dir(&persistence.state_dir) else {
+            return Vec::new();
+        };
+
+        entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(STATE_TMP_FILE_PREFIX))
+            })
+            .collect()
+    }
+
+    async fn assert_failed_save_preserves_state(stage: TestFailureStage) {
+        let temp = SyntheticTempDir::new("failure");
+        let real = test_persistence(&temp);
+        real.save(&json!({ "revision": "original" }))
+            .await
+            .expect("initial save should succeed");
+
+        let failing = faulting_test_persistence(&temp, stage);
+        let result = failing.save(&json!({ "revision": "replacement" })).await;
+
+        assert!(result.is_err());
+        assert_eq!(read_test_state(&real)["revision"], json!("original"));
+        assert!(state_temp_files(&real).is_empty());
+    }
+
+    #[tokio::test]
+    async fn state_persistence_first_save_creates_valid_json_without_temp() {
+        let temp = SyntheticTempDir::new("first-save");
+        let persistence = test_persistence(&temp);
+
+        persistence
+            .save(&json!({ "schemaVersion": STATE_SCHEMA_VERSION, "value": 1 }))
+            .await
+            .expect("first save should succeed");
+
+        assert_eq!(read_test_state(&persistence)["value"], json!(1));
+        assert!(state_temp_files(&persistence).is_empty());
+    }
+
+    #[tokio::test]
+    async fn state_persistence_atomic_replace_updates_existing_state() {
+        let temp = SyntheticTempDir::new("replace");
+        let persistence = test_persistence(&temp);
+        persistence
+            .save(&json!({ "revision": 1 }))
+            .await
+            .expect("initial save should succeed");
+
+        persistence
+            .save(&json!({ "revision": 2 }))
+            .await
+            .expect("replacement save should succeed");
+
+        assert_eq!(read_test_state(&persistence)["revision"], json!(2));
+        assert!(state_temp_files(&persistence).is_empty());
+    }
+
+    #[tokio::test]
+    async fn state_persistence_serialization_failure_preserves_existing_state() {
+        let temp = SyntheticTempDir::new("serialization");
+        let persistence = test_persistence(&temp);
+        persistence
+            .save(&json!({ "revision": "original" }))
+            .await
+            .expect("initial save should succeed");
+
+        let result = persistence.save(&FailingSerialize).await;
+
+        assert!(result.is_err());
+        assert_eq!(read_test_state(&persistence)["revision"], json!("original"));
+        assert!(state_temp_files(&persistence).is_empty());
+    }
+
+    #[tokio::test]
+    async fn state_persistence_write_failure_preserves_existing_state() {
+        assert_failed_save_preserves_state(TestFailureStage::Write).await;
+    }
+
+    #[tokio::test]
+    async fn state_persistence_flush_failure_preserves_existing_state() {
+        assert_failed_save_preserves_state(TestFailureStage::Flush).await;
+    }
+
+    #[tokio::test]
+    async fn state_persistence_sync_failure_preserves_existing_state() {
+        assert_failed_save_preserves_state(TestFailureStage::Sync).await;
+    }
+
+    #[tokio::test]
+    async fn state_persistence_replace_failure_preserves_existing_state() {
+        assert_failed_save_preserves_state(TestFailureStage::Replace).await;
+    }
+
+    #[tokio::test]
+    async fn state_persistence_failure_does_not_remove_unrelated_temp_file() {
+        let temp = SyntheticTempDir::new("unrelated-temp");
+        let real = test_persistence(&temp);
+        real.save(&json!({ "revision": "original" }))
+            .await
+            .expect("initial save should succeed");
+        let unrelated = real
+            .state_dir
+            .join(format!("{STATE_TMP_FILE_PREFIX}.unrelated"));
+        std_fs::write(&unrelated, b"synthetic unrelated temp")
+            .expect("unrelated temp should be created");
+
+        let failing = faulting_test_persistence(&temp, TestFailureStage::Write);
+        assert!(failing.save(&json!({ "revision": "new" })).await.is_err());
+
+        assert!(unrelated.exists());
+        let temp_files = state_temp_files(&real);
+        assert_eq!(temp_files, vec![unrelated]);
+    }
+
+    #[tokio::test]
+    async fn state_persistence_concurrent_snapshots_keep_latest_state() {
+        let temp = SyntheticTempDir::new("concurrent");
+        let persistence = test_persistence(&temp);
+        let state = Arc::new(MockApiState::new(
+            persistence,
+            Arc::new(TestSecretStore),
+            default_persisted_state(),
+        ));
+        let save_lock = state.persistence.save_lock.clone();
+        let save_guard = save_lock.lock().await;
+
+        state.settings.write().await["syntheticRevision"] = json!(1);
+        let first_state = state.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let first_save = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            persist_mock_state(&first_state).await
+        });
+        started_rx.await.expect("first save should start");
+        tokio::task::yield_now().await;
+
+        state.settings.write().await["syntheticRevision"] = json!(2);
+        let second_state = state.clone();
+        let second_save = tokio::spawn(async move { persist_mock_state(&second_state).await });
+        drop(save_guard);
+
+        first_save
+            .await
+            .expect("first save task should finish")
+            .expect("first save should succeed");
+        second_save
+            .await
+            .expect("second save task should finish")
+            .expect("second save should succeed");
+
+        assert_eq!(
+            read_test_state(&state.persistence)["settings"]["syntheticRevision"],
+            json!(2)
+        );
+        assert!(state_temp_files(&state.persistence).is_empty());
+    }
+
+    #[tokio::test]
+    async fn state_persistence_handler_returns_safe_error_when_replace_fails() {
+        let temp = SyntheticTempDir::new("handler-error");
+        let real = test_persistence(&temp);
+        real.save(&default_persisted_state())
+            .await
+            .expect("initial state should save");
+        let state = Arc::new(MockApiState::new(
+            faulting_test_persistence(&temp, TestFailureStage::Replace),
+            Arc::new(TestSecretStore),
+            default_persisted_state(),
+        ));
+
+        let response = update_assistant(
+            State(state),
+            Json(UpdateAssistantRequest {
+                assistant_id: "synthetic-assistant".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("error response body should be readable");
+        let body = String::from_utf8(body.to_vec()).expect("error response should be UTF-8");
+        assert!(body.contains("Local state could not be saved"));
+        assert!(!body.contains("synthetic-assistant"));
+        assert!(!body.contains("state.v1.json"));
+        assert!(!body.contains(temp.path.to_string_lossy().as_ref()));
+    }
 
     fn openai_vision_test_config(custom_body: Option<Value>) -> OpenAiChatConfig {
         OpenAiChatConfig {

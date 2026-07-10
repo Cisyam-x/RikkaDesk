@@ -192,6 +192,8 @@ Phase 9B upgrades provider state to `schemaVersion: 4` with `providers[].customH
 
 Phase 10 upgrades local desktop state to `schemaVersion: 5` with managed file metadata for the mock API file skeleton, then `schemaVersion: 6` with provider model capability metadata. Old beta.11 or earlier builds should not be started against schema v5/v6 state files. Use synthetic app data for Phase 10 file tests, or back up and restore real app data before switching builds.
 
+Phase 12 P1-A serializes local state saves, uses unique same-directory temp files, flushes and syncs each complete temp file, and replaces the primary state without deleting it first. Packaging verification should run the synthetic `state_persist` tests and confirm save failures return a non-success response. P1-A does not yet add backup/restore, migration backup, future-schema protection, or in-memory rollback after a failed save.
+
 It may contain:
 
 - settings

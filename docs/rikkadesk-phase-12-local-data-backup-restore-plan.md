@@ -25,7 +25,30 @@ P0 is documentation only. It does not implement backup or restore APIs, add UI, 
 5. Restore must use a validated staging area, an automatic pre-restore backup, an explicit commit step, and rollback. It must never overwrite current app data directly.
 6. Phase 12 should start implementation with P1 atomic state backup/write primitives before adding packaging or UI.
 
-## Current Persistence Implementation
+## P1-A Implementation Status
+
+Phase 12 P1-A hardens the ordinary `state.v1.json` write path without changing the state schema, load/migration decisions, backup formats, or managed blob behavior.
+
+Implemented behavior:
+
+- All ordinary full-state saves are serialized by one process-local persistence mutex.
+- `persist_mock_state` acquires the save mutex before it reads the independent settings, conversation, provider, and file metadata locks. A waiting save therefore snapshots current state only after earlier saves finish; a snapshot prepared before waiting cannot later overwrite a newer snapshot.
+- JSON serialization completes before any filesystem operation touches the primary state file.
+- Every save uses a unique same-directory temp name in the form `state.v1.json.tmp.<pid>.<counter>` and creates it with create-new semantics.
+- The writer performs `write_all`, `flush`, and `sync_all`, closes the temp handle, and only then commits it.
+- On Windows, an existing primary state is replaced with `ReplaceFileW`; a first save uses a same-directory rename. Neither path deletes the primary state first.
+- On non-Windows platforms, the same-directory rename path is used without a pre-delete.
+- Serialization, temp create/write/flush/sync, and replacement failures preserve the previous primary state and best-effort remove only the temp file created by that save.
+- State mutation handlers await the persistence result and return a safe HTTP 5xx response on failure instead of reporting success.
+- Streaming completion cannot return an HTTP response, so persistence failure is recorded only as a fixed operation context and failure stage. No state content, message, provider config, secret, or local path is logged.
+
+The save transaction does not currently roll back an in-memory mutation when disk persistence fails. The API no longer acknowledges that mutation as saved, but in-memory state may temporarily lead the last valid on-disk state until a later successful save or restart. A broader centralized mutation transaction/rollback design remains future hardening because the current runtime state is split across several independent locks.
+
+P1-A does not claim complete power-loss protection, a transactional boundary between state and managed blobs, backup/restore support, or complete corruption recovery.
+
+## P0 Persistence Baseline (Before P1-A)
+
+The following audit records the implementation that P1-A replaced. It remains here as the rationale and risk baseline; statements in this section describing fixed temp names, pre-delete, missing sync, ignored save errors, or no save mutex are historical rather than current behavior.
 
 ### App Data And State Path
 
@@ -613,7 +636,7 @@ Acceptance:
 - No runtime data accessed.
 - Current schema/import-export versions unchanged.
 
-### P1: Atomic State Backup Primitives
+### P1-A: Atomic State Write Primitives (Completed)
 
 Goal:
 
@@ -623,27 +646,39 @@ Candidate file:
 
 - `web-ui/src-tauri/src/mock_api.rs`
 
-Required design:
+Implemented design:
 
 - Serialize before touching the primary file.
 - Use a unique same-directory temp file.
 - Write all bytes, flush, and `sync_all`.
-- Parse/validate the temp state before commit.
 - Serialize saves through one persistence mutex/writer.
 - Use a Windows-safe atomic replace primitive or a proven equivalent that never deletes the only good file first.
-- Preserve a verified pre-migration backup.
-- Abort reset/migration if backup cannot be created.
 - Propagate save failure instead of returning success silently.
-- Recover/clean stale temp files without deleting valid state.
 
 Tests:
 
 - temp write failure
 - replace failure
 - concurrent saves
-- truncated temp
-- migration backup failure
 - original state survives every failed commit point
+
+P1-A uses synthetic temporary directories and injected file-operation failures. It does not read real app data or secret blobs.
+
+### P1-B: Load And Migration Safety (Pending)
+
+Goal:
+
+- Make startup, migration, and recovery fail closed without overwriting the last recoverable state.
+
+Required design:
+
+- Create and verify a backup before migration writes.
+- Treat unsupported future schemas as a non-destructive compatibility error.
+- Abort default-state replacement when corrupt backup preservation fails.
+- Distinguish state read errors from JSON/shape parse errors.
+- Define downgrade protection and a user-visible recovery decision.
+- Define startup handling for stale unique temp files without deleting a valid primary state.
+- Add truncated-temp, migration-backup-failure, future-schema, and backup-failure tests.
 
 ### P2: Portable Metadata/Full Backup Package
 
@@ -730,18 +765,20 @@ Acceptance:
 - No test reads real app data or secret blobs.
 - Recovery reports contain no user content or secrets.
 
-## P0 Conclusion And Blockers
+## Phase 12 Status And Remaining Blockers
 
-Current blocker conclusions:
+P0 baseline conclusions and P1-A status:
 
-- Atomic state write exists: No.
+- Atomic replacement state write exists: Yes for the P1-A single-file commit path; no pre-delete remains.
 - Corrupt backup exists: Yes, but only for parse/unsupported-schema paths and it is not fail-closed.
-- Direct primary-state removal exists: Yes.
-- Persistence save mutex exists: No.
+- Direct primary-state removal in ordinary saves exists: No.
+- Persistence save mutex exists: Yes.
+- Persistence errors reach mutation handlers: Yes; background completion logs a safe stage-only error.
+- In-memory rollback on persistence failure exists: No; memory may temporarily lead disk.
 - Silent reset risk exists: Yes.
-- Silent data loss risk exists: Yes.
+- Load/migration overwrite risk exists: Yes, pending P1-B.
 - State/blob consistency risk exists: Yes.
 - DPAPI secret blobs are portable across machines/users: No.
 - A formal backup/restore package currently exists: No.
 
-Recommended next step: Phase 12 P1 atomic state backup primitives. P1 should be completed and fault-tested before Mode A/B packaging, managed blob restore, or any backup/restore UI.
+Recommended next step: Phase 12 P1-B load/migration safety. P1-B should be completed and fault-tested before Mode A/B packaging, managed blob restore, or any backup/restore UI.
