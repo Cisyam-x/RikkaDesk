@@ -703,22 +703,48 @@ Required design:
 
 Implemented with synthetic state and injected read/write/backup/migration failures. No real app data or encrypted secret blob is read.
 
-### P1-C: Mutation Transaction Rollback (Pending)
+### P1-C0: Mutation Transaction Boundary Design (Completed)
 
 Goal:
 
-- Keep in-memory state and the last valid persisted state aligned when a mutation save fails.
+- Audit every persisted mutation and define state, SecretStore, blob, network, streaming, lock, commit, rollback, compensation, and event-ordering boundaries before implementation.
 
-Required design:
+Decision:
 
-- Define a centralized mutation transaction boundary across settings, conversations, providers, and managed file metadata.
-- Preserve or reconstruct the previous in-memory value before mutation.
-- Roll back the affected in-memory state when persistence fails.
-- Avoid deadlock between mutation locks and the persistence mutex.
-- Preserve the P1-A rule that handlers return a safe failure rather than acknowledging an unsaved mutation.
-- Add concurrent mutation, rollback failure, streaming completion, provider deletion/SecretStore ordering, and file metadata/blob ordering tests.
+- Use stage, persist, then commit live rather than live mutation followed by rollback.
+- Add one global mutation transaction mutex.
+- Use a short live commit read/write barrier while persisted fields remain split across component locks.
+- Never hold component/commit locks across disk sync, SecretStore/blob operations, network waits, or SSE sends.
+- Emit success events only after durable state and live state agree.
+- Allow ID gaps, forbid duplicate IDs, and never decrement `id_seq` during compensation.
+- Keep startup/migration under P1-B rather than the runtime transaction helper.
 
-P1-C must not be represented as a state/blob transaction unless blob commit and rollback behavior is explicitly included and tested.
+The complete call-site inventory, lock order, external-side-effect matrix, compensation rules, and synthetic test plan are in `docs/rikkadesk-phase-12-mutation-transaction-boundaries.md`.
+
+### P1-C1: Pure State Staged Transactions (Pending)
+
+- Add the mutation mutex, commit barrier, cloneable staged persisted state, and persist-before-live-commit helper.
+- Cover settings, assistant/current model/favorites, title/pin, message edit/delete, conversation delete, lazy conversation creation policy, and state-only counters.
+- Keep SecretStore, blob operations, and streaming finalization out of this step.
+
+### P1-C2: Provider And SecretStore Compensation (Pending)
+
+- Add reversible secret prepare/apply/rollback/finalize semantics.
+- Cover provider upsert with key, key replacement/clear, provider deletion, and secret reconciliation.
+- Never treat JSON rollback as sufficient to restore a deleted/replaced DPAPI or keyring value.
+
+### P1-C3: File Blob Transaction And Compensation (Pending)
+
+- Cover upload blob publication plus metadata commit, delete tombstone/deferred cleanup, attachment references, and orphan/missing reconciliation.
+- Merge this work with the original Phase 12 P3 blob consistency scope where useful.
+
+### P1-C4: Background Streaming Transaction Safety (Pending)
+
+- Commit initial send/placeholder before network start.
+- Keep provider waits outside transaction locks.
+- Add generation tokens, transient delta semantics, final/failure staged commits, retry visibility, and post-commit SSE ordering.
+
+Mode A/B backup packaging remains blocked until P1-C1 through P1-C4 pass their synthetic safety tests.
 
 ### P2: Portable Metadata/Full Backup Package
 
@@ -819,9 +845,9 @@ Current P1-A/P1-B status:
 - Future schema is fail-closed: Yes; it is not treated as corrupt or migrated.
 - Schema 1-5 pre-migration backup exists: Yes.
 - Automatic non-NotFound reset exists: No.
-- In-memory mutation rollback risk exists: Yes, pending P1-C.
+- Runtime mutation consistency risk exists: Yes, pending staged transaction work in P1-C1 through P1-C4.
 - State/blob consistency risk exists: Yes.
 - DPAPI secret blobs are portable across machines/users: No.
 - A formal backup/restore package currently exists: No.
 
-Recommended next step: Phase 12 P1-C mutation transaction rollback. P1-C should be scoped carefully before Mode A/B packaging, managed blob restore, or any backup/restore UI.
+Recommended next step: Phase 12 P1-C1 pure state staged transactions. Mode A/B packaging, managed blob restore, and backup/restore UI remain deferred until P1-C1 through P1-C4 establish consistent runtime snapshots.
