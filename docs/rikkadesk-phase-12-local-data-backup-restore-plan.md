@@ -46,6 +46,27 @@ The save transaction does not currently roll back an in-memory mutation when dis
 
 P1-A does not claim complete power-loss protection, a transactional boundary between state and managed blobs, backup/restore support, or complete corruption recovery.
 
+## P1-B Implementation Status
+
+Phase 12 P1-B makes startup state loading and schema migration fail closed. It does not add recovery UI or automatically repair damaged state.
+
+Implemented behavior:
+
+- The loader reads the exact primary `state.v1.json` path directly and distinguishes `NotFound` from every other I/O error. The old check-then-read `exists()` flow is removed.
+- Only `NotFound` initializes schema v6 default state. Initialization is reported successful only after the P1-A atomic persistence helper succeeds.
+- Permission, sharing, locking, transient, and other read failures stop mock API startup. They do not create a default state or a corrupt backup.
+- Malformed JSON or an invalid current/legacy state shape is copied byte-for-byte to a unique same-directory `state.v1.corrupt.<millis>.<pid>.<counter>.json` file.
+- Corrupt backups use create-new semantics followed by `write_all`, `flush`, and `sync_all`. The original primary state remains in place. Successful preservation returns a recovery-required startup error; backup failure stops startup without writing defaults.
+- A numeric `schemaVersion` greater than 6 returns a dedicated newer-schema compatibility error. Future state is not labeled corrupt, backed up as corrupt, migrated, reset, or modified.
+- Schema 1-5 migrations first preserve the original bytes in a unique `state.v1.pre-migration.v<from>-to-v6.<millis>.<pid>.<counter>.json` file.
+- Migration backup, in-memory transform, result validation, and P1-A atomic persistence run in that order. Any failure stops startup; the old primary remains and a completed pre-migration backup is retained.
+- Migration validation requires schema v6 output, object-shaped settings, normalized TEXT/IMAGE input capabilities, TEXT output, and preservation of schema v5 file metadata.
+- Strictly named P1-A stale temp files are detected and ignored. They are never promoted, parsed as primary state, deleted, or allowed to replace the primary state.
+- The automatic `reset_persisted_state` path is removed. No non-NotFound load failure writes default state.
+- Startup errors use fixed stages and schema numbers only. State bytes, user content, provider data, secret references, and local paths are not logged.
+
+P1-B does not provide a recovery UI. A user encountering corrupt state receives a startup failure while the original and durable corrupt backup remain available for a later explicit recovery workflow. It also does not provide state/blob transactions, formal backup packages, portable DPAPI backup, or in-memory mutation rollback.
+
 ## P0 Persistence Baseline (Before P1-A)
 
 The following audit records the implementation that P1-A replaced. It remains here as the rationale and risk baseline; statements in this section describing fixed temp names, pre-delete, missing sync, ignored save errors, or no save mutex are historical rather than current behavior.
@@ -664,7 +685,7 @@ Tests:
 
 P1-A uses synthetic temporary directories and injected file-operation failures. It does not read real app data or secret blobs.
 
-### P1-B: Load And Migration Safety (Pending)
+### P1-B: Load And Migration Safety (Completed)
 
 Goal:
 
@@ -679,6 +700,25 @@ Required design:
 - Define downgrade protection and a user-visible recovery decision.
 - Define startup handling for stale unique temp files without deleting a valid primary state.
 - Add truncated-temp, migration-backup-failure, future-schema, and backup-failure tests.
+
+Implemented with synthetic state and injected read/write/backup/migration failures. No real app data or encrypted secret blob is read.
+
+### P1-C: Mutation Transaction Rollback (Pending)
+
+Goal:
+
+- Keep in-memory state and the last valid persisted state aligned when a mutation save fails.
+
+Required design:
+
+- Define a centralized mutation transaction boundary across settings, conversations, providers, and managed file metadata.
+- Preserve or reconstruct the previous in-memory value before mutation.
+- Roll back the affected in-memory state when persistence fails.
+- Avoid deadlock between mutation locks and the persistence mutex.
+- Preserve the P1-A rule that handlers return a safe failure rather than acknowledging an unsaved mutation.
+- Add concurrent mutation, rollback failure, streaming completion, provider deletion/SecretStore ordering, and file metadata/blob ordering tests.
+
+P1-C must not be represented as a state/blob transaction unless blob commit and rollback behavior is explicitly included and tested.
 
 ### P2: Portable Metadata/Full Backup Package
 
@@ -767,18 +807,21 @@ Acceptance:
 
 ## Phase 12 Status And Remaining Blockers
 
-P0 baseline conclusions and P1-A status:
+Current P1-A/P1-B status:
 
 - Atomic replacement state write exists: Yes for the P1-A single-file commit path; no pre-delete remains.
-- Corrupt backup exists: Yes, but only for parse/unsupported-schema paths and it is not fail-closed.
+- Corrupt backup is fail-closed: Yes after P1-B; the primary is retained and no default is written.
 - Direct primary-state removal in ordinary saves exists: No.
 - Persistence save mutex exists: Yes.
 - Persistence errors reach mutation handlers: Yes; background completion logs a safe stage-only error.
 - In-memory rollback on persistence failure exists: No; memory may temporarily lead disk.
-- Silent reset risk exists: Yes.
-- Load/migration overwrite risk exists: Yes, pending P1-B.
+- Silent automatic reset after read/parse/schema failure exists: No.
+- Future schema is fail-closed: Yes; it is not treated as corrupt or migrated.
+- Schema 1-5 pre-migration backup exists: Yes.
+- Automatic non-NotFound reset exists: No.
+- In-memory mutation rollback risk exists: Yes, pending P1-C.
 - State/blob consistency risk exists: Yes.
 - DPAPI secret blobs are portable across machines/users: No.
 - A formal backup/restore package currently exists: No.
 
-Recommended next step: Phase 12 P1-B load/migration safety. P1-B should be completed and fault-tested before Mode A/B packaging, managed blob restore, or any backup/restore UI.
+Recommended next step: Phase 12 P1-C mutation transaction rollback. P1-C should be scoped carefully before Mode A/B packaging, managed blob restore, or any backup/restore UI.

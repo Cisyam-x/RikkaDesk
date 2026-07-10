@@ -51,6 +51,7 @@ const PREFERRED_ADDR: &str = "127.0.0.1:8080";
 const PERSIST_DIR_NAME: &str = "mock-api";
 const STATE_FILE_NAME: &str = "state.v1.json";
 const STATE_TMP_FILE_PREFIX: &str = "state.v1.json.tmp";
+const STATE_BACKUP_CREATE_ATTEMPTS: usize = 32;
 const STATE_SCHEMA_VERSION: u32 = 6;
 const FILE_METADATA_STATE_SCHEMA_VERSION: u32 = 5;
 const CUSTOM_REQUEST_CONFIG_STATE_SCHEMA_VERSION: u32 = 4;
@@ -136,6 +137,10 @@ impl PersistenceError {
     fn stage(&self) -> &'static str {
         self.stage
     }
+
+    fn io_kind(&self) -> Option<io::ErrorKind> {
+        self.source.downcast_ref::<io::Error>().map(io::Error::kind)
+    }
 }
 
 impl fmt::Display for PersistenceError {
@@ -155,6 +160,108 @@ impl From<io::Error> for PersistenceError {
         Self::new("filesystem operation", error)
     }
 }
+
+#[derive(Debug)]
+enum StateLoadError {
+    ReadFailed(io::Error),
+    RecoveryRequired,
+    UnsupportedFutureSchema {
+        found: u64,
+        supported: u32,
+    },
+    BackupFailed {
+        purpose: &'static str,
+        source: PersistenceError,
+    },
+    MigrationFailed {
+        from: u32,
+        reason: &'static str,
+    },
+    PersistFailed {
+        purpose: &'static str,
+        source: PersistenceError,
+    },
+}
+
+impl fmt::Display for StateLoadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ReadFailed(_) => write!(formatter, "state load failed during read"),
+            Self::RecoveryRequired => write!(
+                formatter,
+                "local state is invalid and requires explicit recovery"
+            ),
+            Self::UnsupportedFutureSchema { found, supported } => write!(
+                formatter,
+                "local data was created by a newer RikkaDesk schema version; found schema {found}, this build supports up to schema {supported}"
+            ),
+            Self::BackupFailed { purpose, .. } => {
+                write!(formatter, "state load failed during {purpose} backup")
+            }
+            Self::MigrationFailed { from, reason } => write!(
+                formatter,
+                "state migration from schema {from} failed during {reason}"
+            ),
+            Self::PersistFailed { purpose, .. } => {
+                write!(formatter, "state load failed during {purpose} persistence")
+            }
+        }
+    }
+}
+
+impl Error for StateLoadError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::ReadFailed(source) => Some(source),
+            Self::BackupFailed { source, .. } | Self::PersistFailed { source, .. } => Some(source),
+            Self::RecoveryRequired
+            | Self::UnsupportedFutureSchema { .. }
+            | Self::MigrationFailed { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StateLoadOutcome {
+    Loaded,
+    InitializedDefault,
+    Migrated { from: u32, to: u32 },
+}
+
+struct StateLoadResult {
+    persisted: PersistedMockState,
+    outcome: StateLoadOutcome,
+}
+
+#[derive(Clone, Copy)]
+enum StateBackupKind {
+    Corrupt,
+    PreMigration { from: u32, to: u32 },
+}
+
+impl StateBackupKind {
+    fn purpose(self) -> &'static str {
+        match self {
+            Self::Corrupt => "corrupt state",
+            Self::PreMigration { .. } => "pre-migration state",
+        }
+    }
+
+    fn file_name(self, timestamp: u64, process_id: u32, sequence: u64) -> String {
+        match self {
+            Self::Corrupt => format!("state.v1.corrupt.{timestamp}.{process_id}.{sequence}.json"),
+            Self::PreMigration { from, to } => format!(
+                "state.v1.pre-migration.v{from}-to-v{to}.{timestamp}.{process_id}.{sequence}.json"
+            ),
+        }
+    }
+}
+
+trait StateMigrator: Send + Sync {
+    fn migrate(&self, persisted: PersistedMockState) -> Result<PersistedMockState, StateLoadError>;
+}
+
+struct RealStateMigrator;
 
 trait SecretStore: Send + Sync {
     fn set_secret(&self, secret_ref: &str, value: &str) -> SecretStoreResult<()>;
@@ -362,6 +469,7 @@ struct MockPersistence {
     state_path: PathBuf,
     save_lock: Arc<Mutex<()>>,
     temp_seq: Arc<AtomicU64>,
+    backup_seq: Arc<AtomicU64>,
     file_ops: Arc<dyn StateFileOps>,
 }
 
@@ -379,12 +487,9 @@ impl MockPersistence {
             state_path,
             save_lock: Arc::new(Mutex::new(())),
             temp_seq: Arc::new(AtomicU64::new(1)),
+            backup_seq: Arc::new(AtomicU64::new(1)),
             file_ops,
         }
-    }
-
-    fn state_path(&self) -> &std::path::Path {
-        &self.state_path
     }
 
     fn file_blobs_dir(&self) -> PathBuf {
@@ -429,6 +534,70 @@ impl MockPersistence {
         .map_err(|error| PersistenceError::new("blocking writer", error))?
     }
 
+    async fn read_state_bytes(&self) -> io::Result<Vec<u8>> {
+        let state_path = self.state_path.clone();
+        let file_ops = self.file_ops.clone();
+        tokio::task::spawn_blocking(move || file_ops.read(&state_path))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "state read task failed"))?
+    }
+
+    async fn write_raw_backup(
+        &self,
+        kind: StateBackupKind,
+        bytes: &[u8],
+    ) -> PersistenceResult<PathBuf> {
+        let _save_guard = self.save_lock.lock().await;
+        self.write_raw_backup_locked(kind, bytes).await
+    }
+
+    async fn write_raw_backup_locked(
+        &self,
+        kind: StateBackupKind,
+        bytes: &[u8],
+    ) -> PersistenceResult<PathBuf> {
+        let data = Arc::new(bytes.to_vec());
+        for _ in 0..STATE_BACKUP_CREATE_ATTEMPTS {
+            let backup_path = self.next_backup_path(kind);
+            let file_ops = self.file_ops.clone();
+            let path_for_write = backup_path.clone();
+            let data = data.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                write_new_file_durably(file_ops.as_ref(), &path_for_write, data.as_slice())
+            })
+            .await
+            .map_err(|error| PersistenceError::new("backup writer task", error))?;
+
+            match result {
+                Ok(()) => return Ok(backup_path),
+                Err(error) if error.io_kind() == Some(io::ErrorKind::AlreadyExists) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+
+        Err(PersistenceError::new(
+            "backup file creation",
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "backup filename attempts exhausted",
+            ),
+        ))
+    }
+
+    fn has_stale_state_temp(&self) -> bool {
+        let prefix = format!("{STATE_TMP_FILE_PREFIX}.");
+        let Ok(entries) = std_fs::read_dir(&self.state_dir) else {
+            return false;
+        };
+
+        entries.filter_map(Result::ok).any(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(&prefix))
+        })
+    }
+
     fn next_temp_path(&self) -> PathBuf {
         let sequence = self.temp_seq.fetch_add(1, Ordering::Relaxed);
         self.state_dir.join(format!(
@@ -437,9 +606,16 @@ impl MockPersistence {
             sequence
         ))
     }
+
+    fn next_backup_path(&self, kind: StateBackupKind) -> PathBuf {
+        let sequence = self.backup_seq.fetch_add(1, Ordering::Relaxed);
+        self.state_dir
+            .join(kind.file_name(now_millis(), std::process::id(), sequence))
+    }
 }
 
 trait StateFileOps: Send + Sync {
+    fn read(&self, path: &FilePath) -> io::Result<Vec<u8>>;
     fn create_dir_all(&self, path: &FilePath) -> io::Result<()>;
     fn create_temp(&self, path: &FilePath) -> io::Result<std_fs::File>;
     fn write_all(&self, file: &mut std_fs::File, data: &[u8]) -> io::Result<()>;
@@ -452,6 +628,10 @@ trait StateFileOps: Send + Sync {
 struct RealStateFileOps;
 
 impl StateFileOps for RealStateFileOps {
+    fn read(&self, path: &FilePath) -> io::Result<Vec<u8>> {
+        std_fs::read(path)
+    }
+
     fn create_dir_all(&self, path: &FilePath) -> io::Result<()> {
         std_fs::create_dir_all(path)
     }
@@ -482,6 +662,38 @@ impl StateFileOps for RealStateFileOps {
     fn remove_file(&self, path: &FilePath) -> io::Result<()> {
         std_fs::remove_file(path)
     }
+}
+
+fn write_new_file_durably(
+    file_ops: &dyn StateFileOps,
+    path: &FilePath,
+    data: &[u8],
+) -> PersistenceResult<()> {
+    let mut file = file_ops
+        .create_temp(path)
+        .map_err(|error| PersistenceError::new("backup file creation", error))?;
+
+    let write_result = (|| {
+        file_ops
+            .write_all(&mut file, data)
+            .map_err(|error| PersistenceError::new("backup file write", error))?;
+        file_ops
+            .flush(&mut file)
+            .map_err(|error| PersistenceError::new("backup file flush", error))?;
+        file_ops
+            .sync_all(&file)
+            .map_err(|error| PersistenceError::new("backup file sync", error))?;
+        Ok(())
+    })();
+
+    drop(file);
+
+    if let Err(error) = write_result {
+        let _ = file_ops.remove_file(path);
+        return Err(error);
+    }
+
+    Ok(())
 }
 
 fn write_state_file_atomically(
@@ -577,7 +789,7 @@ struct PersistedMockState {
     files: Vec<ManagedFileMetadata>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ManagedFileMetadata {
     id: u64,
@@ -1405,12 +1617,21 @@ impl MockApiState {
 pub async fn start(app_data_dir: PathBuf) -> Result<MockApiHandle, Box<dyn std::error::Error>> {
     let secret_store = create_secret_store(&app_data_dir);
     let persistence = MockPersistence::new(app_data_dir);
-    eprintln!(
-        "RikkaDesk mock API state file: {}",
-        persistence.state_path().display()
-    );
-    let persisted = load_persisted_state(&persistence).await;
-    let state = Arc::new(MockApiState::new(persistence, secret_store, persisted));
+    let loaded = load_persisted_state(&persistence).await?;
+    match loaded.outcome {
+        StateLoadOutcome::Loaded => {}
+        StateLoadOutcome::InitializedDefault => {
+            eprintln!("RikkaDesk local state initialized");
+        }
+        StateLoadOutcome::Migrated { from, to } => {
+            eprintln!("RikkaDesk local state migrated from schema {from} to schema {to}");
+        }
+    }
+    let state = Arc::new(MockApiState::new(
+        persistence,
+        secret_store,
+        loaded.persisted,
+    ));
     let router = Router::new()
         .route("/api/settings/stream", get(settings_stream))
         .route("/api/conversations/paged", get(conversations_paged))
@@ -1508,119 +1729,133 @@ pub async fn start(app_data_dir: PathBuf) -> Result<MockApiHandle, Box<dyn std::
     Ok(MockApiHandle { base_url })
 }
 
-async fn load_persisted_state(persistence: &MockPersistence) -> PersistedMockState {
-    if !persistence.state_path().exists() {
-        let persisted = default_persisted_state();
-        if let Err(error) = persistence.save(&persisted).await {
-            eprintln!("RikkaDesk mock API failed to create default state: {error}");
-        }
-        return persisted;
+async fn load_persisted_state(
+    persistence: &MockPersistence,
+) -> Result<StateLoadResult, StateLoadError> {
+    load_persisted_state_with_migrator(persistence, &RealStateMigrator).await
+}
+
+async fn load_persisted_state_with_migrator(
+    persistence: &MockPersistence,
+    migrator: &dyn StateMigrator,
+) -> Result<StateLoadResult, StateLoadError> {
+    if persistence.has_stale_state_temp() {
+        eprintln!("RikkaDesk stale state temp file detected and ignored");
     }
 
-    let bytes = match fs::read(persistence.state_path()).await {
+    let bytes = match persistence.read_state_bytes().await {
         Ok(bytes) => bytes,
-        Err(error) => {
-            eprintln!("RikkaDesk mock API failed to read state file: {error}");
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
             let persisted = default_persisted_state();
-            if let Err(error) = persistence.save(&persisted).await {
-                eprintln!("RikkaDesk mock API failed to save fallback state: {error}");
-            }
-            return persisted;
+            persistence
+                .save(&persisted)
+                .await
+                .map_err(|source| StateLoadError::PersistFailed {
+                    purpose: "default initialization",
+                    source,
+                })?;
+            return Ok(StateLoadResult {
+                persisted,
+                outcome: StateLoadOutcome::InitializedDefault,
+            });
         }
+        Err(error) => return Err(StateLoadError::ReadFailed(error)),
     };
 
-    match serde_json::from_slice::<PersistedMockState>(&bytes) {
-        Ok(mut persisted) if persisted.schema_version == STATE_SCHEMA_VERSION => {
-            normalize_desktop_providers(&mut persisted.providers);
-            sync_settings_with_desktop_providers(&mut persisted.settings, &persisted.providers);
-            ensure_current_model_exists(&mut persisted.settings);
-            persisted
-        }
-        Ok(persisted) if persisted.schema_version == FILE_METADATA_STATE_SCHEMA_VERSION => {
-            let mut migrated = migrate_v5_to_v6(persisted);
-            sync_settings_with_desktop_providers(&mut migrated.settings, &migrated.providers);
-            ensure_current_model_exists(&mut migrated.settings);
-            if let Err(error) = persistence.save(&migrated).await {
-                eprintln!("RikkaDesk mock API failed to save migrated state: {error}");
-            }
-            migrated
-        }
-        Ok(persisted) if persisted.schema_version == CUSTOM_REQUEST_CONFIG_STATE_SCHEMA_VERSION => {
-            let mut migrated = migrate_v4_to_v6(persisted);
-            sync_settings_with_desktop_providers(&mut migrated.settings, &migrated.providers);
-            ensure_current_model_exists(&mut migrated.settings);
-            if let Err(error) = persistence.save(&migrated).await {
-                eprintln!("RikkaDesk mock API failed to save migrated state: {error}");
-            }
-            migrated
-        }
-        Ok(persisted) if persisted.schema_version == MULTI_MODEL_STATE_SCHEMA_VERSION => {
-            let mut migrated = migrate_v3_to_v6(persisted);
-            sync_settings_with_desktop_providers(&mut migrated.settings, &migrated.providers);
-            ensure_current_model_exists(&mut migrated.settings);
-            if let Err(error) = persistence.save(&migrated).await {
-                eprintln!("RikkaDesk mock API failed to save migrated state: {error}");
-            }
-            migrated
-        }
-        Ok(persisted) if persisted.schema_version == PREVIOUS_STATE_SCHEMA_VERSION => {
-            let mut migrated = migrate_v2_to_v6(persisted);
-            sync_settings_with_desktop_providers(&mut migrated.settings, &migrated.providers);
-            ensure_current_model_exists(&mut migrated.settings);
-            if let Err(error) = persistence.save(&migrated).await {
-                eprintln!("RikkaDesk mock API failed to save migrated state: {error}");
-            }
-            migrated
-        }
-        Ok(persisted) if persisted.schema_version == LEGACY_STATE_SCHEMA_VERSION => {
-            let mut migrated = migrate_v1_to_v6(persisted);
-            sync_settings_with_desktop_providers(&mut migrated.settings, &migrated.providers);
-            ensure_current_model_exists(&mut migrated.settings);
-            if let Err(error) = persistence.save(&migrated).await {
-                eprintln!("RikkaDesk mock API failed to save migrated state: {error}");
-            }
-            migrated
-        }
-        Ok(persisted) => {
-            reset_persisted_state(
-                persistence,
-                format!("unsupported schemaVersion {}", persisted.schema_version),
-            )
-            .await
-        }
-        Err(error) => reset_persisted_state(persistence, format!("invalid JSON: {error}")).await,
+    let raw_value = match serde_json::from_slice::<Value>(&bytes) {
+        Ok(value) => value,
+        Err(_) => return Err(preserve_corrupt_state(persistence, &bytes).await),
+    };
+    let Some(schema_version) = raw_value.get("schemaVersion").and_then(Value::as_u64) else {
+        return Err(preserve_corrupt_state(persistence, &bytes).await);
+    };
+
+    if schema_version > u64::from(STATE_SCHEMA_VERSION) {
+        return Err(StateLoadError::UnsupportedFutureSchema {
+            found: schema_version,
+            supported: STATE_SCHEMA_VERSION,
+        });
     }
+    if schema_version == 0 {
+        return Err(preserve_corrupt_state(persistence, &bytes).await);
+    }
+
+    let persisted = match serde_json::from_value::<PersistedMockState>(raw_value) {
+        Ok(persisted) => persisted,
+        Err(_) => return Err(preserve_corrupt_state(persistence, &bytes).await),
+    };
+
+    if persisted.schema_version == STATE_SCHEMA_VERSION {
+        let mut persisted = persisted;
+        normalize_desktop_providers(&mut persisted.providers);
+        sync_settings_with_desktop_providers(&mut persisted.settings, &persisted.providers);
+        ensure_current_model_exists(&mut persisted.settings);
+        return Ok(StateLoadResult {
+            persisted,
+            outcome: StateLoadOutcome::Loaded,
+        });
+    }
+
+    if !matches!(
+        persisted.schema_version,
+        LEGACY_STATE_SCHEMA_VERSION
+            | PREVIOUS_STATE_SCHEMA_VERSION
+            | MULTI_MODEL_STATE_SCHEMA_VERSION
+            | CUSTOM_REQUEST_CONFIG_STATE_SCHEMA_VERSION
+            | FILE_METADATA_STATE_SCHEMA_VERSION
+    ) {
+        return Err(preserve_corrupt_state(persistence, &bytes).await);
+    }
+
+    let from = persisted.schema_version;
+    let _save_guard = persistence.save_lock.lock().await;
+    persistence
+        .write_raw_backup_locked(
+            StateBackupKind::PreMigration {
+                from,
+                to: STATE_SCHEMA_VERSION,
+            },
+            &bytes,
+        )
+        .await
+        .map_err(|source| StateLoadError::BackupFailed {
+            purpose: StateBackupKind::PreMigration {
+                from,
+                to: STATE_SCHEMA_VERSION,
+            }
+            .purpose(),
+            source,
+        })?;
+
+    let migrated = migrator.migrate(persisted)?;
+    persistence
+        .save_locked(&migrated)
+        .await
+        .map_err(|source| StateLoadError::PersistFailed {
+            purpose: "migration",
+            source,
+        })?;
+
+    Ok(StateLoadResult {
+        persisted: migrated,
+        outcome: StateLoadOutcome::Migrated {
+            from,
+            to: STATE_SCHEMA_VERSION,
+        },
+    })
 }
 
-async fn reset_persisted_state(
-    persistence: &MockPersistence,
-    reason: String,
-) -> PersistedMockState {
-    eprintln!("RikkaDesk mock API state reset: {reason}");
-
-    if let Err(error) = backup_corrupt_state(persistence).await {
-        eprintln!("RikkaDesk mock API failed to back up corrupt state: {error}");
+async fn preserve_corrupt_state(persistence: &MockPersistence, bytes: &[u8]) -> StateLoadError {
+    match persistence
+        .write_raw_backup(StateBackupKind::Corrupt, bytes)
+        .await
+    {
+        Ok(_) => StateLoadError::RecoveryRequired,
+        Err(source) => StateLoadError::BackupFailed {
+            purpose: StateBackupKind::Corrupt.purpose(),
+            source,
+        },
     }
-
-    let persisted = default_persisted_state();
-    if let Err(error) = persistence.save(&persisted).await {
-        eprintln!("RikkaDesk mock API failed to save fallback state: {error}");
-    }
-
-    persisted
-}
-
-async fn backup_corrupt_state(persistence: &MockPersistence) -> PersistenceResult<()> {
-    if !persistence.state_path().exists() {
-        return Ok(());
-    }
-
-    fs::create_dir_all(&persistence.state_dir).await?;
-    let backup_path = persistence
-        .state_dir
-        .join(format!("state.v1.corrupt.{}.json", now_millis()));
-    fs::rename(persistence.state_path(), backup_path).await?;
-    Ok(())
 }
 
 async fn persist_mock_state(state: &Arc<MockApiState>) -> PersistenceResult<()> {
@@ -5163,6 +5398,76 @@ fn migrate_v5_to_v6(mut persisted: PersistedMockState) -> PersistedMockState {
     persisted
 }
 
+impl StateMigrator for RealStateMigrator {
+    fn migrate(&self, persisted: PersistedMockState) -> Result<PersistedMockState, StateLoadError> {
+        let from = persisted.schema_version;
+        let original_files =
+            (from == FILE_METADATA_STATE_SCHEMA_VERSION).then(|| persisted.files.clone());
+        let mut migrated = match from {
+            LEGACY_STATE_SCHEMA_VERSION => migrate_v1_to_v6(persisted),
+            PREVIOUS_STATE_SCHEMA_VERSION => migrate_v2_to_v6(persisted),
+            MULTI_MODEL_STATE_SCHEMA_VERSION => migrate_v3_to_v6(persisted),
+            CUSTOM_REQUEST_CONFIG_STATE_SCHEMA_VERSION => migrate_v4_to_v6(persisted),
+            FILE_METADATA_STATE_SCHEMA_VERSION => migrate_v5_to_v6(persisted),
+            _ => {
+                return Err(StateLoadError::MigrationFailed {
+                    from,
+                    reason: "source validation",
+                });
+            }
+        };
+
+        sync_settings_with_desktop_providers(&mut migrated.settings, &migrated.providers);
+        ensure_current_model_exists(&mut migrated.settings);
+        validate_migrated_state(&migrated, from)?;
+
+        if original_files
+            .as_ref()
+            .is_some_and(|files| files != &migrated.files)
+        {
+            return Err(StateLoadError::MigrationFailed {
+                from,
+                reason: "file metadata validation",
+            });
+        }
+
+        Ok(migrated)
+    }
+}
+
+fn validate_migrated_state(
+    persisted: &PersistedMockState,
+    from: u32,
+) -> Result<(), StateLoadError> {
+    if persisted.schema_version != STATE_SCHEMA_VERSION || !persisted.settings.is_object() {
+        return Err(StateLoadError::MigrationFailed {
+            from,
+            reason: "result validation",
+        });
+    }
+
+    let modalities_valid = persisted.providers.iter().all(|provider| {
+        provider.models.iter().all(|model| {
+            model.input_modalities.first().map(String::as_str) == Some(MODEL_MODALITY_TEXT)
+                && model.input_modalities.iter().all(|modality| {
+                    matches!(
+                        modality.as_str(),
+                        MODEL_MODALITY_TEXT | MODEL_MODALITY_IMAGE
+                    )
+                })
+                && model.output_modalities == default_output_modalities()
+        })
+    });
+    if !modalities_valid {
+        return Err(StateLoadError::MigrationFailed {
+            from,
+            reason: "model capability validation",
+        });
+    }
+
+    Ok(())
+}
+
 fn normalize_desktop_providers(providers: &mut Vec<DesktopProviderConfig>) {
     for provider in providers {
         provider.normalize_models();
@@ -5877,6 +6182,8 @@ mod tests {
 
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum TestFailureStage {
+        Read,
+        BackupCreate,
         Write,
         Flush,
         Sync,
@@ -5894,11 +6201,21 @@ mod tests {
     }
 
     impl StateFileOps for FaultingStateFileOps {
+        fn read(&self, path: &FilePath) -> io::Result<Vec<u8>> {
+            if self.stage == TestFailureStage::Read {
+                return Err(self.failure());
+            }
+            RealStateFileOps.read(path)
+        }
+
         fn create_dir_all(&self, path: &FilePath) -> io::Result<()> {
             RealStateFileOps.create_dir_all(path)
         }
 
         fn create_temp(&self, path: &FilePath) -> io::Result<std_fs::File> {
+            if self.stage == TestFailureStage::BackupCreate && is_test_backup_path(path) {
+                return Err(self.failure());
+            }
             RealStateFileOps.create_temp(path)
         }
 
@@ -5932,6 +6249,88 @@ mod tests {
 
         fn remove_file(&self, path: &FilePath) -> io::Result<()> {
             RealStateFileOps.remove_file(path)
+        }
+    }
+
+    struct CollisionOnceStateFileOps {
+        collided: std::sync::atomic::AtomicBool,
+    }
+
+    impl CollisionOnceStateFileOps {
+        fn new() -> Self {
+            Self {
+                collided: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl StateFileOps for CollisionOnceStateFileOps {
+        fn read(&self, path: &FilePath) -> io::Result<Vec<u8>> {
+            RealStateFileOps.read(path)
+        }
+
+        fn create_dir_all(&self, path: &FilePath) -> io::Result<()> {
+            RealStateFileOps.create_dir_all(path)
+        }
+
+        fn create_temp(&self, path: &FilePath) -> io::Result<std_fs::File> {
+            if !self.collided.swap(true, Ordering::SeqCst) {
+                let mut existing = RealStateFileOps.create_temp(path)?;
+                RealStateFileOps.write_all(&mut existing, b"synthetic existing backup")?;
+                RealStateFileOps.flush(&mut existing)?;
+                RealStateFileOps.sync_all(&existing)?;
+                drop(existing);
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "synthetic backup collision",
+                ));
+            }
+            RealStateFileOps.create_temp(path)
+        }
+
+        fn write_all(&self, file: &mut std_fs::File, data: &[u8]) -> io::Result<()> {
+            RealStateFileOps.write_all(file, data)
+        }
+
+        fn flush(&self, file: &mut std_fs::File) -> io::Result<()> {
+            RealStateFileOps.flush(file)
+        }
+
+        fn sync_all(&self, file: &std_fs::File) -> io::Result<()> {
+            RealStateFileOps.sync_all(file)
+        }
+
+        fn replace(&self, replacement: &FilePath, target: &FilePath) -> io::Result<()> {
+            RealStateFileOps.replace(replacement, target)
+        }
+
+        fn remove_file(&self, path: &FilePath) -> io::Result<()> {
+            RealStateFileOps.remove_file(path)
+        }
+    }
+
+    struct FailingStateMigrator;
+
+    impl StateMigrator for FailingStateMigrator {
+        fn migrate(
+            &self,
+            persisted: PersistedMockState,
+        ) -> Result<PersistedMockState, StateLoadError> {
+            Err(StateLoadError::MigrationFailed {
+                from: persisted.schema_version,
+                reason: "synthetic transform",
+            })
+        }
+    }
+
+    struct UnexpectedStateMigrator;
+
+    impl StateMigrator for UnexpectedStateMigrator {
+        fn migrate(
+            &self,
+            _persisted: PersistedMockState,
+        ) -> Result<PersistedMockState, StateLoadError> {
+            panic!("migration must not run when the pre-migration backup fails")
         }
     }
 
@@ -5977,8 +6376,455 @@ mod tests {
     }
 
     fn read_test_state(persistence: &MockPersistence) -> Value {
-        let data = std_fs::read(persistence.state_path()).expect("state file should exist");
+        let data = std_fs::read(&persistence.state_path).expect("state file should exist");
         serde_json::from_slice(&data).expect("state file should contain valid JSON")
+    }
+
+    fn write_test_state_bytes(persistence: &MockPersistence, bytes: &[u8]) {
+        std_fs::create_dir_all(&persistence.state_dir)
+            .expect("synthetic state directory should be created");
+        std_fs::write(&persistence.state_path, bytes).expect("synthetic state should be written");
+    }
+
+    fn is_test_backup_path(path: &FilePath) -> bool {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name.starts_with("state.v1.corrupt.") || name.starts_with("state.v1.pre-migration.")
+            })
+    }
+
+    fn state_backup_files(persistence: &MockPersistence, marker: &str) -> Vec<PathBuf> {
+        let Ok(entries) = std_fs::read_dir(&persistence.state_dir) else {
+            return Vec::new();
+        };
+        let mut paths = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains(marker))
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+
+    fn synthetic_state_for_schema(schema_version: u32) -> PersistedMockState {
+        let mut persisted = default_persisted_state();
+        persisted.schema_version = schema_version;
+        persisted.settings["syntheticLoadMarker"] = json!("preserved");
+        persisted.files.push(ManagedFileMetadata {
+            id: 42,
+            storage_key: "synthetic-file-42".to_string(),
+            display_name: "synthetic.txt".to_string(),
+            mime: "text/plain".to_string(),
+            size_bytes: 16,
+            sha256: None,
+            kind: "document".to_string(),
+            relative_path: "files/blobs/synthetic-file-42".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            source: "synthetic".to_string(),
+            deleted_at: None,
+        });
+        persisted.providers.push(DesktopProviderConfig {
+            id: "synthetic-provider".to_string(),
+            provider_type: OPENAI_COMPATIBLE_PROVIDER_TYPE.to_string(),
+            enabled: true,
+            name: "Synthetic Provider".to_string(),
+            base_url: "http://127.0.0.1:9999/v1".to_string(),
+            models: vec![DesktopProviderModelConfig {
+                id: "synthetic-model".to_string(),
+                model_id: "synthetic-model".to_string(),
+                display_name: "Synthetic Model".to_string(),
+                input_modalities: vec!["image".to_string(), "text".to_string()],
+                output_modalities: vec!["text".to_string()],
+            }],
+            legacy_model: None,
+            secret_ref: "synthetic-provider-reference".to_string(),
+            custom_headers: Vec::new(),
+            custom_body: None,
+        });
+        persisted
+    }
+
+    async fn assert_state_load_migration(from: u32) {
+        let temp = SyntheticTempDir::new("migration");
+        let persistence = test_persistence(&temp);
+        let persisted = synthetic_state_for_schema(from);
+        let original_conversation_ids = persisted
+            .conversations
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let original_files = persisted.files.clone();
+        let original_bytes =
+            serde_json::to_vec_pretty(&persisted).expect("synthetic state should serialize");
+        write_test_state_bytes(&persistence, &original_bytes);
+
+        let loaded = load_persisted_state(&persistence)
+            .await
+            .expect("migration should succeed");
+
+        assert_eq!(
+            loaded.outcome,
+            StateLoadOutcome::Migrated {
+                from,
+                to: STATE_SCHEMA_VERSION,
+            }
+        );
+        assert_eq!(loaded.persisted.schema_version, STATE_SCHEMA_VERSION);
+        assert_eq!(
+            loaded.persisted.settings["syntheticLoadMarker"],
+            json!("preserved")
+        );
+        assert_eq!(
+            loaded
+                .persisted
+                .conversations
+                .keys()
+                .cloned()
+                .collect::<HashSet<_>>(),
+            original_conversation_ids
+        );
+        if from == LEGACY_STATE_SCHEMA_VERSION {
+            assert!(loaded.persisted.providers.is_empty());
+        } else {
+            let model = &loaded.persisted.providers[0].models[0];
+            assert_eq!(
+                model.input_modalities,
+                vec![
+                    MODEL_MODALITY_TEXT.to_string(),
+                    MODEL_MODALITY_IMAGE.to_string()
+                ]
+            );
+            assert_eq!(model.output_modalities, default_output_modalities());
+        }
+        if from == FILE_METADATA_STATE_SCHEMA_VERSION {
+            assert!(loaded.persisted.files == original_files);
+        } else {
+            assert!(loaded.persisted.files.is_empty());
+        }
+
+        let backups = state_backup_files(&persistence, ".pre-migration.");
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            std_fs::read(&backups[0]).expect("migration backup should be readable"),
+            original_bytes
+        );
+        assert_eq!(
+            read_test_state(&persistence)["schemaVersion"],
+            json!(STATE_SCHEMA_VERSION)
+        );
+    }
+
+    #[tokio::test]
+    async fn state_load_missing_initializes_default_only_after_persistence() {
+        let temp = SyntheticTempDir::new("missing");
+        let persistence = test_persistence(&temp);
+
+        let loaded = load_persisted_state(&persistence)
+            .await
+            .expect("missing state should initialize");
+
+        assert_eq!(loaded.outcome, StateLoadOutcome::InitializedDefault);
+        assert_eq!(loaded.persisted.schema_version, STATE_SCHEMA_VERSION);
+        assert_eq!(
+            read_test_state(&persistence)["schemaVersion"],
+            json!(STATE_SCHEMA_VERSION)
+        );
+        assert!(state_backup_files(&persistence, ".corrupt.").is_empty());
+        assert!(state_backup_files(&persistence, ".pre-migration.").is_empty());
+    }
+
+    #[tokio::test]
+    async fn state_load_missing_persistence_failure_stops_initialization() {
+        let temp = SyntheticTempDir::new("missing-persist-failure");
+        let persistence = faulting_test_persistence(&temp, TestFailureStage::Write);
+
+        let result = load_persisted_state(&persistence).await;
+
+        assert!(matches!(
+            result,
+            Err(StateLoadError::PersistFailed {
+                purpose: "default initialization",
+                ..
+            })
+        ));
+        assert!(!persistence.state_path.exists());
+        assert!(state_backup_files(&persistence, ".corrupt.").is_empty());
+    }
+
+    #[tokio::test]
+    async fn state_load_read_failure_is_fail_closed_without_reset() {
+        let temp = SyntheticTempDir::new("read-failure");
+        let real = test_persistence(&temp);
+        let original = serde_json::to_vec_pretty(&synthetic_state_for_schema(STATE_SCHEMA_VERSION))
+            .expect("synthetic state should serialize");
+        write_test_state_bytes(&real, &original);
+        let persistence = faulting_test_persistence(&temp, TestFailureStage::Read);
+
+        let result = load_persisted_state(&persistence).await;
+
+        assert!(matches!(result, Err(StateLoadError::ReadFailed(_))));
+        assert_eq!(
+            std_fs::read(&real.state_path).expect("original state should remain"),
+            original
+        );
+        assert!(state_backup_files(&real, ".corrupt.").is_empty());
+        assert!(state_backup_files(&real, ".pre-migration.").is_empty());
+    }
+
+    #[tokio::test]
+    async fn state_load_corrupt_json_preserves_original_and_requires_recovery() {
+        let temp = SyntheticTempDir::new("corrupt");
+        let persistence = test_persistence(&temp);
+        let original = b"{ synthetic malformed JSON".to_vec();
+        write_test_state_bytes(&persistence, &original);
+
+        let result = load_persisted_state(&persistence).await;
+
+        assert!(matches!(result, Err(StateLoadError::RecoveryRequired)));
+        assert_eq!(
+            std_fs::read(&persistence.state_path).expect("original state should remain"),
+            original
+        );
+        let backups = state_backup_files(&persistence, ".corrupt.");
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            std_fs::read(&backups[0]).expect("corrupt backup should be readable"),
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn state_load_corrupt_backup_failure_preserves_original_and_stops() {
+        let temp = SyntheticTempDir::new("corrupt-backup-failure");
+        let real = test_persistence(&temp);
+        let original = b"{ synthetic malformed JSON".to_vec();
+        write_test_state_bytes(&real, &original);
+        let persistence = faulting_test_persistence(&temp, TestFailureStage::BackupCreate);
+
+        let result = load_persisted_state(&persistence).await;
+
+        assert!(matches!(
+            result,
+            Err(StateLoadError::BackupFailed {
+                purpose: "corrupt state",
+                ..
+            })
+        ));
+        assert_eq!(
+            std_fs::read(&real.state_path).expect("original state should remain"),
+            original
+        );
+        assert!(state_backup_files(&real, ".corrupt.").is_empty());
+    }
+
+    #[tokio::test]
+    async fn state_load_future_schema_is_fail_closed_without_corrupt_backup() {
+        let temp = SyntheticTempDir::new("future-schema");
+        let persistence = test_persistence(&temp);
+        let original = br#"{"schemaVersion":7,"syntheticMarker":"do-not-log"}"#.to_vec();
+        write_test_state_bytes(&persistence, &original);
+
+        let error = match load_persisted_state(&persistence).await {
+            Err(error) => error,
+            Ok(_) => panic!("future schema should stop startup"),
+        };
+
+        assert!(matches!(
+            error,
+            StateLoadError::UnsupportedFutureSchema {
+                found: 7,
+                supported: STATE_SCHEMA_VERSION,
+            }
+        ));
+        assert_eq!(
+            std_fs::read(&persistence.state_path).expect("future state should remain"),
+            original
+        );
+        assert!(state_backup_files(&persistence, ".corrupt.").is_empty());
+        assert!(state_backup_files(&persistence, ".pre-migration.").is_empty());
+    }
+
+    #[tokio::test]
+    async fn state_load_migration_v1_to_v6() {
+        assert_state_load_migration(LEGACY_STATE_SCHEMA_VERSION).await;
+    }
+
+    #[tokio::test]
+    async fn state_load_migration_v2_to_v6() {
+        assert_state_load_migration(PREVIOUS_STATE_SCHEMA_VERSION).await;
+    }
+
+    #[tokio::test]
+    async fn state_load_migration_v3_to_v6() {
+        assert_state_load_migration(MULTI_MODEL_STATE_SCHEMA_VERSION).await;
+    }
+
+    #[tokio::test]
+    async fn state_load_migration_v4_to_v6() {
+        assert_state_load_migration(CUSTOM_REQUEST_CONFIG_STATE_SCHEMA_VERSION).await;
+    }
+
+    #[tokio::test]
+    async fn state_load_migration_v5_to_v6() {
+        assert_state_load_migration(FILE_METADATA_STATE_SCHEMA_VERSION).await;
+    }
+
+    #[tokio::test]
+    async fn state_load_migration_backup_failure_stops_before_transform() {
+        let temp = SyntheticTempDir::new("migration-backup-failure");
+        let real = test_persistence(&temp);
+        let original = serde_json::to_vec_pretty(&synthetic_state_for_schema(
+            FILE_METADATA_STATE_SCHEMA_VERSION,
+        ))
+        .expect("synthetic state should serialize");
+        write_test_state_bytes(&real, &original);
+        let persistence = faulting_test_persistence(&temp, TestFailureStage::BackupCreate);
+
+        let result =
+            load_persisted_state_with_migrator(&persistence, &UnexpectedStateMigrator).await;
+
+        assert!(matches!(
+            result,
+            Err(StateLoadError::BackupFailed {
+                purpose: "pre-migration state",
+                ..
+            })
+        ));
+        assert_eq!(
+            std_fs::read(&real.state_path).expect("old state should remain"),
+            original
+        );
+        assert!(state_backup_files(&real, ".pre-migration.").is_empty());
+    }
+
+    #[tokio::test]
+    async fn state_load_migration_transform_failure_preserves_state_and_backup() {
+        let temp = SyntheticTempDir::new("migration-transform-failure");
+        let persistence = test_persistence(&temp);
+        let original = serde_json::to_vec_pretty(&synthetic_state_for_schema(
+            FILE_METADATA_STATE_SCHEMA_VERSION,
+        ))
+        .expect("synthetic state should serialize");
+        write_test_state_bytes(&persistence, &original);
+
+        let result = load_persisted_state_with_migrator(&persistence, &FailingStateMigrator).await;
+
+        assert!(matches!(
+            result,
+            Err(StateLoadError::MigrationFailed {
+                from: FILE_METADATA_STATE_SCHEMA_VERSION,
+                reason: "synthetic transform",
+            })
+        ));
+        assert_eq!(
+            std_fs::read(&persistence.state_path).expect("old state should remain"),
+            original
+        );
+        let backups = state_backup_files(&persistence, ".pre-migration.");
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std_fs::read(&backups[0]).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn state_load_migration_persistence_failure_preserves_state_and_backup() {
+        let temp = SyntheticTempDir::new("migration-persist-failure");
+        let real = test_persistence(&temp);
+        let original = serde_json::to_vec_pretty(&synthetic_state_for_schema(
+            FILE_METADATA_STATE_SCHEMA_VERSION,
+        ))
+        .expect("synthetic state should serialize");
+        write_test_state_bytes(&real, &original);
+        let persistence = faulting_test_persistence(&temp, TestFailureStage::Replace);
+
+        let result = load_persisted_state(&persistence).await;
+
+        assert!(matches!(
+            result,
+            Err(StateLoadError::PersistFailed {
+                purpose: "migration",
+                ..
+            })
+        ));
+        assert_eq!(
+            std_fs::read(&real.state_path).expect("old state should remain"),
+            original
+        );
+        let backups = state_backup_files(&real, ".pre-migration.");
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std_fs::read(&backups[0]).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn state_load_corrupt_backup_filename_collision_does_not_overwrite() {
+        let temp = SyntheticTempDir::new("backup-collision");
+        let persistence = MockPersistence::new_with_file_ops(
+            temp.path.clone(),
+            Arc::new(CollisionOnceStateFileOps::new()),
+        );
+        let original = b"{ synthetic malformed JSON".to_vec();
+        write_test_state_bytes(&persistence, &original);
+
+        let result = load_persisted_state(&persistence).await;
+
+        assert!(matches!(result, Err(StateLoadError::RecoveryRequired)));
+        let backups = state_backup_files(&persistence, ".corrupt.");
+        assert_eq!(backups.len(), 2);
+        let contents = backups
+            .iter()
+            .map(|path| std_fs::read(path).expect("backup should be readable"))
+            .collect::<Vec<_>>();
+        assert!(contents.contains(&b"synthetic existing backup".to_vec()));
+        assert!(contents.contains(&original));
+    }
+
+    #[tokio::test]
+    async fn state_load_stale_temp_is_ignored_and_preserved() {
+        let temp = SyntheticTempDir::new("stale-temp");
+        let persistence = test_persistence(&temp);
+        let current = serde_json::to_vec_pretty(&synthetic_state_for_schema(STATE_SCHEMA_VERSION))
+            .expect("current state should serialize");
+        write_test_state_bytes(&persistence, &current);
+        let stale_temp = persistence
+            .state_dir
+            .join(format!("{STATE_TMP_FILE_PREFIX}.999.1"));
+        std_fs::write(&stale_temp, br#"{"schemaVersion":7}"#)
+            .expect("stale temp should be created");
+
+        let loaded = load_persisted_state(&persistence)
+            .await
+            .expect("primary state should load");
+
+        assert_eq!(loaded.outcome, StateLoadOutcome::Loaded);
+        assert!(stale_temp.exists());
+        assert_eq!(
+            std_fs::read(&persistence.state_path).expect("primary state should remain"),
+            current
+        );
+    }
+
+    #[tokio::test]
+    async fn state_load_error_messages_do_not_expose_content_or_absolute_path() {
+        let temp = SyntheticTempDir::new("safe-error");
+        let persistence = test_persistence(&temp);
+        let original = br#"{"schemaVersion":7,"syntheticMarker":"private-value"}"#.to_vec();
+        write_test_state_bytes(&persistence, &original);
+
+        let error = match load_persisted_state(&persistence).await {
+            Err(error) => error,
+            Ok(_) => panic!("future schema should fail"),
+        };
+        let message = error.to_string();
+
+        assert!(message.contains("schema 7"));
+        assert!(!message.contains("private-value"));
+        assert!(!message.contains("state.v1.json"));
+        assert!(!message.contains(temp.path.to_string_lossy().as_ref()));
     }
 
     fn state_temp_files(persistence: &MockPersistence) -> Vec<PathBuf> {

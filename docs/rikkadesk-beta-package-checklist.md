@@ -194,6 +194,8 @@ Phase 10 upgrades local desktop state to `schemaVersion: 5` with managed file me
 
 Phase 12 P1-A serializes local state saves, uses unique same-directory temp files, flushes and syncs each complete temp file, and replaces the primary state without deleting it first. Packaging verification should run the synthetic `state_persist` tests and confirm save failures return a non-success response. P1-A does not yet add backup/restore, migration backup, future-schema protection, or in-memory rollback after a failed save.
 
+Phase 12 P1-B initializes defaults only when the primary state is missing. Other read failures stop startup. Malformed state is preserved byte-for-byte in a unique corrupt backup and requires explicit recovery; a backup failure cannot fall through to default state. Future schemas stop startup without being marked corrupt, and schemas 1-5 receive a durable original-byte backup before migration. Strict P1-A stale temp files remain ignored and preserved. Recovery UI and mutation rollback are still pending.
+
 It may contain:
 
 - settings
