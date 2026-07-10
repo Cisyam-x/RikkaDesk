@@ -1,8 +1,8 @@
 # RikkaDesk Phase 12 Mutation Transaction Boundaries
 
-This document is the Phase 12 P1-C0 audit and design for runtime mutation transactions. It defines state, SecretStore, managed blob, network, streaming, lock, commit, rollback, compensation, and event-ordering boundaries before rollback code is implemented.
+This document began as the Phase 12 P1-C0 audit and design for runtime mutation transactions. It now also records the completed P1-C1 implementation for pure persisted-state mutations while retaining the SecretStore, managed blob, network, and streaming boundaries for later phases.
 
-P1-C0 is documentation only. It does not change Rust or TypeScript, add backup/restore, read real app data or secret blobs, change `schemaVersion: 6`, change provider import/export version 4, or enable real-provider image input by default.
+P1-C1 changes the Rust mock API transaction path only. It does not add backup/restore, read real app data or secret blobs, change `schemaVersion: 6`, change provider import/export version 4, or enable real-provider image input by default.
 
 ## Current State Model
 
@@ -24,29 +24,50 @@ Runtime-only data is separate:
 - SecretStore
 - persistence/save mutex and file operations
 
-P1-A serializes writes and atomically replaces the state file. P1-B makes startup and migration fail closed. Mutation handlers now return an error when persistence fails, but most handlers still mutate live state before persistence. A failed save can therefore leave memory ahead of disk.
+P1-A serializes writes and atomically replaces the state file. P1-B makes startup and migration fail closed. P1-C1 now stages pure settings/conversation mutations, persists the explicit staged snapshot, and commits live state only after persistence succeeds. Provider/SecretStore, file/blob, and streaming mutations remain transitional paths; their short state-write windows are serialized with P1-C1, but their cross-resource compensation is still pending.
+
+## P1-C1 Implementation Status
+
+Implemented pure-state handlers:
+
+- `POST /api/settings/assistant` via `update_assistant`
+- `POST /api/settings/assistant/model` via `update_assistant_model`
+- `POST /api/settings/favorite-models` via `update_favorite_models`
+- `POST /api/conversations/{id}/title` via `update_conversation_title`
+- `POST /api/conversations/{id}/pin` via `toggle_conversation_pin`
+- `DELETE /api/conversations/{id}` via `delete_conversation`
+- `POST /api/conversations/{id}/messages/{message_id}/edit` via `edit_message`
+- `DELETE /api/conversations/{id}/messages/{message_id}` via `delete_message`
+
+The implementation adds one process-local `mutation_transaction_mutex`, one live `commit_barrier`, a cloneable `PersistedMockState`, explicit staged-snapshot persistence, validation before persistence, and a runtime-only monotonic transaction revision. The revision is not serialized and does not change schema v6.
+
+`conversation_detail` and `conversation_stream` no longer call a get-or-create helper. A missing ID receives a virtual empty DTO for compatibility with the frontend's navigate-before-POST new-chat flow. The virtual DTO is not inserted into conversations, does not advance `id_seq`, and is not persisted. The stream sender remains runtime-only.
+
+P1-C1 success is published only after disk persistence and the live commit finish. Persistence or validation failure leaves pure live state, disk state, and revision unchanged and emits no success update.
+
+Transitional Category B/C/D writers now use the same mutation mutex and commit barrier for their short live-state write/persist window. This prevents interleaving with a P1-C1 commit and prevents an older persistence snapshot from overwriting a newer transaction. It does not compensate a SecretStore change, remove an orphan blob, restore a deleted blob, or make streaming deltas durable. A failed transitional writer can still leave its live component ahead of disk; P1-C2, P1-C3, and P1-C4 own those remaining semantics.
 
 ## Mutation Call-Site Inventory
 
 | Endpoint or task | Live structures changed | Persistence | External/runtime side effect | Current persistence-failure behavior | Safe direct rollback? | Category |
 |---|---|---|---|---|---|---|
-| Provider import confirm | providers, derived settings, `id_seq` | Yes | settings SSE | Live imported providers remain; no success SSE | Risky across two locks and concurrent writers | A |
-| Provider upsert without key | providers, derived settings/favorites/current model, `id_seq` | Yes | settings SSE | Live provider/settings remain | Risky across provider/settings locks | A |
+| Provider import confirm | providers, derived settings, `id_seq` | Yes | settings SSE | Transitional writer is serialized, but failed persistence can leave live state ahead | Defer with the provider domain | C2 |
+| Provider upsert without key | providers, derived settings/favorites/current model, `id_seq` | Yes | settings SSE | Transitional writer is serialized, but failed persistence can leave live state ahead | Defer with the provider domain | C2 |
 | Provider upsert with key | providers, derived settings, `id_seq` | Yes | SecretStore write happens first | Secret can change and live state remains even when state save fails | Requires secret compensation and staged state | C |
 | Provider API key update | None in JSON state; existing `secretRef` is read | No | SecretStore replace | SecretStore error returns 500; successful secret change is immediate | SecretStore-owned atomic replace | C |
 | Provider API key clear | None in JSON state; existing `secretRef` remains | No | SecretStore delete | Delete error returns 500; successful clear is immediate | Intentional missing secret, not state rollback | C |
 | Provider delete | providers and derived settings/favorites/current model | Yes | SecretStore delete happens first; settings/list SSE after save | Save failure can leave live provider removed while disk still references a now-missing secret | Unsafe without reversible secret delete | C |
-| Assistant selection | settings | Yes | settings/list SSE | Live selection remains; no success SSE | Yes only under serialized staged transaction | A |
-| Current assistant model | settings and assistant model field | Yes | settings SSE | Live model selection remains | Yes only under serialized staged transaction | A |
-| Favorite models | settings | Yes | settings SSE | Live favorites remain | Yes only under serialized staged transaction | A |
-| Conversation detail/stream lazy create | conversations | No immediate save | Creates conversation sender for stream | A GET can create unpersisted live state | Should stop mutating on read or use A transaction | A |
+| Assistant selection | settings | Yes | settings/list SSE | P1-C1 discards failed stage; live/disk/revision remain old | Implemented staged transaction | A |
+| Current assistant model | settings and assistant model field | Yes | settings SSE | P1-C1 discards failed stage; live/disk/revision remain old | Implemented staged transaction | A |
+| Favorite models | settings | Yes | settings SSE | P1-C1 discards failed stage; live/disk/revision remain old | Implemented staged transaction | A |
+| Conversation detail/stream missing-ID read | None in persisted state | No | Runtime-only stream sender | Returns a virtual DTO without inserting or saving | Implemented pure GET | Read |
 | Send user message | conversations, title/mode/lorebook/generating state, `id_seq` | Yes before provider work | conversation/list SSE, then local reply or provider task | User turn remains live if initial save fails; provider is not started | Stage initial turn; do not rollback live | B |
 | Stop conversation | conversations plus runtime generation flag | Yes | Stops runtime processing before save; conversation/list SSE after save | Live/runtime stop remains if save fails | Needs staged state plus generation token ordering | B |
-| Conversation title | conversations | Yes | conversation/list SSE | Live title remains | Good P1-C1 candidate | A |
-| Pin/unpin | conversations | Yes | conversation/list SSE | Live pin remains | Good P1-C1 candidate | A |
-| Conversation delete | conversations | Yes | Stops generation and removes SSE sender before save | Live conversation and runtime sender remain deleted if save fails | Needs staged state; runtime cleanup after commit | B |
-| Message edit | conversations | Yes | conversation/list SSE | Live edit remains | Good P1-C1 candidate | A |
-| Message delete | conversations | Yes | conversation/list SSE | Live deletion remains | Good P1-C1 candidate | A |
+| Conversation title | conversations | Yes | conversation/list SSE | P1-C1 leaves live/disk old on failure | Implemented staged transaction | A |
+| Pin/unpin | conversations | Yes | conversation/list SSE | P1-C1 leaves live/disk old on failure | Implemented staged transaction | A |
+| Conversation delete | conversations | Yes | Runtime generation/sender cleanup after commit; list SSE after commit | Failed stage leaves conversation and runtime resources intact | Implemented staged transaction | A |
+| Message edit | conversations | Yes | conversation/list SSE | P1-C1 leaves live/disk old on failure | Implemented staged transaction | A |
+| Message delete | conversations | Yes | conversation/list SSE | P1-C1 leaves live/disk old on failure | Implemented staged transaction | A |
 | Regenerate preparation | conversations, truncation/generating state | Yes | SSE, then local reply or provider task | Live history remains truncated if save fails | Stage and commit before any task | B |
 | Append local assistant reply | conversations, `id_seq` | Yes | conversation/list SSE | Live reply remains if save fails | Stage as short A/B transaction | B |
 | Append empty streaming reply | conversations, `id_seq` | Yes | SSE, then generation flag/network task | Live placeholder remains if save fails | Stage before starting network | B |
@@ -99,7 +120,7 @@ NotFound initialization, corrupt backup, future-schema handling, and migration r
 1. HTTP mutation success means the intended live state and durable state agree. Required external effects are complete or the response explicitly reports a durable pending state.
 2. Persistence failure never returns success, never commits staged data to live state, and never emits a success snapshot/invalidation.
 3. An external effect occurs only after state commit when that ordering is safe, or it is prepared/applied with a proven compensation path.
-4. No component `RwLock`, commit barrier, or mutation stage lock is held across disk sync, provider network wait, long-running stream, SSE send, or SecretStore operation.
+4. The global mutation mutex serializes snapshot, persistence, and commit. No component `RwLock` or commit barrier is held across disk sync, provider network wait, long-running stream, SSE send, SecretStore operation, or blob I/O. The mutation mutex is never held across network, SecretStore, blob I/O, or SSE.
 5. Transaction N failure cannot restore or overwrite transaction N+1. Runtime persisted-state writers are globally serialized.
 6. Readers never observe a partially committed multi-field state.
 7. Provider calls start only after the initial user message and assistant placeholder required by that call are durable.
@@ -340,7 +361,7 @@ Errors may include fixed operation/stage codes and non-sensitive numeric IDs onl
 
 ## P1-C Implementation Split
 
-### P1-C1: Pure State Staged Transactions
+### P1-C1: Pure State Staged Transactions (Completed)
 
 Scope:
 
@@ -348,11 +369,10 @@ Scope:
 - Cloneable staged persisted state and deterministic mutation functions.
 - Assistant/current model/favorites.
 - Conversation title, pin, delete, message edit/delete, and lazy conversation creation policy.
-- Provider import/upsert only when no secret operation is requested.
 - State-only ID/timestamp semantics.
 - Persist before live commit; commit before events.
 
-Exclude SecretStore, blob I/O, and streaming finalization.
+Provider import/upsert remains outside P1-C1 even when a request omits a key, so that all provider state and SecretStore ordering can be resolved together in P1-C2. Exclude SecretStore compensation, blob transactions, send/regenerate/stop semantics, and streaming finalization.
 
 ### P1-C2: Provider And SecretStore Compensation
 
@@ -440,7 +460,7 @@ P1-C1 pure state transaction safety
 
 Reason: a backup snapshot cannot be represented as consistent while runtime writers can expose uncommitted state, SecretStore operations can leave cross-resource inconsistencies, blobs can be missing/orphaned, or streaming can mutate persisted objects outside transaction boundaries.
 
-## P1-C0 Conclusions
+## P1-C1 Conclusions
 
 - Recommended architecture: stage, persist, then commit live.
 - Global mutation mutex required: Yes.
@@ -452,6 +472,9 @@ Reason: a backup snapshot cannot be represented as consistent while runtime writ
 - File/blob operations included in P1-C1: No; unchanged metadata may be carried, but operations belong in P1-C3.
 - Background streaming handled separately: Yes, in P1-C4.
 - ID policy: gaps allowed, duplicates forbidden, never decrement `id_seq`.
-- Recovery/backup modes implemented by P1-C0: No.
+- Pure settings/conversation staged transactions implemented: Yes.
+- Missing conversation GET mutates persisted state: No.
+- Runtime revision persisted in schema v6: No.
+- Recovery/backup modes implemented by P1-C1: No.
 
-Recommended next step: P1-C1 pure state staged transaction design/implementation, beginning with a narrow helper and pure settings/title/pin tests before migrating larger conversation/provider operations.
+Recommended next step: P1-C2 Provider and SecretStore compensation. Mode A/B backup packaging remains blocked through P1-C4.

@@ -775,7 +775,7 @@ fn replace_state_file(replacement: &FilePath, target: &FilePath) -> io::Result<(
     std_fs::rename(replacement, target)
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PersistedMockState {
     schema_version: u32,
@@ -812,7 +812,7 @@ impl ManagedFileMetadata {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopProviderConfig {
     id: String,
@@ -888,7 +888,7 @@ impl DesktopProviderConfig {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopProviderModelConfig {
     id: String,
@@ -973,7 +973,7 @@ fn normalize_output_modalities(modalities: Option<&Vec<String>>) -> Result<Vec<S
     Ok(default_output_modalities())
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopProviderCustomHeaderConfig {
     name: String,
@@ -1431,7 +1431,7 @@ struct ConversationListDto {
     is_generating: bool,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MessageDto {
     id: String,
@@ -1445,7 +1445,7 @@ struct MessageDto {
     translation: Option<String>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MessageNodeDto {
     id: String,
@@ -1453,7 +1453,7 @@ struct MessageNodeDto {
     select_index: usize,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ConversationDto {
     id: String,
@@ -1554,6 +1554,8 @@ struct MockApiState {
     persistence: MockPersistence,
     secret_store: Arc<dyn SecretStore>,
     http_client: reqwest::Client,
+    mutation_transaction_mutex: Mutex<()>,
+    commit_barrier: RwLock<()>,
     settings: RwLock<Value>,
     conversations: RwLock<HashMap<String, ConversationDto>>,
     providers: RwLock<Vec<DesktopProviderConfig>>,
@@ -1564,6 +1566,7 @@ struct MockApiState {
     list_tx: broadcast::Sender<SsePayload>,
     seq: AtomicU64,
     id_seq: AtomicU64,
+    revision: AtomicU64,
 }
 
 impl MockApiState {
@@ -1587,6 +1590,8 @@ impl MockApiState {
             http_client: reqwest::Client::builder()
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
+            mutation_transaction_mutex: Mutex::new(()),
+            commit_barrier: RwLock::new(()),
             settings: RwLock::new(persisted.settings),
             conversations: RwLock::new(persisted.conversations),
             providers: RwLock::new(persisted.providers),
@@ -1597,6 +1602,7 @@ impl MockApiState {
             list_tx,
             seq: AtomicU64::new(1),
             id_seq: AtomicU64::new(initial_id_seq),
+            revision: AtomicU64::new(0),
         }
     }
 
@@ -1858,8 +1864,16 @@ async fn preserve_corrupt_state(persistence: &MockPersistence, bytes: &[u8]) -> 
     }
 }
 
+#[cfg(test)]
 async fn persist_mock_state(state: &Arc<MockApiState>) -> PersistenceResult<()> {
-    let _save_guard = state.persistence.save_lock.lock().await;
+    let _mutation_guard = state.mutation_transaction_mutex.lock().await;
+    persist_live_state_while_mutation_locked(state).await
+}
+
+async fn persisted_snapshot_from_live(state: &MockApiState) -> PersistedMockState {
+    let _commit_guard = state.commit_barrier.read().await;
+
+    // Keep this component order identical to commit_persisted_snapshot_to_live.
     let settings = state.settings.read().await.clone();
     let conversations = state.conversations.read().await.clone();
     let providers = state.providers.read().await.clone();
@@ -1871,7 +1885,7 @@ async fn persist_mock_state(state: &Arc<MockApiState>) -> PersistenceResult<()> 
         .max(max_persisted_file_id(&files))
         .max(1);
 
-    let persisted = PersistedMockState {
+    PersistedMockState {
         schema_version: STATE_SCHEMA_VERSION,
         saved_at: now_millis(),
         id_seq,
@@ -1879,15 +1893,185 @@ async fn persist_mock_state(state: &Arc<MockApiState>) -> PersistenceResult<()> 
         conversations,
         providers,
         files,
-    };
-
-    state.persistence.save_locked(&persisted).await
+    }
 }
 
-async fn persist_state_for_request(state: &Arc<MockApiState>) -> Result<(), Response> {
-    persist_mock_state(state)
+async fn persist_live_state_while_mutation_locked(state: &MockApiState) -> PersistenceResult<()> {
+    let persisted = persisted_snapshot_from_live(state).await;
+    state.persistence.save(&persisted).await
+}
+
+async fn persist_live_state_for_request_while_mutation_locked(
+    state: &MockApiState,
+) -> Result<(), Response> {
+    persist_live_state_while_mutation_locked(state)
         .await
         .map_err(|error| persistence_error_response("request", &error))
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+enum PureStateMutationScope {
+    Settings,
+    Conversations,
+    SettingsAndConversations,
+}
+
+#[derive(Debug)]
+enum StateMutationError {
+    BadRequest(&'static str),
+    NotFound(&'static str),
+    Validation(&'static str),
+    Persistence(PersistenceError),
+}
+
+impl From<PersistenceError> for StateMutationError {
+    fn from(error: PersistenceError) -> Self {
+        Self::Persistence(error)
+    }
+}
+
+async fn transact_persisted_state<T, F>(
+    state: &Arc<MockApiState>,
+    scope: PureStateMutationScope,
+    mutation: F,
+) -> Result<T, StateMutationError>
+where
+    F: FnOnce(&mut PersistedMockState) -> Result<T, StateMutationError>,
+{
+    let _mutation_guard = state.mutation_transaction_mutex.lock().await;
+    let before = persisted_snapshot_from_live(state).await;
+    let mut staged = before.clone();
+    let result = mutation(&mut staged)?;
+
+    staged.saved_at = now_millis();
+    validate_pure_state_transaction(&before, &staged, scope)?;
+    state.persistence.save(&staged).await?;
+    commit_persisted_snapshot_to_live(state, staged).await;
+
+    Ok(result)
+}
+
+fn validate_pure_state_transaction(
+    before: &PersistedMockState,
+    staged: &PersistedMockState,
+    scope: PureStateMutationScope,
+) -> Result<(), StateMutationError> {
+    validate_persisted_state_for_transaction(staged)?;
+
+    if staged.id_seq != before.id_seq {
+        return Err(StateMutationError::Validation(
+            "Pure state mutation changed the ID high-water mark",
+        ));
+    }
+    if staged.providers != before.providers || staged.files != before.files {
+        return Err(StateMutationError::Validation(
+            "Pure state mutation crossed a protected component boundary",
+        ));
+    }
+    if matches!(scope, PureStateMutationScope::Settings)
+        && staged.conversations != before.conversations
+    {
+        return Err(StateMutationError::Validation(
+            "Settings mutation changed conversations",
+        ));
+    }
+    if matches!(scope, PureStateMutationScope::Conversations) && staged.settings != before.settings
+    {
+        return Err(StateMutationError::Validation(
+            "Conversation mutation changed settings",
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_persisted_state_for_transaction(
+    persisted: &PersistedMockState,
+) -> Result<(), StateMutationError> {
+    if persisted.schema_version != STATE_SCHEMA_VERSION {
+        return Err(StateMutationError::Validation(
+            "Staged state schema version is invalid",
+        ));
+    }
+    let Some(settings) = persisted.settings.as_object() else {
+        return Err(StateMutationError::Validation(
+            "Staged settings are invalid",
+        ));
+    };
+    if settings.get("favoriteModels").is_some_and(|value| {
+        !value
+            .as_array()
+            .is_some_and(|items| items.iter().all(Value::is_string))
+    }) || settings
+        .get("chatModelId")
+        .is_some_and(|value| !value.is_string())
+        || settings
+            .get("assistants")
+            .is_some_and(|value| !value.is_array())
+    {
+        return Err(StateMutationError::Validation(
+            "Staged settings references are invalid",
+        ));
+    }
+
+    let mut conversation_ids = HashSet::new();
+    let mut node_ids = HashSet::new();
+    let mut message_ids = HashSet::new();
+    for (key, conversation) in &persisted.conversations {
+        if key != &conversation.id || !conversation_ids.insert(conversation.id.as_str()) {
+            return Err(StateMutationError::Validation(
+                "Staged conversation identifiers are invalid",
+            ));
+        }
+        for node in &conversation.messages {
+            if !node_ids.insert(node.id.as_str()) {
+                return Err(StateMutationError::Validation(
+                    "Staged message node identifiers are duplicated",
+                ));
+            }
+            for message in &node.messages {
+                if !message_ids.insert(message.id.as_str()) {
+                    return Err(StateMutationError::Validation(
+                        "Staged message identifiers are duplicated",
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn commit_persisted_snapshot_to_live(state: &MockApiState, staged: PersistedMockState) {
+    let _commit_guard = state.commit_barrier.write().await;
+
+    // Fixed order for every multi-component commit: settings, conversations,
+    // providers, files, then the ID and revision high-water marks.
+    let mut settings = state.settings.write().await;
+    let mut conversations = state.conversations.write().await;
+    let mut providers = state.providers.write().await;
+    let mut files = state.files.write().await;
+
+    *settings = staged.settings;
+    *conversations = staged.conversations;
+    *providers = staged.providers;
+    *files = staged.files;
+    state.id_seq.fetch_max(staged.id_seq, Ordering::Relaxed);
+    state.revision.fetch_add(1, Ordering::Release);
+}
+
+fn state_mutation_error_response(context: &'static str, error: StateMutationError) -> Response {
+    match error {
+        StateMutationError::BadRequest(message) => bad_request_response(message),
+        StateMutationError::NotFound(message) => not_found_response(message),
+        StateMutationError::Validation(reason) => {
+            debug_assert!(!reason.is_empty());
+            eprintln!("RikkaDesk state transaction validation failed in {context}");
+            internal_error_response("Local state validation failed")
+        }
+        StateMutationError::Persistence(error) => persistence_error_response(context, &error),
+    }
 }
 
 fn persistence_error_response(context: &'static str, error: &PersistenceError) -> Response {
@@ -2013,20 +2197,20 @@ async fn confirm_desktop_provider_import(
     }
 
     if !imported_configs.is_empty() {
+        let mutation_guard = state.mutation_transaction_mutex.lock().await;
         {
+            let _commit_guard = state.commit_barrier.write().await;
+            let mut settings = state.settings.write().await;
             let mut providers = state.providers.write().await;
             providers.extend(imported_configs);
-        }
-
-        {
-            let providers = state.providers.read().await;
-            let mut settings = state.settings.write().await;
             sync_settings_with_desktop_providers(&mut settings, &providers);
         }
 
-        if let Err(response) = persist_state_for_request(&state).await {
+        if let Err(response) = persist_live_state_for_request_while_mutation_locked(&state).await {
             return response;
         }
+        state.revision.fetch_add(1, Ordering::Release);
+        drop(mutation_guard);
         broadcast_settings_update(&state).await;
     }
 
@@ -2059,18 +2243,16 @@ async fn upsert_desktop_provider(
                 }
             }
 
+            let mutation_guard = state.mutation_transaction_mutex.lock().await;
             {
+                let _commit_guard = state.commit_barrier.write().await;
+                let mut settings = state.settings.write().await;
                 let mut providers = state.providers.write().await;
                 if let Some(existing) = providers.iter_mut().find(|item| item.id == provider.id) {
                     *existing = provider.clone();
                 } else {
                     providers.push(provider.clone());
                 }
-            }
-
-            {
-                let providers = state.providers.read().await;
-                let mut settings = state.settings.write().await;
                 sync_settings_with_desktop_providers(&mut settings, &providers);
                 if !removed_model_ids.is_empty() {
                     remove_models_from_favorites(
@@ -2086,9 +2268,13 @@ async fn upsert_desktop_provider(
                 ensure_current_model_exists(&mut settings);
             }
 
-            if let Err(response) = persist_state_for_request(&state).await {
+            if let Err(response) =
+                persist_live_state_for_request_while_mutation_locked(&state).await
+            {
                 return response;
             }
+            state.revision.fetch_add(1, Ordering::Release);
+            drop(mutation_guard);
             broadcast_settings_update(&state).await;
 
             let has_secret = match state.secret_store.has_secret(&provider.secret_ref) {
@@ -2178,22 +2364,22 @@ async fn delete_desktop_provider(
         return internal_error_response("Secret store is unavailable");
     }
 
+    let mutation_guard = state.mutation_transaction_mutex.lock().await;
     {
+        let _commit_guard = state.commit_barrier.write().await;
+        let mut settings = state.settings.write().await;
         let mut providers = state.providers.write().await;
         providers.retain(|item| item.id != provider.id);
-    }
-
-    {
-        let providers = state.providers.read().await;
-        let mut settings = state.settings.write().await;
         sync_settings_with_desktop_providers(&mut settings, &providers);
         remove_models_from_favorites(&mut settings, provider.model_ids_for_settings());
         ensure_current_model_exists(&mut settings);
     }
 
-    if let Err(response) = persist_state_for_request(&state).await {
+    if let Err(response) = persist_live_state_for_request_while_mutation_locked(&state).await {
         return response;
     }
+    state.revision.fetch_add(1, Ordering::Release);
+    drop(mutation_guard);
     broadcast_settings_update(&state).await;
     broadcast_list_invalidate(&state).await;
 
@@ -2327,7 +2513,7 @@ async fn conversation_detail(
     State(state): State<Arc<MockApiState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let conversation = get_or_create_conversation(&state, &id).await;
+    let conversation = conversation_or_virtual_for_read(&state, &id).await;
     Json(conversation)
 }
 
@@ -2335,7 +2521,7 @@ async fn conversation_stream(
     State(state): State<Arc<MockApiState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let conversation = get_or_create_conversation(&state, &id).await;
+    let conversation = conversation_or_virtual_for_read(&state, &id).await;
     let initial = conversation_snapshot_payload(&state, &conversation);
     let tx = conversation_sender(&state, &id).await;
     let mut rx = tx.subscribe();
@@ -2368,7 +2554,9 @@ async fn send_message(
     let request_parts = payload.parts.clone();
     let capture_intent = is_capture_local_image_intent(&payload);
 
+    let mutation_guard = state.mutation_transaction_mutex.lock().await;
     let updated_after_user_message = {
+        let _commit_guard = state.commit_barrier.write().await;
         let mut conversations = state.conversations.write().await;
         let conversation = conversations
             .entry(id.clone())
@@ -2403,9 +2591,11 @@ async fn send_message(
         conversation.clone()
     };
 
-    if let Err(response) = persist_state_for_request(&state).await {
+    if let Err(response) = persist_live_state_for_request_while_mutation_locked(&state).await {
         return response;
     }
+    state.revision.fetch_add(1, Ordering::Release);
+    drop(mutation_guard);
     broadcast_conversation_snapshot(&state, &updated_after_user_message).await;
     broadcast_list_invalidate(&state).await;
 
@@ -2598,7 +2788,9 @@ async fn stop_conversation(
 ) -> impl IntoResponse {
     stop_generation(&state, &id).await;
 
+    let mutation_guard = state.mutation_transaction_mutex.lock().await;
     let maybe_updated = {
+        let _commit_guard = state.commit_barrier.write().await;
         let mut conversations = state.conversations.write().await;
         conversations.get_mut(&id).map(|conversation| {
             conversation.is_generating = false;
@@ -2608,11 +2800,15 @@ async fn stop_conversation(
     };
 
     if let Some(conversation) = maybe_updated {
-        if let Err(response) = persist_state_for_request(&state).await {
+        if let Err(response) = persist_live_state_for_request_while_mutation_locked(&state).await {
             return response;
         }
+        state.revision.fetch_add(1, Ordering::Release);
+        drop(mutation_guard);
         broadcast_conversation_snapshot(&state, &conversation).await;
         broadcast_list_invalidate(&state).await;
+    } else {
+        drop(mutation_guard);
     }
 
     Json(json!({ "status": "stopped" })).into_response()
@@ -2628,20 +2824,25 @@ async fn update_conversation_title(
         return bad_request_response("Title cannot be empty");
     }
 
-    let updated = {
-        let mut conversations = state.conversations.write().await;
-        let Some(conversation) = conversations.get_mut(&id) else {
-            return not_found_response("Conversation not found");
-        };
+    let title = title.chars().take(120).collect::<String>();
+    let updated = match transact_persisted_state(
+        &state,
+        PureStateMutationScope::Conversations,
+        move |staged| {
+            let Some(conversation) = staged.conversations.get_mut(&id) else {
+                return Err(StateMutationError::NotFound("Conversation not found"));
+            };
 
-        conversation.title = title.chars().take(120).collect();
-        conversation.update_at = now_millis();
-        conversation.clone()
+            conversation.title = title;
+            conversation.update_at = now_millis();
+            Ok(conversation.clone())
+        },
+    )
+    .await
+    {
+        Ok(updated) => updated,
+        Err(error) => return state_mutation_error_response("update conversation title", error),
     };
-
-    if let Err(response) = persist_state_for_request(&state).await {
-        return response;
-    }
     broadcast_conversation_snapshot(&state, &updated).await;
     broadcast_list_invalidate(&state).await;
 
@@ -2652,19 +2853,23 @@ async fn toggle_conversation_pin(
     State(state): State<Arc<MockApiState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let updated = {
-        let mut conversations = state.conversations.write().await;
-        let Some(conversation) = conversations.get_mut(&id) else {
-            return not_found_response("Conversation not found");
-        };
+    let updated = match transact_persisted_state(
+        &state,
+        PureStateMutationScope::Conversations,
+        move |staged| {
+            let Some(conversation) = staged.conversations.get_mut(&id) else {
+                return Err(StateMutationError::NotFound("Conversation not found"));
+            };
 
-        conversation.is_pinned = !conversation.is_pinned;
-        conversation.clone()
+            conversation.is_pinned = !conversation.is_pinned;
+            Ok(conversation.clone())
+        },
+    )
+    .await
+    {
+        Ok(updated) => updated,
+        Err(error) => return state_mutation_error_response("toggle conversation pin", error),
     };
-
-    if let Err(response) = persist_state_for_request(&state).await {
-        return response;
-    }
     broadcast_conversation_snapshot(&state, &updated).await;
     broadcast_list_invalidate(&state).await;
 
@@ -2675,21 +2880,23 @@ async fn delete_conversation(
     State(state): State<Arc<MockApiState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let removed = {
-        let mut conversations = state.conversations.write().await;
-        conversations.remove(&id)
-    };
-
-    if removed.is_none() {
-        return not_found_response("Conversation not found");
+    if let Err(error) = transact_persisted_state(&state, PureStateMutationScope::Conversations, {
+        let id = id.clone();
+        move |staged| {
+            staged
+                .conversations
+                .remove(&id)
+                .ok_or(StateMutationError::NotFound("Conversation not found"))?;
+            Ok(())
+        }
+    })
+    .await
+    {
+        return state_mutation_error_response("delete conversation", error);
     }
 
     stop_generation(&state, &id).await;
     state.conversation_txs.write().await.remove(&id);
-
-    if let Err(response) = persist_state_for_request(&state).await {
-        return response;
-    }
     broadcast_list_invalidate(&state).await;
 
     Json(json!({ "status": "deleted" })).into_response()
@@ -2704,30 +2911,36 @@ async fn edit_message(
         return bad_request_response("Phase 6A currently supports text-only message editing.");
     };
 
-    let updated = {
-        let mut conversations = state.conversations.write().await;
-        let Some(conversation) = conversations.get_mut(&id) else {
-            return not_found_response("Conversation not found");
-        };
-        let Some(message) = find_message_mut(conversation, &message_id) else {
-            return not_found_response("Message not found");
-        };
+    let updated = match transact_persisted_state(
+        &state,
+        PureStateMutationScope::Conversations,
+        move |staged| {
+            let Some(conversation) = staged.conversations.get_mut(&id) else {
+                return Err(StateMutationError::NotFound("Conversation not found"));
+            };
+            let Some(message) = find_message_mut(conversation, &message_id) else {
+                return Err(StateMutationError::NotFound("Message not found"));
+            };
 
-        if message.role != "USER" && message.role != "ASSISTANT" {
-            return bad_request_response("Only user and assistant text messages can be edited.");
-        }
+            if message.role != "USER" && message.role != "ASSISTANT" {
+                return Err(StateMutationError::BadRequest(
+                    "Only user and assistant text messages can be edited.",
+                ));
+            }
 
-        message.parts = vec![json!({
-            "type": "text",
-            "text": text,
-        })];
-        conversation.update_at = now_millis();
-        conversation.clone()
+            message.parts = vec![json!({
+                "type": "text",
+                "text": text,
+            })];
+            conversation.update_at = now_millis();
+            Ok(conversation.clone())
+        },
+    )
+    .await
+    {
+        Ok(updated) => updated,
+        Err(error) => return state_mutation_error_response("edit message", error),
     };
-
-    if let Err(response) = persist_state_for_request(&state).await {
-        return response;
-    }
     broadcast_conversation_snapshot(&state, &updated).await;
     broadcast_list_invalidate(&state).await;
 
@@ -2738,38 +2951,42 @@ async fn delete_message(
     State(state): State<Arc<MockApiState>>,
     Path((id, message_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let updated = {
-        let mut conversations = state.conversations.write().await;
-        let Some(conversation) = conversations.get_mut(&id) else {
-            return not_found_response("Conversation not found");
-        };
+    let updated = match transact_persisted_state(
+        &state,
+        PureStateMutationScope::Conversations,
+        move |staged| {
+            let Some(conversation) = staged.conversations.get_mut(&id) else {
+                return Err(StateMutationError::NotFound("Conversation not found"));
+            };
 
-        let mut removed = false;
-        for node in &mut conversation.messages {
-            let before = node.messages.len();
-            node.messages.retain(|message| message.id != message_id);
-            if node.messages.len() != before {
-                removed = true;
-                if !node.messages.is_empty() && node.select_index >= node.messages.len() {
-                    node.select_index = node.messages.len() - 1;
+            let mut removed = false;
+            for node in &mut conversation.messages {
+                let before = node.messages.len();
+                node.messages.retain(|message| message.id != message_id);
+                if node.messages.len() != before {
+                    removed = true;
+                    if !node.messages.is_empty() && node.select_index >= node.messages.len() {
+                        node.select_index = node.messages.len() - 1;
+                    }
                 }
             }
-        }
 
-        if !removed {
-            return not_found_response("Message not found");
-        }
+            if !removed {
+                return Err(StateMutationError::NotFound("Message not found"));
+            }
 
-        conversation
-            .messages
-            .retain(|node| !node.messages.is_empty());
-        conversation.update_at = now_millis();
-        conversation.clone()
+            conversation
+                .messages
+                .retain(|node| !node.messages.is_empty());
+            conversation.update_at = now_millis();
+            Ok(conversation.clone())
+        },
+    )
+    .await
+    {
+        Ok(updated) => updated,
+        Err(error) => return state_mutation_error_response("delete message", error),
     };
-
-    if let Err(response) = persist_state_for_request(&state).await {
-        return response;
-    }
     broadcast_conversation_snapshot(&state, &updated).await;
     broadcast_list_invalidate(&state).await;
 
@@ -2785,7 +3002,9 @@ async fn regenerate_message(
     let assistant_id = current_assistant_id(&state).await;
     let model_id = current_model_id(&state, &assistant_id).await;
 
+    let mutation_guard = state.mutation_transaction_mutex.lock().await;
     let (prepared, last_user_has_non_text_parts) = {
+        let _commit_guard = state.commit_barrier.write().await;
         let mut conversations = state.conversations.write().await;
         let Some(conversation) = conversations.get_mut(&id) else {
             return not_found_response("Conversation not found");
@@ -2841,9 +3060,11 @@ async fn regenerate_message(
         (conversation.clone(), last_user_has_non_text_parts)
     };
 
-    if let Err(response) = persist_state_for_request(&state).await {
+    if let Err(response) = persist_live_state_for_request_while_mutation_locked(&state).await {
         return response;
     }
+    state.revision.fetch_add(1, Ordering::Release);
+    drop(mutation_guard);
     broadcast_conversation_snapshot(&state, &prepared).await;
     broadcast_list_invalidate(&state).await;
 
@@ -2935,13 +3156,14 @@ async fn update_assistant(
     State(state): State<Arc<MockApiState>>,
     Json(payload): Json<UpdateAssistantRequest>,
 ) -> impl IntoResponse {
+    if let Err(error) =
+        transact_persisted_state(&state, PureStateMutationScope::Settings, move |staged| {
+            staged.settings["assistantId"] = json!(payload.assistant_id);
+            Ok(())
+        })
+        .await
     {
-        let mut settings = state.settings.write().await;
-        settings["assistantId"] = json!(payload.assistant_id);
-    }
-
-    if let Err(response) = persist_state_for_request(&state).await {
-        return response;
+        return state_mutation_error_response("update assistant", error);
     }
     broadcast_settings_update(&state).await;
     broadcast_list_invalidate(&state).await;
@@ -2953,26 +3175,28 @@ async fn update_assistant_model(
     State(state): State<Arc<MockApiState>>,
     Json(payload): Json<UpdateAssistantModelRequest>,
 ) -> impl IntoResponse {
-    {
-        let mut settings = state.settings.write().await;
-        settings["chatModelId"] = json!(payload.model_id.clone());
+    if let Err(error) =
+        transact_persisted_state(&state, PureStateMutationScope::Settings, move |staged| {
+            let settings = &mut staged.settings;
+            settings["chatModelId"] = json!(payload.model_id.clone());
 
-        if let Some(assistants) = settings.get_mut("assistants").and_then(Value::as_array_mut) {
-            for assistant in assistants {
-                let is_target = assistant
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|id| id == payload.assistant_id);
-                if is_target {
-                    assistant["chatModelId"] = json!(payload.model_id);
-                    break;
+            if let Some(assistants) = settings.get_mut("assistants").and_then(Value::as_array_mut) {
+                for assistant in assistants {
+                    let is_target = assistant
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| id == payload.assistant_id);
+                    if is_target {
+                        assistant["chatModelId"] = json!(payload.model_id);
+                        break;
+                    }
                 }
             }
-        }
-    }
-
-    if let Err(response) = persist_state_for_request(&state).await {
-        return response;
+            Ok(())
+        })
+        .await
+    {
+        return state_mutation_error_response("update assistant model", error);
     }
     broadcast_settings_update(&state).await;
 
@@ -2992,13 +3216,14 @@ async fn update_favorite_models(
         .filter(|model_id| seen.insert(model_id.clone()))
         .collect();
 
+    if let Err(error) =
+        transact_persisted_state(&state, PureStateMutationScope::Settings, move |staged| {
+            staged.settings["favoriteModels"] = json!(model_ids);
+            Ok(())
+        })
+        .await
     {
-        let mut settings = state.settings.write().await;
-        settings["favoriteModels"] = json!(model_ids);
-    }
-
-    if let Err(response) = persist_state_for_request(&state).await {
-        return response;
+        return state_mutation_error_response("update favorite models", error);
     }
     broadcast_settings_update(&state).await;
 
@@ -3098,7 +3323,9 @@ async fn upload_files(
         return internal_error_response("File upload failed");
     }
 
+    let mutation_guard = state.mutation_transaction_mutex.lock().await;
     let uploaded = {
+        let _commit_guard = state.commit_barrier.write().await;
         let mut files = state.files.write().await;
         let uploaded = prepared
             .iter()
@@ -3108,9 +3335,11 @@ async fn upload_files(
         uploaded
     };
 
-    if let Err(response) = persist_state_for_request(&state).await {
+    if let Err(response) = persist_live_state_for_request_while_mutation_locked(&state).await {
         return response;
     }
+    state.revision.fetch_add(1, Ordering::Release);
+    drop(mutation_guard);
 
     Json(UploadFilesResponse { files: uploaded }).into_response()
 }
@@ -3206,7 +3435,9 @@ async fn delete_file(
         }
     }
 
+    let mutation_guard = state.mutation_transaction_mutex.lock().await;
     {
+        let _commit_guard = state.commit_barrier.write().await;
         let now = now_iso();
         let mut files = state.files.write().await;
         if let Some(file) = files.iter_mut().find(|file| file.id == id) {
@@ -3215,9 +3446,11 @@ async fn delete_file(
         }
     }
 
-    if let Err(response) = persist_state_for_request(&state).await {
+    if let Err(response) = persist_live_state_for_request_while_mutation_locked(&state).await {
         return response;
     }
+    state.revision.fetch_add(1, Ordering::Release);
+    drop(mutation_guard);
 
     Json(json!({ "status": "deleted" })).into_response()
 }
@@ -3838,7 +4071,9 @@ async fn append_assistant_reply(
     reply_text: String,
     now: u64,
 ) -> PersistenceResult<()> {
+    let mutation_guard = state.mutation_transaction_mutex.lock().await;
     let updated = {
+        let _commit_guard = state.commit_barrier.write().await;
         let mut conversations = state.conversations.write().await;
         let conversation = conversations
             .entry(conversation_id.to_string())
@@ -3871,7 +4106,9 @@ async fn append_assistant_reply(
         conversation.clone()
     };
 
-    persist_mock_state(state).await?;
+    persist_live_state_while_mutation_locked(state).await?;
+    state.revision.fetch_add(1, Ordering::Release);
+    drop(mutation_guard);
     broadcast_conversation_snapshot(state, &updated).await;
     broadcast_list_invalidate(state).await;
     Ok(())
@@ -3885,7 +4122,9 @@ async fn append_empty_streaming_assistant_reply(
     now: u64,
 ) -> PersistenceResult<String> {
     let message_id = state.next_id("msg");
+    let mutation_guard = state.mutation_transaction_mutex.lock().await;
     let updated = {
+        let _commit_guard = state.commit_barrier.write().await;
         let mut conversations = state.conversations.write().await;
         let conversation = conversations
             .entry(conversation_id.to_string())
@@ -3918,7 +4157,9 @@ async fn append_empty_streaming_assistant_reply(
         conversation.clone()
     };
 
-    persist_mock_state(state).await?;
+    persist_live_state_while_mutation_locked(state).await?;
+    state.revision.fetch_add(1, Ordering::Release);
+    drop(mutation_guard);
     broadcast_conversation_snapshot(state, &updated).await;
     broadcast_list_invalidate(state).await;
     Ok(message_id)
@@ -3934,7 +4175,9 @@ async fn append_text_to_assistant_message(
         return;
     }
 
+    let mutation_guard = state.mutation_transaction_mutex.lock().await;
     let updated = {
+        let _commit_guard = state.commit_barrier.write().await;
         let mut conversations = state.conversations.write().await;
         let Some(conversation) = conversations.get_mut(conversation_id) else {
             return;
@@ -3948,6 +4191,7 @@ async fn append_text_to_assistant_message(
         conversation.clone()
     };
 
+    drop(mutation_guard);
     broadcast_conversation_snapshot(state, &updated).await;
 }
 
@@ -3958,7 +4202,9 @@ async fn finish_streaming_assistant_reply(
 ) -> PersistenceResult<()> {
     stop_generation(state, conversation_id).await;
 
+    let mutation_guard = state.mutation_transaction_mutex.lock().await;
     let updated = {
+        let _commit_guard = state.commit_barrier.write().await;
         let mut conversations = state.conversations.write().await;
         let Some(conversation) = conversations.get_mut(conversation_id) else {
             return Ok(());
@@ -3974,7 +4220,9 @@ async fn finish_streaming_assistant_reply(
         conversation.clone()
     };
 
-    persist_mock_state(state).await?;
+    persist_live_state_while_mutation_locked(state).await?;
+    state.revision.fetch_add(1, Ordering::Release);
+    drop(mutation_guard);
     broadcast_conversation_snapshot(state, &updated).await;
     broadcast_list_invalidate(state).await;
     Ok(())
@@ -5225,18 +5473,19 @@ fn internal_error_response(message: impl Into<String>) -> Response {
         .into_response()
 }
 
-async fn get_or_create_conversation(state: &Arc<MockApiState>, id: &str) -> ConversationDto {
-    if let Some(conversation) = state.conversations.read().await.get(id).cloned() {
-        return conversation;
-    }
+async fn conversation_or_virtual_for_read(state: &Arc<MockApiState>, id: &str) -> ConversationDto {
+    let _commit_guard = state.commit_barrier.read().await;
+    let assistant_id = state
+        .settings
+        .read()
+        .await
+        .get("assistantId")
+        .and_then(Value::as_str)
+        .unwrap_or(MOCK_ASSISTANT_ID)
+        .to_string();
+    let conversation = state.conversations.read().await.get(id).cloned();
 
-    let assistant_id = current_assistant_id(state).await;
-    let now = now_millis();
-    let mut conversations = state.conversations.write().await;
-    conversations
-        .entry(id.to_string())
-        .or_insert_with(|| empty_conversation(id.to_string(), assistant_id, now))
-        .clone()
+    conversation.unwrap_or_else(|| empty_conversation(id.to_string(), assistant_id, now_millis()))
 }
 
 async fn conversation_sender(state: &Arc<MockApiState>, id: &str) -> broadcast::Sender<SsePayload> {
@@ -6386,6 +6635,40 @@ mod tests {
         std_fs::write(&persistence.state_path, bytes).expect("synthetic state should be written");
     }
 
+    async fn transaction_test_state(
+        temp: &SyntheticTempDir,
+        persisted: PersistedMockState,
+        failure_stage: Option<TestFailureStage>,
+    ) -> Arc<MockApiState> {
+        test_persistence(temp)
+            .save(&persisted)
+            .await
+            .expect("synthetic initial state should save");
+        let persistence = failure_stage.map_or_else(
+            || test_persistence(temp),
+            |stage| faulting_test_persistence(temp, stage),
+        );
+        Arc::new(MockApiState::new(
+            persistence,
+            Arc::new(TestSecretStore),
+            persisted,
+        ))
+    }
+
+    async fn live_conversation(state: &MockApiState, id: &str) -> ConversationDto {
+        state
+            .conversations
+            .read()
+            .await
+            .get(id)
+            .cloned()
+            .expect("synthetic conversation should exist")
+    }
+
+    fn disk_conversation(temp: &SyntheticTempDir, id: &str) -> Value {
+        read_test_state(&test_persistence(temp))["conversations"][id].clone()
+    }
+
     fn is_test_backup_path(path: &FilePath) -> bool {
         path.file_name()
             .and_then(|name| name.to_str())
@@ -7021,6 +7304,730 @@ mod tests {
         assert!(!body.contains("synthetic-assistant"));
         assert!(!body.contains("state.v1.json"));
         assert!(!body.contains(temp.path.to_string_lossy().as_ref()));
+    }
+
+    #[tokio::test]
+    async fn staged_transaction_success_updates_disk_live_and_revision() {
+        let temp = SyntheticTempDir::new("staged-success");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let initial_id_seq = state.id_seq.load(Ordering::Relaxed);
+
+        transact_persisted_state(&state, PureStateMutationScope::Settings, |staged| {
+            staged.settings["syntheticTransaction"] = json!("committed");
+            Ok(())
+        })
+        .await
+        .expect("staged transaction should commit");
+
+        assert_eq!(
+            state.settings.read().await["syntheticTransaction"],
+            json!("committed")
+        );
+        assert_eq!(
+            read_test_state(&test_persistence(&temp))["settings"]["syntheticTransaction"],
+            json!("committed")
+        );
+        assert_eq!(state.revision.load(Ordering::Acquire), 1);
+        assert_eq!(state.id_seq.load(Ordering::Relaxed), initial_id_seq);
+    }
+
+    #[tokio::test]
+    async fn transaction_failure_preserves_live_disk_and_revision() {
+        let temp = SyntheticTempDir::new("staged-failure");
+        let initial = default_persisted_state();
+        let state = transaction_test_state(&temp, initial, Some(TestFailureStage::Replace)).await;
+
+        let result = transact_persisted_state(&state, PureStateMutationScope::Settings, |staged| {
+            staged.settings["syntheticTransaction"] = json!("must-not-commit");
+            Ok(())
+        })
+        .await;
+
+        assert!(matches!(result, Err(StateMutationError::Persistence(_))));
+        assert!(state.settings.read().await["syntheticTransaction"].is_null());
+        assert!(
+            read_test_state(&test_persistence(&temp))["settings"]["syntheticTransaction"].is_null()
+        );
+        assert_eq!(state.revision.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn staged_transaction_validation_failure_does_not_write_or_commit() {
+        let temp = SyntheticTempDir::new("staged-validation");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let before = std_fs::read(&state.persistence.state_path)
+            .expect("synthetic state bytes should be readable");
+
+        let result = transact_persisted_state(&state, PureStateMutationScope::Settings, |staged| {
+            staged.id_seq += 1;
+            Ok(())
+        })
+        .await;
+
+        assert!(matches!(result, Err(StateMutationError::Validation(_))));
+        assert_eq!(
+            std_fs::read(&state.persistence.state_path)
+                .expect("synthetic state bytes should remain readable"),
+            before
+        );
+        assert_eq!(state.revision.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn transaction_failure_staged_state_is_hidden_and_component_locks_are_free() {
+        let temp = SyntheticTempDir::new("staged-hidden");
+        let state = transaction_test_state(
+            &temp,
+            default_persisted_state(),
+            Some(TestFailureStage::Replace),
+        )
+        .await;
+        let save_guard = state.persistence.save_lock.lock().await;
+        let task_state = state.clone();
+        let task = tokio::spawn(async move {
+            transact_persisted_state(&task_state, PureStateMutationScope::Settings, |staged| {
+                staged.settings["syntheticTransaction"] = json!("hidden");
+                Ok(())
+            })
+            .await
+        });
+
+        for _ in 0..100 {
+            if state.mutation_transaction_mutex.try_lock().is_err() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let visible = tokio::time::timeout(Duration::from_secs(1), async {
+            let _barrier = state.commit_barrier.read().await;
+            state.settings.read().await["syntheticTransaction"].clone()
+        })
+        .await
+        .expect("component reads must remain available during staged disk wait");
+        assert!(visible.is_null());
+
+        drop(save_guard);
+        let result = task.await.expect("transaction task should finish");
+        assert!(matches!(result, Err(StateMutationError::Persistence(_))));
+        assert!(state.settings.read().await["syntheticTransaction"].is_null());
+    }
+
+    #[tokio::test]
+    async fn staged_transaction_commit_visibility_is_atomic_across_components() {
+        let temp = SyntheticTempDir::new("staged-visibility");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let save_guard = state.persistence.save_lock.lock().await;
+        let task_state = state.clone();
+        let task = tokio::spawn(async move {
+            transact_persisted_state(
+                &task_state,
+                PureStateMutationScope::SettingsAndConversations,
+                |staged| {
+                    staged.settings["syntheticPair"] = json!("new");
+                    staged
+                        .conversations
+                        .get_mut(MOCK_WELCOME_CONVERSATION_ID)
+                        .expect("welcome conversation should exist")
+                        .title = "new".to_string();
+                    Ok(())
+                },
+            )
+            .await
+        });
+
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let barrier_guard = state.commit_barrier.read().await;
+        drop(save_guard);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(bytes) = std_fs::read(&state.persistence.state_path) {
+                    if serde_json::from_slice::<Value>(&bytes)
+                        .is_ok_and(|value| value["settings"]["syntheticPair"] == json!("new"))
+                    {
+                        break;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("staged snapshot should persist before live commit");
+
+        let old_settings = state.settings.read().await["syntheticPair"].clone();
+        let old_title = live_conversation(&state, MOCK_WELCOME_CONVERSATION_ID)
+            .await
+            .title;
+        assert!(old_settings.is_null());
+        assert_eq!(old_title, "RikkaDesk Mock Welcome");
+
+        drop(barrier_guard);
+        task.await
+            .expect("transaction task should finish")
+            .expect("transaction should commit");
+
+        let _barrier = state.commit_barrier.read().await;
+        assert_eq!(state.settings.read().await["syntheticPair"], json!("new"));
+        assert_eq!(
+            live_conversation(&state, MOCK_WELCOME_CONVERSATION_ID)
+                .await
+                .title,
+            "new"
+        );
+    }
+
+    #[tokio::test]
+    async fn mutation_transaction_concurrent_updates_are_serialized() {
+        let temp = SyntheticTempDir::new("staged-concurrent");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let start = Arc::new(tokio::sync::Barrier::new(4));
+        let mut tasks = Vec::new();
+
+        for marker in ["one", "two", "three"] {
+            let task_state = state.clone();
+            let task_start = start.clone();
+            tasks.push(tokio::spawn(async move {
+                task_start.wait().await;
+                transact_persisted_state(
+                    &task_state,
+                    PureStateMutationScope::Settings,
+                    move |staged| {
+                        staged.settings[format!("synthetic-{marker}")] = json!(true);
+                        Ok(())
+                    },
+                )
+                .await
+            }));
+        }
+
+        start.wait().await;
+        for task in tasks {
+            task.await
+                .expect("concurrent transaction should finish")
+                .expect("concurrent transaction should commit");
+        }
+
+        let settings = state.settings.read().await;
+        assert_eq!(settings["synthetic-one"], json!(true));
+        assert_eq!(settings["synthetic-two"], json!(true));
+        assert_eq!(settings["synthetic-three"], json!(true));
+        assert_eq!(state.revision.load(Ordering::Acquire), 3);
+        let disk = read_test_state(&test_persistence(&temp));
+        assert_eq!(disk["settings"]["synthetic-one"], json!(true));
+        assert_eq!(disk["settings"]["synthetic-two"], json!(true));
+        assert_eq!(disk["settings"]["synthetic-three"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn mutation_transaction_older_commit_cannot_overwrite_newer_commit() {
+        let temp = SyntheticTempDir::new("staged-order");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let queue_guard = state.mutation_transaction_mutex.lock().await;
+
+        let first_state = state.clone();
+        let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel();
+        let first = tokio::spawn(async move {
+            let _ = first_started_tx.send(());
+            transact_persisted_state(&first_state, PureStateMutationScope::Settings, |staged| {
+                staged.settings["syntheticOrder"] = json!(1);
+                Ok(())
+            })
+            .await
+        });
+        first_started_rx
+            .await
+            .expect("first transaction should queue");
+        tokio::task::yield_now().await;
+
+        let second_state = state.clone();
+        let (second_started_tx, second_started_rx) = tokio::sync::oneshot::channel();
+        let second = tokio::spawn(async move {
+            let _ = second_started_tx.send(());
+            transact_persisted_state(&second_state, PureStateMutationScope::Settings, |staged| {
+                staged.settings["syntheticOrder"] = json!(2);
+                Ok(())
+            })
+            .await
+        });
+        second_started_rx
+            .await
+            .expect("second transaction should queue");
+        tokio::task::yield_now().await;
+        drop(queue_guard);
+
+        first
+            .await
+            .expect("first transaction should finish")
+            .expect("first transaction should commit");
+        second
+            .await
+            .expect("second transaction should finish")
+            .expect("second transaction should commit");
+
+        assert_eq!(state.settings.read().await["syntheticOrder"], json!(2));
+        assert_eq!(
+            read_test_state(&test_persistence(&temp))["settings"]["syntheticOrder"],
+            json!(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn transaction_failure_title_endpoint_preserves_live_and_disk() {
+        let temp = SyntheticTempDir::new("title-failure");
+        let state = transaction_test_state(
+            &temp,
+            default_persisted_state(),
+            Some(TestFailureStage::Replace),
+        )
+        .await;
+
+        let response = update_conversation_title(
+            State(state.clone()),
+            Path(MOCK_WELCOME_CONVERSATION_ID.to_string()),
+            Json(UpdateConversationTitleRequest {
+                title: "must not commit".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            live_conversation(&state, MOCK_WELCOME_CONVERSATION_ID)
+                .await
+                .title,
+            "RikkaDesk Mock Welcome"
+        );
+        assert_eq!(
+            disk_conversation(&temp, MOCK_WELCOME_CONVERSATION_ID)["title"],
+            json!("RikkaDesk Mock Welcome")
+        );
+    }
+
+    #[tokio::test]
+    async fn transaction_failure_pin_endpoint_preserves_live_and_disk() {
+        let temp = SyntheticTempDir::new("pin-failure");
+        let state = transaction_test_state(
+            &temp,
+            default_persisted_state(),
+            Some(TestFailureStage::Replace),
+        )
+        .await;
+
+        let response = toggle_conversation_pin(
+            State(state.clone()),
+            Path(MOCK_WELCOME_CONVERSATION_ID.to_string()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            !live_conversation(&state, MOCK_WELCOME_CONVERSATION_ID)
+                .await
+                .is_pinned
+        );
+        assert_eq!(
+            disk_conversation(&temp, MOCK_WELCOME_CONVERSATION_ID)["isPinned"],
+            json!(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn transaction_failure_conversation_delete_preserves_live_and_disk() {
+        let temp = SyntheticTempDir::new("conversation-delete-failure");
+        let state = transaction_test_state(
+            &temp,
+            default_persisted_state(),
+            Some(TestFailureStage::Replace),
+        )
+        .await;
+
+        let response = delete_conversation(
+            State(state.clone()),
+            Path(MOCK_WELCOME_CONVERSATION_ID.to_string()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(state
+            .conversations
+            .read()
+            .await
+            .contains_key(MOCK_WELCOME_CONVERSATION_ID));
+        assert!(!disk_conversation(&temp, MOCK_WELCOME_CONVERSATION_ID).is_null());
+    }
+
+    #[tokio::test]
+    async fn transaction_failure_settings_endpoint_preserves_live_and_disk() {
+        let temp = SyntheticTempDir::new("settings-failure");
+        let state = transaction_test_state(
+            &temp,
+            default_persisted_state(),
+            Some(TestFailureStage::Replace),
+        )
+        .await;
+        let original = state.settings.read().await["favoriteModels"].clone();
+
+        let response = update_favorite_models(
+            State(state.clone()),
+            Json(UpdateFavoriteModelsRequest {
+                model_ids: vec!["synthetic-model".to_string()],
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(state.settings.read().await["favoriteModels"], original);
+        assert_eq!(
+            read_test_state(&test_persistence(&temp))["settings"]["favoriteModels"],
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn transaction_failure_message_edit_endpoint_preserves_live_and_disk() {
+        let temp = SyntheticTempDir::new("message-edit-failure");
+        let state = transaction_test_state(
+            &temp,
+            default_persisted_state(),
+            Some(TestFailureStage::Replace),
+        )
+        .await;
+        let original = live_conversation(&state, MOCK_WELCOME_CONVERSATION_ID).await;
+
+        let response = edit_message(
+            State(state.clone()),
+            Path((
+                MOCK_WELCOME_CONVERSATION_ID.to_string(),
+                "welcome-message-1".to_string(),
+            )),
+            Json(EditMessageRequest {
+                parts: vec![json!({ "type": "text", "text": "must not commit" })],
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(live_conversation(&state, MOCK_WELCOME_CONVERSATION_ID).await == original);
+        assert_eq!(
+            disk_conversation(&temp, MOCK_WELCOME_CONVERSATION_ID)["messages"][0]["messages"][0]
+                ["parts"],
+            json!(original.messages[0].messages[0].parts)
+        );
+    }
+
+    #[tokio::test]
+    async fn transaction_failure_message_delete_endpoint_preserves_live_and_disk() {
+        let temp = SyntheticTempDir::new("message-delete-failure");
+        let state = transaction_test_state(
+            &temp,
+            default_persisted_state(),
+            Some(TestFailureStage::Replace),
+        )
+        .await;
+
+        let response = delete_message(
+            State(state.clone()),
+            Path((
+                MOCK_WELCOME_CONVERSATION_ID.to_string(),
+                "welcome-message-1".to_string(),
+            )),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            live_conversation(&state, MOCK_WELCOME_CONVERSATION_ID)
+                .await
+                .messages
+                .len(),
+            1
+        );
+        assert_eq!(
+            disk_conversation(&temp, MOCK_WELCOME_CONVERSATION_ID)["messages"]
+                .as_array()
+                .expect("disk messages should be an array")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_transaction_success_response_observes_committed_live_and_disk() {
+        let temp = SyntheticTempDir::new("endpoint-success");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+
+        let response = update_conversation_title(
+            State(state.clone()),
+            Path(MOCK_WELCOME_CONVERSATION_ID.to_string()),
+            Json(UpdateConversationTitleRequest {
+                title: "committed title".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            live_conversation(&state, MOCK_WELCOME_CONVERSATION_ID)
+                .await
+                .title,
+            "committed title"
+        );
+        assert_eq!(
+            disk_conversation(&temp, MOCK_WELCOME_CONVERSATION_ID)["title"],
+            json!("committed title")
+        );
+        assert_eq!(state.revision.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn get_does_not_mutate_missing_conversation_detail() {
+        let temp = SyntheticTempDir::new("get-detail-pure");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let before_bytes = std_fs::read(&state.persistence.state_path)
+            .expect("synthetic state bytes should be readable");
+        let before_count = state.conversations.read().await.len();
+        let before_id = state.id_seq.load(Ordering::Relaxed);
+
+        let response = conversation_detail(
+            State(state.clone()),
+            Path("synthetic-missing-conversation".to_string()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(state.conversations.read().await.len(), before_count);
+        assert_eq!(state.id_seq.load(Ordering::Relaxed), before_id);
+        assert_eq!(
+            std_fs::read(&state.persistence.state_path)
+                .expect("synthetic state bytes should remain readable"),
+            before_bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn get_does_not_mutate_missing_conversation_stream() {
+        let temp = SyntheticTempDir::new("get-stream-pure");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let before_bytes = std_fs::read(&state.persistence.state_path)
+            .expect("synthetic state bytes should be readable");
+        let before_count = state.conversations.read().await.len();
+
+        let response = conversation_stream(
+            State(state.clone()),
+            Path("synthetic-missing-stream".to_string()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(state.conversations.read().await.len(), before_count);
+        assert_eq!(
+            std_fs::read(&state.persistence.state_path)
+                .expect("synthetic state bytes should remain readable"),
+            before_bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn get_does_not_mutate_repeated_missing_conversation_reads() {
+        let temp = SyntheticTempDir::new("get-repeated-pure");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let before = persisted_snapshot_from_live(&state).await;
+        let before_bytes = std_fs::read(&state.persistence.state_path)
+            .expect("synthetic state bytes should be readable");
+
+        for _ in 0..3 {
+            let _ = conversation_detail(
+                State(state.clone()),
+                Path("synthetic-repeated-missing".to_string()),
+            )
+            .await;
+        }
+
+        let after = persisted_snapshot_from_live(&state).await;
+        assert_eq!(before.settings, after.settings);
+        assert!(before.conversations == after.conversations);
+        assert!(before.providers == after.providers);
+        assert!(before.files == after.files);
+        assert_eq!(before.id_seq, after.id_seq);
+        assert_eq!(
+            std_fs::read(&state.persistence.state_path)
+                .expect("synthetic state bytes should remain readable"),
+            before_bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn virtual_conversation_get_then_message_post_creates_durable_chat() {
+        let temp = SyntheticTempDir::new("virtual-then-post");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let id = "synthetic-new-chat".to_string();
+
+        let response = conversation_detail(State(state.clone()), Path(id.clone()))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!state.conversations.read().await.contains_key(&id));
+
+        let response = send_message(
+            State(state.clone()),
+            Path(id.clone()),
+            Json(SendMessageRequest {
+                parts: vec![json!({ "type": "text", "text": "synthetic new chat" })],
+                mode_injection_ids: None,
+                lorebook_ids: None,
+                image_input_confirmed: None,
+                image_input_mode: None,
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(state.conversations.read().await.contains_key(&id));
+        assert!(!disk_conversation(&temp, &id).is_null());
+    }
+
+    #[tokio::test]
+    async fn mutation_transaction_coordinates_with_legacy_background_commit() {
+        let temp = SyntheticTempDir::new("staged-legacy");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let start = Arc::new(tokio::sync::Barrier::new(3));
+
+        let staged_state = state.clone();
+        let staged_start = start.clone();
+        let staged = tokio::spawn(async move {
+            staged_start.wait().await;
+            transact_persisted_state(
+                &staged_state,
+                PureStateMutationScope::Conversations,
+                |snapshot| {
+                    snapshot
+                        .conversations
+                        .get_mut(MOCK_WELCOME_CONVERSATION_ID)
+                        .expect("welcome conversation should exist")
+                        .title = "transaction title".to_string();
+                    Ok(())
+                },
+            )
+            .await
+        });
+
+        let legacy_state = state.clone();
+        let legacy_start = start.clone();
+        let legacy = tokio::spawn(async move {
+            legacy_start.wait().await;
+            append_assistant_reply(
+                &legacy_state,
+                MOCK_WELCOME_CONVERSATION_ID,
+                MOCK_ASSISTANT_ID,
+                MOCK_MODEL_ID,
+                "synthetic background reply".to_string(),
+                now_millis(),
+            )
+            .await
+        });
+
+        start.wait().await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            staged
+                .await
+                .expect("staged transaction should finish")
+                .expect("staged transaction should commit");
+            legacy
+                .await
+                .expect("legacy mutation should finish")
+                .expect("legacy mutation should persist");
+        })
+        .await
+        .expect("coordinated mutations must not deadlock");
+
+        let conversation = live_conversation(&state, MOCK_WELCOME_CONVERSATION_ID).await;
+        assert_eq!(conversation.title, "transaction title");
+        assert_eq!(conversation.messages.len(), 2);
+        let disk = disk_conversation(&temp, MOCK_WELCOME_CONVERSATION_ID);
+        assert_eq!(disk["title"], json!("transaction title"));
+        assert_eq!(
+            disk["messages"]
+                .as_array()
+                .expect("disk messages should be an array")
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn mutation_transaction_no_deadlock_across_category_a_and_legacy_commits() {
+        let temp = SyntheticTempDir::new("staged-no-deadlock");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let title_state = state.clone();
+            let title = tokio::spawn(async move {
+                update_conversation_title(
+                    State(title_state),
+                    Path(MOCK_WELCOME_CONVERSATION_ID.to_string()),
+                    Json(UpdateConversationTitleRequest {
+                        title: "no deadlock".to_string(),
+                    }),
+                )
+                .await
+                .into_response()
+                .status()
+            });
+            let settings_state = state.clone();
+            let settings = tokio::spawn(async move {
+                update_assistant(
+                    State(settings_state),
+                    Json(UpdateAssistantRequest {
+                        assistant_id: "synthetic-assistant".to_string(),
+                    }),
+                )
+                .await
+                .into_response()
+                .status()
+            });
+            let legacy_state = state.clone();
+            let legacy = tokio::spawn(async move {
+                append_assistant_reply(
+                    &legacy_state,
+                    MOCK_WELCOME_CONVERSATION_ID,
+                    MOCK_ASSISTANT_ID,
+                    MOCK_MODEL_ID,
+                    "synthetic no-deadlock reply".to_string(),
+                    now_millis(),
+                )
+                .await
+            });
+
+            assert_eq!(
+                title.await.expect("title task should finish"),
+                StatusCode::OK
+            );
+            assert_eq!(
+                settings.await.expect("settings task should finish"),
+                StatusCode::OK
+            );
+            legacy
+                .await
+                .expect("legacy task should finish")
+                .expect("legacy task should persist");
+        })
+        .await
+        .expect("mixed mutation tasks must finish before timeout");
+
+        let disk = read_test_state(&test_persistence(&temp));
+        assert_eq!(disk["schemaVersion"], json!(STATE_SCHEMA_VERSION));
     }
 
     fn openai_vision_test_config(custom_body: Option<Value>) -> OpenAiChatConfig {

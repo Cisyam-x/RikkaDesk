@@ -32,7 +32,7 @@ Phase 12 P1-A hardens the ordinary `state.v1.json` write path without changing t
 Implemented behavior:
 
 - All ordinary full-state saves are serialized by one process-local persistence mutex.
-- `persist_mock_state` acquires the save mutex before it reads the independent settings, conversation, provider, and file metadata locks. A waiting save therefore snapshots current state only after earlier saves finish; a snapshot prepared before waiting cannot later overwrite a newer snapshot.
+- P1-A's atomic writer still owns the one save mutex and one unique-temp/replace implementation. P1-C1 runtime transactions now build an explicit staged snapshot under the mutation mutex and pass that snapshot to the same writer; the persistence layer does not re-read live state for staged transactions.
 - JSON serialization completes before any filesystem operation touches the primary state file.
 - Every save uses a unique same-directory temp name in the form `state.v1.json.tmp.<pid>.<counter>` and creates it with create-new semantics.
 - The writer performs `write_all`, `flush`, and `sync_all`, closes the temp handle, and only then commits it.
@@ -42,7 +42,7 @@ Implemented behavior:
 - State mutation handlers await the persistence result and return a safe HTTP 5xx response on failure instead of reporting success.
 - Streaming completion cannot return an HTTP response, so persistence failure is recorded only as a fixed operation context and failure stage. No state content, message, provider config, secret, or local path is logged.
 
-The save transaction does not currently roll back an in-memory mutation when disk persistence fails. The API no longer acknowledges that mutation as saved, but in-memory state may temporarily lead the last valid on-disk state until a later successful save or restart. A broader centralized mutation transaction/rollback design remains future hardening because the current runtime state is split across several independent locks.
+P1-C1 removes this live-ahead-of-disk behavior for the pure settings and conversation mutations listed below. Provider/SecretStore, file/blob, and streaming paths remain transitional and can still leave one live component or external resource ahead of disk after a failed save. Their compensation and finalization rules remain P1-C2 through P1-C4 work.
 
 P1-A does not claim complete power-loss protection, a transactional boundary between state and managed blobs, backup/restore support, or complete corruption recovery.
 
@@ -65,7 +65,7 @@ Implemented behavior:
 - The automatic `reset_persisted_state` path is removed. No non-NotFound load failure writes default state.
 - Startup errors use fixed stages and schema numbers only. State bytes, user content, provider data, secret references, and local paths are not logged.
 
-P1-B does not provide a recovery UI. A user encountering corrupt state receives a startup failure while the original and durable corrupt backup remain available for a later explicit recovery workflow. It also does not provide state/blob transactions, formal backup packages, portable DPAPI backup, or in-memory mutation rollback.
+P1-B does not provide a recovery UI. A user encountering corrupt state receives a startup failure while the original and durable corrupt backup remain available for a later explicit recovery workflow. It also does not provide state/blob transactions, formal backup packages, portable DPAPI backup, or cross-resource mutation compensation.
 
 ## P0 Persistence Baseline (Before P1-A)
 
@@ -721,11 +721,16 @@ Decision:
 
 The complete call-site inventory, lock order, external-side-effect matrix, compensation rules, and synthetic test plan are in `docs/rikkadesk-phase-12-mutation-transaction-boundaries.md`.
 
-### P1-C1: Pure State Staged Transactions (Pending)
+### P1-C1: Pure State Staged Transactions (Completed)
 
-- Add the mutation mutex, commit barrier, cloneable staged persisted state, and persist-before-live-commit helper.
-- Cover settings, assistant/current model/favorites, title/pin, message edit/delete, conversation delete, lazy conversation creation policy, and state-only counters.
-- Keep SecretStore, blob operations, and streaming finalization out of this step.
+- Added a global mutation transaction mutex and short read/write commit barrier around the split persisted components.
+- Added a cloneable staged `PersistedMockState`, validation, explicit snapshot persistence through the P1-A atomic writer, and persist-before-live-commit behavior.
+- Migrated assistant selection, current assistant model, favorite models, conversation title, pin/unpin, conversation delete, text message edit, and message delete.
+- Pure persistence or validation failure now leaves live state, disk state, and the runtime-only revision unchanged. Success SSE/invalidation is emitted only after live commit.
+- Removed GET-time persisted conversation creation. Detail and stream GETs return a virtual empty DTO for a missing ID without changing conversations, `id_seq`, or disk.
+- Added a runtime-only monotonic revision; it is not written to schema v6. ID gaps remain allowed, duplicate IDs are validated, and `id_seq` is never decremented.
+- Coordinated transitional Provider/SecretStore, file/blob, send/regenerate/stop, and background write windows with the mutation mutex and commit barrier without changing their external side-effect order.
+- Kept Provider/SecretStore compensation, blob consistency, and streaming transaction semantics out of this step. Failed transitional writers may still leave live/external state ahead of disk until P1-C2, P1-C3, or P1-C4 resolves them.
 
 ### P1-C2: Provider And SecretStore Compensation (Pending)
 
@@ -833,21 +838,22 @@ Acceptance:
 
 ## Phase 12 Status And Remaining Blockers
 
-Current P1-A/P1-B status:
+Current P1-A/P1-B/P1-C1 status:
 
 - Atomic replacement state write exists: Yes for the P1-A single-file commit path; no pre-delete remains.
 - Corrupt backup is fail-closed: Yes after P1-B; the primary is retained and no default is written.
 - Direct primary-state removal in ordinary saves exists: No.
 - Persistence save mutex exists: Yes.
 - Persistence errors reach mutation handlers: Yes; background completion logs a safe stage-only error.
-- In-memory rollback on persistence failure exists: No; memory may temporarily lead disk.
+- Pure settings/conversation persistence failure leaves live state unchanged: Yes after P1-C1.
+- All mutation classes have rollback/compensation: No; Provider/SecretStore, blobs, and streaming remain pending.
 - Silent automatic reset after read/parse/schema failure exists: No.
 - Future schema is fail-closed: Yes; it is not treated as corrupt or migrated.
 - Schema 1-5 pre-migration backup exists: Yes.
 - Automatic non-NotFound reset exists: No.
-- Runtime mutation consistency risk exists: Yes, pending staged transaction work in P1-C1 through P1-C4.
+- Runtime mutation consistency risk exists: Reduced for Category A; still present in P1-C2 through P1-C4 scopes.
 - State/blob consistency risk exists: Yes.
 - DPAPI secret blobs are portable across machines/users: No.
 - A formal backup/restore package currently exists: No.
 
-Recommended next step: Phase 12 P1-C1 pure state staged transactions. Mode A/B packaging, managed blob restore, and backup/restore UI remain deferred until P1-C1 through P1-C4 establish consistent runtime snapshots.
+Recommended next step: Phase 12 P1-C2 Provider and SecretStore compensation. Mode A/B packaging, managed blob restore, and backup/restore UI remain deferred until P1-C2 through P1-C4 establish the remaining consistent runtime boundaries.
