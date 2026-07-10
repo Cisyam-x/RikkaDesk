@@ -194,7 +194,7 @@ Phase 10 upgrades local desktop state to `schemaVersion: 5` with managed file me
 
 Phase 12 P1-A serializes local state saves, uses unique same-directory temp files, flushes and syncs each complete temp file, and replaces the primary state without deleting it first. Packaging verification should run the synthetic `state_persist` tests and confirm save failures return a non-success response. P1-A does not yet add backup/restore, migration backup, future-schema protection, or in-memory rollback after a failed save.
 
-Phase 12 P1-B initializes defaults only when the primary state is missing. Other read failures stop startup. Malformed state is preserved byte-for-byte in a unique corrupt backup and requires explicit recovery; a backup failure cannot fall through to default state. Future schemas stop startup without being marked corrupt, and schemas 1-5 receive a durable original-byte backup before migration. Strict P1-A stale temp files remain ignored and preserved. Recovery UI and non-pure mutation compensation are still pending.
+Phase 12 P1-B initializes defaults only when the primary state is missing. Other read failures stop startup. Malformed state is preserved byte-for-byte in a unique corrupt backup and requires explicit recovery; a backup failure cannot fall through to default state. Future schemas stop startup without being marked corrupt, and schemas 1-5 receive a durable original-byte backup before migration. Strict P1-A stale temp files remain ignored and preserved. Recovery UI and P1-C4 streaming transaction safety are still pending.
 
 Phase 12 P1-C1 stages pure settings and conversation mutations, persists the staged snapshot through the P1-A atomic writer, and commits live state only after persistence succeeds. Covered operations are assistant selection, current assistant model, favorites, title, pin/unpin, conversation delete, text message edit, and message delete. Missing conversation detail/stream GETs now return a virtual DTO without creating persisted state. Run the synthetic `staged_transaction`, `mutation_transaction`, `transaction_failure`, and `get_does_not_mutate` test groups and confirm success events occur only after commit.
 
@@ -211,7 +211,23 @@ P1-C2 verification must cover:
 - Safe errors containing no key, encrypted bytes, secret ref, storage path, or state body.
 - Synthetic temp state and an in-memory fake SecretStore only. Never read real app data or `mock-api/secrets/*.bin`.
 
-P1-C1/P1-C2 do not make every mutation class atomic. File/blob consistency remains P1-C3, and send/regenerate/stop/streaming finalization remains P1-C4. Backup Mode A/B packaging is still blocked. Do not claim that SecretStore and JSON state are fully atomic across process crashes: an unreferenced encrypted orphan can remain between new-secret prepare and state commit or between state commit and old-secret cleanup. Managed blobs/metadata and streaming deltas are also not yet fully transactional.
+Phase 12 P1-C3 serializes managed file/blob operations and commits file metadata through the staged-state helper. Accepted upload batches publish all program-named blobs before one metadata/ID commit. Blob or state failure commits no partial metadata; failed state persistence compensates every operation-created final blob with bounded retry. DELETE rejects persisted numeric `metadata.fileId` references, commits a durable `deletedAt` tombstone before physical cleanup, and preserves the active blob if tombstone persistence fails. Post-commit cleanup failure remains logical success with a fixed redacted warning and an inaccessible orphan.
+
+P1-C3 verification must cover:
+
+- Single and batch upload success with unique IDs/storage keys, complete metadata/blob publication, and one staged state commit.
+- Blob write or mid-batch publish failure leaving no metadata or partial successful response and cleaning prior batch blobs.
+- State persistence failure after publication leaving live/disk/revision/`id_seq` unchanged and compensating all new blobs.
+- Compensation cleanup exhaustion returning a fixed safe failure while state references none of the residual blobs.
+- Unreferenced DELETE tombstoning metadata before blob cleanup; failed tombstone persistence keeps the original blob active.
+- Post-tombstone cleanup failure returning logical success while metadata/path GET remains unavailable; repeated DELETE is idempotent and retries cleanup.
+- Numeric image/document references returning conflict; malformed legacy URLs do not identify another file.
+- Message/conversation deletion not auto-GCing former attachments.
+- Concurrent uploads, Category A mutation, Provider transaction, and delete/GET ordering completing without duplicate IDs, lost updates, or deadlock.
+- Safe errors and fixed warnings containing no blob bytes, storage key, original file name, absolute path, state JSON, or user message.
+- The synthetic `file_transaction`, `blob_compensation`, `file_delete`, and `file_reference` groups plus the complete Rust suite. Never use real app data or real user files.
+
+P1-C1/P1-C2/P1-C3 do not make every mutation class or cross-resource crash window atomic. Send/regenerate/stop/streaming finalization remains P1-C4, so Backup Mode A/B packaging is still blocked. Do not claim that SecretStore and JSON state are fully atomic across process crashes: an unreferenced encrypted orphan can remain between new-secret prepare and state commit or between state commit and old-secret cleanup. Managed blob publication and physical deletion also retain crash-only orphan windows, and automatic orphan reconciliation/GC is not implemented.
 
 It may contain:
 

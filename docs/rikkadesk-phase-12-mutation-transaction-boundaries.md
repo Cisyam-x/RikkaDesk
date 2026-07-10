@@ -1,8 +1,8 @@
 # RikkaDesk Phase 12 Mutation Transaction Boundaries
 
-This document began as the Phase 12 P1-C0 audit and design for runtime mutation transactions. It now records the completed P1-C1 pure-state implementation and P1-C2 Provider/SecretStore compensation while retaining managed blob, network, and streaming boundaries for later phases.
+This document began as the Phase 12 P1-C0 audit and design for runtime mutation transactions. It now records the completed P1-C1 pure-state implementation, P1-C2 Provider/SecretStore compensation, and P1-C3 managed file/blob compensation while retaining network and streaming boundaries for P1-C4.
 
-P1-C1 and P1-C2 change the Rust mock API transaction path only. They do not add backup/restore, read real app data or secret blobs, change `schemaVersion: 6`, change provider import/export version 4, or enable real-provider image input by default.
+P1-C1 through P1-C3 change the Rust mock API transaction path only. They do not add backup/restore, read real app data or secret blobs, change `schemaVersion: 6`, change provider import/export version 4, or enable real-provider image input by default.
 
 ## Current State Model
 
@@ -24,9 +24,10 @@ Runtime-only data is separate:
 - SecretStore
 - Provider/SecretStore transaction mutex
 - Provider secret-ref sequence
+- managed blob store and file/blob transaction mutex
 - persistence/save mutex and file operations
 
-P1-A serializes writes and atomically replaces the state file. P1-B makes startup and migration fail closed. P1-C1 stages pure settings/conversation mutations, persists the explicit staged snapshot, and commits live state only after persistence succeeds. P1-C2 now applies the same state transaction to Provider metadata and coordinates it with copy-on-write SecretStore operations. File/blob and streaming mutations remain transitional paths.
+P1-A serializes writes and atomically replaces the state file. P1-B makes startup and migration fail closed. P1-C1 stages pure settings/conversation mutations, persists the explicit staged snapshot, and commits live state only after persistence succeeds. P1-C2 applies the same state transaction to Provider metadata and coordinates it with copy-on-write SecretStore operations. P1-C3 publishes managed blobs before one staged metadata commit, compensates handled upload failures, and uses durable tombstones before physical deletion. Streaming mutations remain the transitional P1-C4 path.
 
 ## P1-C1 Implementation Status
 
@@ -47,7 +48,7 @@ The implementation adds one process-local `mutation_transaction_mutex`, one live
 
 P1-C1 success is published only after disk persistence and the live commit finish. Persistence or validation failure leaves pure live state, disk state, and revision unchanged and emits no success update.
 
-Transitional Category B/D writers use the same mutation mutex and commit barrier for their short live-state write/persist window. This prevents interleaving with a staged commit and prevents an older persistence snapshot from overwriting a newer transaction. It does not remove an orphan managed file blob, restore a deleted blob, or make streaming deltas durable. P1-C3 and P1-C4 own those remaining semantics.
+Transitional Category B/D writers use the same mutation mutex and commit barrier for their short live-state write/persist window. This prevents interleaving with a staged commit and prevents an older persistence snapshot from overwriting a newer transaction. P1-C3 now owns the managed file/blob paths; it prevents handled failures from creating active dangling metadata but intentionally does not reconcile crash-only orphans. P1-C4 still owns streaming durability.
 
 ## P1-C2 Implementation Status
 
@@ -66,6 +67,18 @@ API key create/update uses a newly generated immutable `secretRef`; no existing 
 Secret compensation and cleanup use a bounded three-attempt idempotent delete. Old-secret cleanup failure after a successful state commit is logical success with a fixed redacted warning. The committed state does not reference the old encrypted blob, so it is an orphan rather than a dangling active reference. No complex partial-success UI was added. Handled state failures compensate operation-created blobs; if all compensation attempts are prevented by an underlying SecretStore failure, the API returns a distinct fixed safe error and requires later reconciliation.
 
 JSON state and DPAPI/keyring storage are not one atomic resource. A process crash after a new encrypted blob is prepared but before state commit, or after state commit but before old-blob cleanup, can leave an unreferenced encrypted orphan. Startup orphan discovery/reconciliation is deferred. P1-C2 does not claim portable secret backup or complete cross-resource atomicity.
+
+## P1-C3 Implementation Status
+
+`POST /api/files/upload` and `DELETE /api/files/{id}` now use one process-local `file_blob_transaction_mutex`. Managed blob I/O happens outside component locks, the commit barrier, and the global state mutation mutex. File metadata is committed through `transact_persisted_state` with a dedicated validation scope, preserving the fixed outer lock order: file/blob mutex, blob work, then the short staged state transaction.
+
+Uploads are atomic at the accepted batch level. Every item is validated before blob publication. Each blob receives a program-generated storage key independent of its numeric file ID, and is written to a unique same-directory `blob.tmp.<pid>.<counter>` file with create-new, `write_all`, `flush`, `sync_all`, close, and no-overwrite publish semantics. Only after all blobs are final does one staged transaction allocate file IDs, append all metadata, persist, and commit live state. Blob write/publish failure commits no metadata and cleans prior batch blobs. Metadata persistence failure leaves live state, disk state, `id_seq`, and revision unchanged and performs a bounded three-attempt cleanup of all operation-created final blobs. Exhausted compensation returns a fixed safe failure and can leave only an unreferenced, API-inaccessible orphan.
+
+Deletion now checks numeric `metadata.fileId` references across all persisted conversation message parts inside the staged state transaction. An active reference returns conflict without changing metadata or the blob. An unreferenced file is first durably tombstoned with `deletedAt`; only after durable/live commit is its physical blob removed. Tombstone persistence failure leaves the active metadata and blob unchanged. Physical cleanup failure after commit remains logical success, records one fixed redacted warning, and leaves an inaccessible orphan for bounded retry on repeated DELETE. Repeated DELETE is idempotent.
+
+Metadata/path reads reject missing and tombstoned entries. Path reads and delete operations share the file/blob mutex, so a committed tombstone cannot continue serving bytes. A blob without metadata has no API route. Message send also verifies every numeric managed file reference is active while serialized with state mutations, preventing a new persisted reference from racing a tombstone. Message/conversation deletion does not auto-delete blobs; conservative orphan reconciliation/GC remains deferred.
+
+State and blob storage are not one crash-atomic resource. A process crash between final blob publish and metadata commit can leave an unreferenced blob. A crash between durable tombstone commit and physical deletion can leave tombstoned metadata plus an inaccessible physical blob. P1-C3 does not claim complete power-loss atomicity or automatic orphan cleanup.
 
 ## Mutation Call-Site Inventory
 
@@ -94,10 +107,10 @@ JSON state and DPAPI/keyring storage are not one atomic resource. A process cras
 | Append stream text delta | conversations | No | Snapshot SSE for each delta | UI/readers see text not yet durable | Must become transient runtime buffer or checkpoint transaction | B |
 | Stream provider failure text | conversations | Only through later finish save | Snapshot SSE before final save | Failure text can be visible but not durable | Commit as one final short transaction | B |
 | Finish stream | conversations and runtime generation flag | Yes | Stops runtime flag before save; final SSE after save | Live finished state remains; disk may still show generating; safe stage-only log | Needs generation token and retry/error event | B |
-| Upload file | files, `id_seq` | Yes | Blob files are created first | State save failure leaves live metadata and blobs; no response success | Requires blob compensation/staging | D |
-| Delete file | files tombstone | Yes | Blob is deleted first | Save failure leaves disk metadata active but blob missing | Reverse order; tombstone then deferred cleanup | D |
-| Attachment references in messages | conversations | Through message transaction | References managed file IDs/URLs | File deletion can make committed messages unavailable | Requires reference policy in C3 | D |
-| `id_seq` allocation | atomic counter | Included in later full save | IDs can be used in response/state/blob names | Failed mutations consume in-process IDs | Do not decrement; allow gaps, forbid duplicates | A-D |
+| Upload file | files, `id_seq` | Yes | Entire accepted batch is published before one staged metadata commit | Failed blob work commits no metadata; failed state commit compensates all new blobs and leaves live/disk/revision unchanged | Implemented publish/stage/compensate transaction | D |
+| Delete file | files tombstone | Yes | Durable tombstone precedes physical blob cleanup | Failed tombstone persistence retains active metadata/blob; post-commit cleanup failure is logical success with inaccessible orphan | Implemented tombstone then cleanup | D |
+| Attachment references in messages | conversations | Through message transaction | References numeric `metadata.fileId` | Persisted references block ordinary DELETE; send rejects missing/tombstoned IDs | Implemented conservative reference policy | D |
+| `id_seq` allocation | staged state or coordinated legacy counter | Included in full save | File IDs are allocated only in the staged metadata transaction; storage keys are independent | Failed file metadata commit does not publish staged file IDs; gaps elsewhere remain allowed | Never decrement; allow gaps, forbid duplicates | A-D |
 | `savedAt` | staged persisted snapshot | Every save | None | Failed save does not publish timestamp | Generate for staged snapshot only | A-D |
 | SSE event sequence | runtime `seq` only | No | Event ordering | Gaps are harmless | Runtime-only, outside transaction | Runtime |
 
@@ -312,29 +325,31 @@ On Windows, `secret_exists` checks the controlled blob path without reading or d
 
 ### Upload
 
-Recommended P1-C3 sequence:
+Implemented P1-C3 sequence:
 
-1. Validate and reserve IDs/storage keys.
-2. Write and sync each blob to a controlled transaction temp.
-3. Publish blobs to final managed names.
-4. Build file metadata in staged state.
-5. Persist staged state.
-6. On state failure, delete only blobs created by this operation; record safe orphan cleanup if deletion fails.
-7. On success, commit live metadata and return file responses.
+1. Validate the complete accepted upload batch before blob publication.
+2. Acquire the file/blob transaction mutex and generate storage keys without consuming file IDs.
+3. Write and sync each blob to a unique controlled temp, close it, and publish to a non-existing final managed name.
+4. If any blob step fails, clean all temps/finals created by this batch and commit no metadata.
+5. Build all file metadata and allocate numeric IDs in one staged state transaction.
+6. Persist the staged state and commit live metadata.
+7. On state failure, delete only final blobs created by this operation with bounded retry; record a fixed safe compensation warning if deletion remains blocked.
+8. On success, return every file response as one batch.
 
-This ordering prefers an unreferenced orphan over durable metadata that points to a missing blob. Orphans must never be exposed through the file API and need a referenced-file-aware cleanup policy.
+This ordering prefers an unreferenced orphan over durable metadata that points to a missing blob. Handled failures normally remove operation-created blobs; an exhausted cleanup or process crash can still leave an orphan. Orphans have no numeric metadata route and are never exposed through the file API.
 
 ### Delete
 
-Do not delete the blob first. Persist and commit a metadata tombstone or pending-delete state before physical deletion. Then remove the blob:
+P1-C3 does not delete the blob first. It scans persisted message parts for the numeric file ID, then persists and commits a metadata tombstone before physical deletion:
 
-- Blob deletion success: finalize deletion and return success.
-- Blob deletion failure: keep the durable tombstone/pending cleanup state and return an explicit pending/failure result; retry later.
-- Active message references: initially reject deletion unless the operation is a draft cancellation or the user explicitly accepts that committed attachments become unavailable.
+- Active message reference: return conflict; metadata and blob stay active.
+- Tombstone persistence failure: return failure; live/disk metadata and blob stay active.
+- Blob deletion success or already missing: return logical success.
+- Blob deletion failure: retain the durable tombstone, deny metadata/path reads, return logical success, emit a fixed warning, and retry cleanup on repeated DELETE.
 
-P1-C0 defines this boundary only. Actual blob consistency, cleanup journal/tombstone shape, orphan scanning, and reference policy belong in P1-C3 and may be merged with the original Phase 12 P3 blob consistency work.
+Message and conversation deletion intentionally do not auto-GC their former attachments. This prevents accidental deletion of shared or conservatively referenced blobs. Orphan discovery, reconciliation, and garbage collection remain deferred to Phase 12 P6 or a dedicated maintenance phase.
 
-Files do not belong in P1-C1 except for proving that pure staged snapshots can carry unchanged file metadata.
+The process-crash windows remain final publish before metadata commit, and durable tombstone before physical delete. Both can leave inaccessible orphans, but ordinary handled failures do not leave active metadata pointing to a newly missing blob.
 
 ## Provider Network And Streaming Boundary
 
@@ -376,7 +391,7 @@ Background streaming is handled separately in P1-C4.
 | Stream finish/failure | Keep runtime buffer for retry; no final commit | Network and persistence errors stay distinct | Safe SSE error; no final-success snapshot |
 | Stop | Failed staged stop leaves prior durable generating state | Runtime cancellation uses generation token | Safe 5xx or retry status; no stopped success event |
 | File upload | Discard metadata stage; delete operation-created blobs | Cleanup failure records orphan safely | Safe 5xx; no file response |
-| File delete | Keep/commit tombstone policy; never restore stale live metadata blindly | Blob cleanup failure remains pending | Explicit pending/failure; no false physical-delete success |
+| File delete | Discard failed tombstone stage and retain active metadata/blob | Post-commit blob cleanup failure leaves an inaccessible orphan | Reference conflict is 409; committed tombstone remains logical success with fixed warning |
 
 Errors may include fixed operation/stage codes and non-sensitive numeric IDs only when needed. They must not contain state JSON, local paths, API keys, secret values/references, request bodies, or blob content.
 
@@ -407,15 +422,16 @@ Scope:
 
 Completed P1-C2 prevents handled persistence failures from leaving state pointing to a newly missing secret and prevents key clear/delete from destroying the old secret before state durability. Process-crash orphan discovery and deletion are intentionally deferred; P1-C2 does not scan secret storage.
 
-### P1-C3: File Blob Transaction And Compensation
+### P1-C3: File Blob Transaction And Compensation (Completed)
 
 Scope:
 
-- Upload staging/publication plus metadata commit.
-- Delete tombstone/deferred cleanup.
-- Referenced attachment policy.
-- Missing/orphan reconciliation.
-- Integration with the original Phase 12 P3 blob consistency work.
+- Atomic accepted-batch upload publication plus one staged metadata/ID commit.
+- Unique create-new temp files and non-overwriting final storage keys independent of file IDs.
+- State-failure blob compensation with bounded retry and fixed redacted failures.
+- Durable tombstone before physical deletion, including idempotent cleanup retry.
+- Numeric persisted-reference protection and send-time active attachment checks.
+- API-inaccessible orphan policy; automatic reconciliation/GC remains deferred.
 
 ### P1-C4: Background Streaming Transaction Safety
 
@@ -452,11 +468,15 @@ Scope:
 
 ### Files
 
-- Blob publication plus metadata failure removes only operation-created blobs.
-- Cleanup failure creates a safe orphan report, not exposed metadata.
-- Metadata tombstone success plus blob failure remains retryable.
-- Delete does not silently break committed message references.
-- Orphan cleanup never removes referenced blobs.
+- Single and batch upload success publish every blob and metadata item with unique IDs.
+- Blob write/publish failure commits no metadata and cleans prior batch blobs.
+- Blob publication plus metadata failure removes only operation-created blobs and leaves live/disk/revision unchanged.
+- Compensation cleanup exhaustion creates only an API-inaccessible orphan and returns a fixed safe failure.
+- Tombstone persistence failure preserves active metadata and blob.
+- Post-tombstone blob cleanup failure is logical success; GET remains blocked and repeated DELETE retries cleanup.
+- Image/document numeric references block ordinary DELETE; malformed legacy URLs do not identify another file.
+- Concurrent upload, Category A, Provider, delete, and GET cases preserve lock ordering and complete without lost updates or deadlock.
+- The P1-C3 implementation adds 22 synthetic file/blob tests; the complete Rust suite contains 103 passing tests at completion.
 
 ### Streaming
 
@@ -477,14 +497,14 @@ Do not implement Mode A/B backup packaging until these gates pass:
 ```text
 P1-C1 pure state transaction safety
   -> P1-C2 provider secret consistency (completed)
-  -> P1-C3 file/blob consistency
+  -> P1-C3 file/blob handled-failure consistency (completed)
   -> P1-C4 streaming transaction safety
   -> Mode A/B backup package
 ```
 
 Reason: a backup snapshot cannot be represented as consistent while runtime writers can expose uncommitted state, SecretStore operations can leave cross-resource inconsistencies, blobs can be missing/orphaned, or streaming can mutate persisted objects outside transaction boundaries.
 
-## P1-C1 And P1-C2 Conclusions
+## P1-C1 Through P1-C3 Conclusions
 
 - Recommended architecture: stage, persist, then commit live.
 - Global mutation mutex required: Yes.
@@ -495,12 +515,16 @@ Reason: a backup snapshot cannot be represented as consistent while runtime writ
 - SecretStore included in P1-C1: No.
 - Provider/SecretStore compensation implemented in P1-C2: Yes, with copy-on-write refs and handled-failure compensation.
 - State and SecretStore fully atomic across process crashes: No; encrypted orphan windows remain documented.
-- File/blob operations included in P1-C1: No; unchanged metadata may be carried, but operations belong in P1-C3.
+- File/blob operations included in P1-C1: No; P1-C3 now implements their coordinated handled-failure semantics.
+- State and managed blobs fully atomic across process crashes: No; upload/delete orphan windows remain documented and reconciliation is deferred.
+- Ordinary handled file failures leave active dangling metadata: No; failed upload state commits compensate new blobs, and failed delete state commits retain the original blob.
+- Referenced managed file ordinary DELETE permitted: No; persisted numeric references return conflict.
+- Message/conversation deletion auto-GCs managed blobs: No; conservative orphan cleanup is deferred.
 - Background streaming handled separately: Yes, in P1-C4.
 - ID policy: gaps allowed, duplicates forbidden, never decrement `id_seq`.
 - Pure settings/conversation staged transactions implemented: Yes.
 - Missing conversation GET mutates persisted state: No.
 - Runtime revision persisted in schema v6: No.
-- Recovery/backup modes implemented by P1-C1/P1-C2: No.
+- Recovery/backup modes implemented by P1-C1/P1-C2/P1-C3: No.
 
-Recommended next step: P1-C3 file blob transaction and compensation. Mode A/B backup packaging remains blocked through P1-C4.
+Recommended next step: P1-C4 background streaming transaction safety. Mode A/B backup packaging remains blocked through P1-C4.

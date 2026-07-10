@@ -15,6 +15,7 @@ P0 is documentation only. It does not implement backup or restore APIs, add UI, 
 - Windows artifacts: unsigned private beta.
 - GitHub Release: No.
 - Real-provider image input: not enabled by default.
+- Runtime mutation hardening: P1-C1 pure state, P1-C2 Provider/SecretStore, and P1-C3 managed file/blob handled-failure semantics completed; P1-C4 streaming remains pending.
 
 ## P0 Decisions
 
@@ -42,7 +43,7 @@ Implemented behavior:
 - State mutation handlers await the persistence result and return a safe HTTP 5xx response on failure instead of reporting success.
 - Streaming completion cannot return an HTTP response, so persistence failure is recorded only as a fixed operation context and failure stage. No state content, message, provider config, secret, or local path is logged.
 
-P1-C1 removes this live-ahead-of-disk behavior for the pure settings and conversation mutations listed below. P1-C2 extends staged state commits to Provider metadata and coordinates them with copy-on-write SecretStore operations. File/blob and streaming paths remain transitional and can still leave one live component or external resource ahead of disk after a failed save; P1-C3 and P1-C4 own those remaining rules.
+P1-C1 removes this live-ahead-of-disk behavior for the pure settings and conversation mutations listed below. P1-C2 extends staged state commits to Provider metadata and coordinates them with copy-on-write SecretStore operations. P1-C3 now coordinates managed blob publication/deletion with staged file metadata. Streaming paths remain transitional and can still leave one live component ahead of disk after a failed save; P1-C4 owns those remaining rules.
 
 P1-A does not claim complete power-loss protection, a transactional boundary between state and managed blobs, backup/restore support, or complete corruption recovery.
 
@@ -67,6 +68,23 @@ Implemented behavior:
 
 P1-B does not provide a recovery UI. A user encountering corrupt state receives a startup failure while the original and durable corrupt backup remain available for a later explicit recovery workflow. It also does not provide state/blob transactions, formal backup packages, portable DPAPI backup, or cross-resource mutation compensation.
 
+## P1-C3 Implementation Status
+
+Phase 12 P1-C3 hardens handled managed file upload/delete failures without changing schema v6, the file API shape, or backup formats.
+
+Implemented behavior:
+
+- One file/blob transaction mutex serializes managed upload, delete, path reads, and provider-image blob reads without holding component locks or the global state mutation mutex across blob I/O.
+- The accepted upload batch is validated first, then every blob is written to a unique create-new same-directory temp, flushed, synced, closed, and published to a non-existing program-generated final name.
+- Blob storage keys are independent of numeric file IDs. File IDs and `id_seq` advance only in one staged file-metadata transaction after every batch blob is published.
+- Blob write/publish failure commits no metadata and removes prior operation-created blobs. State persistence failure leaves live/disk metadata, revision, and `id_seq` unchanged and compensates all new final blobs with bounded retry.
+- Exhausted upload compensation returns a fixed safe failure and can leave only an unreferenced blob with no API-accessible metadata.
+- Ordinary DELETE scans numeric `metadata.fileId` references in persisted messages. A referenced file returns conflict. An unreferenced file is durably tombstoned before physical cleanup.
+- Tombstone persistence failure leaves the active metadata and blob unchanged. Cleanup failure after commit returns logical success, leaves GET/path access blocked, emits a fixed redacted warning, and is retried by repeated DELETE.
+- Message/conversation deletion does not automatically remove attachment blobs. Automatic orphan discovery, reconciliation, and GC remain deferred.
+
+P1-C3 still does not make JSON state and blob storage crash-atomic. A process crash after final blob publication but before metadata commit can leave an unreferenced blob. A crash after durable tombstone commit but before physical deletion can leave an inaccessible physical blob. These residuals are inputs to the later reconciliation design, not evidence that backup/restore is implemented.
+
 ## P0 Persistence Baseline (Before P1-A)
 
 The following audit records the implementation that P1-A replaced. It remains here as the rationale and risk baseline; statements in this section describing fixed temp names, pre-delete, missing sync, ignored save errors, or no save mutex are historical rather than current behavior.
@@ -89,7 +107,7 @@ On Windows, the documented effective layout is:
 %APPDATA%\com.cisyamx.rikkadesk\mock-api\secrets\<encoded-secret-ref>.bin
 ```
 
-The API accepts file IDs, not filesystem paths. `file_blob_path` validates `storageKey` and constructs blob paths under the managed blob directory.
+The API accepts file IDs, not filesystem paths. `ManagedBlobStore::final_path` validates `storageKey` and constructs blob paths under the managed blob directory.
 
 The current startup path logs the full state path to stderr. Handoff, backup, and restore diagnostics must therefore exclude raw logs unless a human has reviewed them for local usernames and paths.
 
@@ -377,23 +395,24 @@ Blob bytes are stored separately under `mock-api/files/blobs`. Runtime blob look
 
 ### Upload And Delete Ordering
 
-Upload currently:
+Upload after P1-C3:
 
-1. Writes each blob through a per-blob temp file and rename.
-2. Adds metadata to in-memory state.
-3. Persists full state.
+1. Validates the complete accepted batch and publishes every blob through a unique create-new, flush/sync/close temp path.
+2. Allocates numeric file IDs and appends all metadata in one staged state transaction.
+3. Persists the staged snapshot, commits live metadata, and only then returns the batch.
+4. Compensates operation-created blobs if publication or metadata persistence fails.
 
-If step 3 fails, blobs can exist without persisted metadata.
+Handled state persistence failure does not publish metadata and normally removes all new blobs. Cleanup exhaustion or a process crash between blob publication and metadata commit can still leave an unreferenced, API-inaccessible orphan.
 
-Delete currently:
+Delete after P1-C3:
 
-1. Deletes the blob.
-2. Marks metadata deleted in memory.
-3. Persists full state.
+1. Rejects the operation if any persisted message part has the numeric `metadata.fileId` reference.
+2. Persists and commits `deletedAt` for an unreferenced file.
+3. Deletes the physical blob only after the tombstone is durable and live.
 
-If step 3 fails or the process stops between steps, persisted metadata can refer to a missing blob.
+If tombstone persistence fails, the active metadata and original blob remain. If post-commit cleanup fails or the process stops between steps 2 and 3, the tombstone blocks all API reads while the physical blob remains an inaccessible orphan.
 
-There is no startup orphan scan, orphan cleanup, missing-blob reconciliation, or metadata/blob transaction.
+There is still no startup orphan scan, automatic orphan cleanup, or full state/blob crash transaction. P1-C3 provides handled-failure compensation and tombstone semantics; reconciliation remains deferred.
 
 ### Partial Backup And Restore Cases
 
@@ -743,7 +762,7 @@ The complete call-site inventory, lock order, external-side-effect matrix, compe
 - Removed GET-time persisted conversation creation. Detail and stream GETs return a virtual empty DTO for a missing ID without changing conversations, `id_seq`, or disk.
 - Added a runtime-only monotonic revision; it is not written to schema v6. ID gaps remain allowed, duplicate IDs are validated, and `id_seq` is never decremented.
 - Coordinated transitional Provider/SecretStore, file/blob, send/regenerate/stop, and background write windows with the mutation mutex and commit barrier without changing their external side-effect order.
-- P1-C1 intentionally kept Provider/SecretStore compensation, blob consistency, and streaming transaction semantics out of that step. Provider/SecretStore handled-failure semantics are now completed by P1-C2; file/blob and streaming risks remain for P1-C3/P1-C4.
+- P1-C1 intentionally kept Provider/SecretStore compensation, blob consistency, and streaming transaction semantics out of that step. Provider/SecretStore handled-failure semantics are now completed by P1-C2, file/blob handled-failure semantics by P1-C3, and streaming risk remains for P1-C4.
 
 ### P1-C2: Provider And SecretStore Compensation (Completed)
 
@@ -756,10 +775,15 @@ The complete call-site inventory, lock order, external-side-effect matrix, compe
 - Compensation/cleanup uses a bounded three-attempt idempotent delete. Exhausted cleanup after state commit is fixed-warning partial success with an unreferenced encrypted orphan. Process-crash orphan reconciliation remains future work and no secret directory scan was added.
 - All tests use synthetic state and an in-memory fake SecretStore; no real app data, DPAPI blob, or API key is read.
 
-### P1-C3: File Blob Transaction And Compensation (Pending)
+### P1-C3: File Blob Transaction And Compensation (Completed)
 
-- Cover upload blob publication plus metadata commit, delete tombstone/deferred cleanup, attachment references, and orphan/missing reconciliation.
-- Merge this work with the original Phase 12 P3 blob consistency scope where useful.
+- Added a dedicated file/blob transaction mutex and a no-overwrite managed blob publisher using unique create-new temps, flush/sync/close, and program-generated storage keys independent of file IDs.
+- Accepted upload batches publish all blobs before one staged metadata/ID transaction. Publication failure cleans prior batch blobs; state failure leaves live/disk/revision unchanged and compensates all operation-created finals.
+- Added bounded cleanup retry and fixed redacted failures. Cleanup exhaustion or process crash can leave only an API-inaccessible orphan; no automatic orphan scan/GC was added.
+- DELETE now blocks persisted numeric attachment references, commits a durable `deletedAt` tombstone before physical cleanup, preserves the blob on state failure, and treats post-commit cleanup failure as logical success with safe retry.
+- Path reads reject tombstoned metadata and serialize against delete. Send rejects missing/tombstoned numeric attachment references so a new persisted message cannot race a delete.
+- Message/conversation deletion intentionally does not auto-GC attachments. Reconciliation remains part of the later P6 safety work.
+- Added 22 synthetic file transaction, compensation, delete, reference, concurrency, and safe-error tests; no real app data or user files are read.
 
 ### P1-C4: Background Streaming Transaction Safety (Pending)
 
@@ -767,7 +791,7 @@ The complete call-site inventory, lock order, external-side-effect matrix, compe
 - Keep provider waits outside transaction locks.
 - Add generation tokens, transient delta semantics, final/failure staged commits, retry visibility, and post-commit SSE ordering.
 
-Mode A/B backup packaging remains blocked until P1-C3 and P1-C4 pass their synthetic safety tests. P1-C1 and P1-C2 are complete.
+Mode A/B backup packaging remains blocked until P1-C4 passes its synthetic safety tests. P1-C1, P1-C2, and P1-C3 are complete.
 
 ### P2: Portable Metadata/Full Backup Package
 
@@ -856,7 +880,7 @@ Acceptance:
 
 ## Phase 12 Status And Remaining Blockers
 
-Current P1-A/P1-B/P1-C1/P1-C2 status:
+Current P1-A/P1-B/P1-C1/P1-C2/P1-C3 status:
 
 - Atomic replacement state write exists: Yes for the P1-A single-file commit path; no pre-delete remains.
 - Corrupt backup is fail-closed: Yes after P1-B; the primary is retained and no default is written.
@@ -865,14 +889,15 @@ Current P1-A/P1-B/P1-C1/P1-C2 status:
 - Persistence errors reach mutation handlers: Yes; background completion logs a safe stage-only error.
 - Pure settings/conversation persistence failure leaves live state unchanged: Yes after P1-C1.
 - Provider/SecretStore handled-failure compensation exists: Yes after P1-C2; process-crash encrypted orphan reconciliation remains pending.
-- All mutation classes have rollback/compensation: No; managed blobs and streaming remain pending.
+- Managed file/blob handled-failure compensation exists: Yes after P1-C3; process-crash orphan reconciliation and automatic GC remain pending.
+- All mutation classes have rollback/compensation: No; background streaming remains pending.
 - Silent automatic reset after read/parse/schema failure exists: No.
 - Future schema is fail-closed: Yes; it is not treated as corrupt or migrated.
 - Schema 1-5 pre-migration backup exists: Yes.
 - Automatic non-NotFound reset exists: No.
-- Runtime mutation consistency risk exists: Reduced for Category A and Provider/SecretStore operations; still present in P1-C3/P1-C4 scopes.
-- State/blob consistency risk exists: Yes.
+- Runtime mutation consistency risk exists: Reduced for Category A, Provider/SecretStore, and managed file/blob operations; still present in P1-C4 streaming scope.
+- State/blob consistency risk exists: Handled failures are compensated/tombstoned after P1-C3, but crash-only orphan windows and restore reconciliation remain.
 - DPAPI secret blobs are portable across machines/users: No.
 - A formal backup/restore package currently exists: No.
 
-Recommended next step: Phase 12 P1-C3 file blob transaction and compensation. Mode A/B packaging, managed blob restore, and backup/restore UI remain deferred until P1-C3 and P1-C4 establish the remaining consistent runtime boundaries.
+Recommended next step: Phase 12 P1-C4 background streaming transaction safety. Mode A/B packaging, managed blob restore, reconciliation, and backup/restore UI remain deferred until P1-C4 establishes the remaining runtime boundary.

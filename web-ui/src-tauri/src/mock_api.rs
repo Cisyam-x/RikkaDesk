@@ -61,6 +61,9 @@ const LEGACY_STATE_SCHEMA_VERSION: u32 = 1;
 const SECRETS_DIR_NAME: &str = "secrets";
 const FILES_DIR_NAME: &str = "files";
 const FILE_BLOBS_DIR_NAME: &str = "blobs";
+const FILE_BLOB_TEMP_PREFIX: &str = "blob.tmp";
+const FILE_BLOB_CREATE_ATTEMPTS: usize = 32;
+const FILE_BLOB_CLEANUP_ATTEMPTS: usize = 3;
 const FILE_UPLOAD_MAX_ITEMS: usize = 5;
 const FILE_UPLOAD_MAX_BYTES: usize = 20 * 1024 * 1024;
 const FILE_UPLOAD_TOTAL_MAX_BYTES: usize = FILE_UPLOAD_MAX_ITEMS * FILE_UPLOAD_MAX_BYTES;
@@ -471,6 +474,199 @@ fn secret_io_error(error: io::Error) -> String {
     error.to_string()
 }
 
+trait ManagedBlobFileOps: Send + Sync {
+    fn create_dir_all(&self, path: &FilePath) -> io::Result<()>;
+    fn path_exists(&self, path: &FilePath) -> io::Result<bool>;
+    fn create_temp(&self, path: &FilePath) -> io::Result<std_fs::File>;
+    fn write_all(&self, file: &mut std_fs::File, data: &[u8]) -> io::Result<()>;
+    fn flush(&self, file: &mut std_fs::File) -> io::Result<()>;
+    fn sync_all(&self, file: &std_fs::File) -> io::Result<()>;
+    fn publish(&self, temp: &FilePath, final_path: &FilePath) -> io::Result<()>;
+    fn remove_file(&self, path: &FilePath) -> io::Result<()>;
+}
+
+struct RealManagedBlobFileOps;
+
+impl ManagedBlobFileOps for RealManagedBlobFileOps {
+    fn create_dir_all(&self, path: &FilePath) -> io::Result<()> {
+        std_fs::create_dir_all(path)
+    }
+
+    fn path_exists(&self, path: &FilePath) -> io::Result<bool> {
+        match std_fs::metadata(path) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn create_temp(&self, path: &FilePath) -> io::Result<std_fs::File> {
+        std_fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+    }
+
+    fn write_all(&self, file: &mut std_fs::File, data: &[u8]) -> io::Result<()> {
+        file.write_all(data)
+    }
+
+    fn flush(&self, file: &mut std_fs::File) -> io::Result<()> {
+        file.flush()
+    }
+
+    fn sync_all(&self, file: &std_fs::File) -> io::Result<()> {
+        file.sync_all()
+    }
+
+    fn publish(&self, temp: &FilePath, final_path: &FilePath) -> io::Result<()> {
+        publish_managed_blob_file(temp, final_path)
+    }
+
+    fn remove_file(&self, path: &FilePath) -> io::Result<()> {
+        std_fs::remove_file(path)
+    }
+}
+
+#[cfg(windows)]
+fn publish_managed_blob_file(temp: &FilePath, final_path: &FilePath) -> io::Result<()> {
+    std_fs::rename(temp, final_path)
+}
+
+#[cfg(not(windows))]
+fn publish_managed_blob_file(temp: &FilePath, final_path: &FilePath) -> io::Result<()> {
+    std_fs::hard_link(temp, final_path)?;
+    if let Err(error) = std_fs::remove_file(temp) {
+        let _ = std_fs::remove_file(final_path);
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct ManagedBlobStore {
+    blobs_dir: PathBuf,
+    sequence: Arc<AtomicU64>,
+    file_ops: Arc<dyn ManagedBlobFileOps>,
+}
+
+#[derive(Clone)]
+struct PublishedManagedBlob {
+    storage_key: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManagedBlobOperationError {
+    Operation,
+    Cleanup,
+}
+
+impl ManagedBlobStore {
+    fn new_with_file_ops(blobs_dir: PathBuf, file_ops: Arc<dyn ManagedBlobFileOps>) -> Self {
+        Self {
+            blobs_dir,
+            sequence: Arc::new(AtomicU64::new(1)),
+            file_ops,
+        }
+    }
+
+    fn final_path(&self, storage_key: &str) -> Option<PathBuf> {
+        is_safe_storage_key(storage_key).then(|| self.blobs_dir.join(storage_key))
+    }
+
+    fn prepare_and_publish(
+        &self,
+        bytes: &[u8],
+    ) -> Result<PublishedManagedBlob, ManagedBlobOperationError> {
+        self.file_ops
+            .create_dir_all(&self.blobs_dir)
+            .map_err(|_| ManagedBlobOperationError::Operation)?;
+
+        for _ in 0..FILE_BLOB_CREATE_ATTEMPTS {
+            let sequence = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
+            let timestamp = now_millis();
+            let process_id = std::process::id();
+            let storage_key = format!("blob-{timestamp}-{process_id}-{sequence}");
+            let Some(final_path) = self.final_path(&storage_key) else {
+                return Err(ManagedBlobOperationError::Operation);
+            };
+            if self
+                .file_ops
+                .path_exists(&final_path)
+                .map_err(|_| ManagedBlobOperationError::Operation)?
+            {
+                continue;
+            }
+
+            let temp_path = self
+                .blobs_dir
+                .join(format!("{FILE_BLOB_TEMP_PREFIX}.{process_id}.{sequence}"));
+            let mut temp = match self.file_ops.create_temp(&temp_path) {
+                Ok(temp) => temp,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(_) => return Err(ManagedBlobOperationError::Operation),
+            };
+
+            let write_result = self
+                .file_ops
+                .write_all(&mut temp, bytes)
+                .and_then(|_| self.file_ops.flush(&mut temp))
+                .and_then(|_| self.file_ops.sync_all(&temp));
+            drop(temp);
+            if write_result.is_err() {
+                return match self.delete_path_with_retry(&temp_path) {
+                    Ok(()) => Err(ManagedBlobOperationError::Operation),
+                    Err(()) => Err(ManagedBlobOperationError::Cleanup),
+                };
+            }
+
+            let final_exists = match self.file_ops.path_exists(&final_path) {
+                Ok(exists) => exists,
+                Err(_) => {
+                    return match self.delete_path_with_retry(&temp_path) {
+                        Ok(()) => Err(ManagedBlobOperationError::Operation),
+                        Err(()) => Err(ManagedBlobOperationError::Cleanup),
+                    };
+                }
+            };
+            if final_exists {
+                return match self.delete_path_with_retry(&temp_path) {
+                    Ok(()) => Err(ManagedBlobOperationError::Operation),
+                    Err(()) => Err(ManagedBlobOperationError::Cleanup),
+                };
+            }
+            if self.file_ops.publish(&temp_path, &final_path).is_err() {
+                return match self.delete_path_with_retry(&temp_path) {
+                    Ok(()) => Err(ManagedBlobOperationError::Operation),
+                    Err(()) => Err(ManagedBlobOperationError::Cleanup),
+                };
+            }
+
+            return Ok(PublishedManagedBlob { storage_key });
+        }
+
+        Err(ManagedBlobOperationError::Operation)
+    }
+
+    fn delete_storage_key(&self, storage_key: &str) -> Result<(), ()> {
+        let Some(path) = self.final_path(storage_key) else {
+            return Err(());
+        };
+        self.delete_path_with_retry(&path)
+    }
+
+    fn delete_path_with_retry(&self, path: &FilePath) -> Result<(), ()> {
+        for _ in 0..FILE_BLOB_CLEANUP_ATTEMPTS {
+            match self.file_ops.remove_file(path) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(_) => {}
+            }
+        }
+        Err(())
+    }
+}
+
 #[derive(Clone)]
 struct MockPersistence {
     state_dir: PathBuf,
@@ -504,10 +700,6 @@ impl MockPersistence {
         self.state_dir
             .join(FILES_DIR_NAME)
             .join(FILE_BLOBS_DIR_NAME)
-    }
-
-    fn file_blob_path(&self, storage_key: &str) -> Option<PathBuf> {
-        is_safe_storage_key(storage_key).then(|| self.file_blobs_dir().join(storage_key))
     }
 
     async fn save<T>(&self, persisted: &T) -> PersistenceResult<()>
@@ -1562,9 +1754,11 @@ struct AiIconQuery {
 
 struct MockApiState {
     persistence: MockPersistence,
+    blob_store: ManagedBlobStore,
     secret_store: Arc<dyn SecretStore>,
     http_client: reqwest::Client,
     provider_secret_transaction_mutex: Mutex<()>,
+    file_blob_transaction_mutex: Mutex<()>,
     mutation_transaction_mutex: Mutex<()>,
     commit_barrier: RwLock<()>,
     settings: RwLock<Value>,
@@ -1585,7 +1779,21 @@ impl MockApiState {
     fn new(
         persistence: MockPersistence,
         secret_store: Arc<dyn SecretStore>,
+        persisted: PersistedMockState,
+    ) -> Self {
+        Self::new_with_blob_file_ops(
+            persistence,
+            secret_store,
+            persisted,
+            Arc::new(RealManagedBlobFileOps),
+        )
+    }
+
+    fn new_with_blob_file_ops(
+        persistence: MockPersistence,
+        secret_store: Arc<dyn SecretStore>,
         mut persisted: PersistedMockState,
+        blob_file_ops: Arc<dyn ManagedBlobFileOps>,
     ) -> Self {
         sync_settings_with_desktop_providers(&mut persisted.settings, &persisted.providers);
         let initial_id_seq = persisted
@@ -1595,14 +1803,18 @@ impl MockApiState {
             .max(1);
         let (settings_tx, _) = broadcast::channel(64);
         let (list_tx, _) = broadcast::channel(64);
+        let blob_store =
+            ManagedBlobStore::new_with_file_ops(persistence.file_blobs_dir(), blob_file_ops);
 
         Self {
             persistence,
+            blob_store,
             secret_store,
             http_client: reqwest::Client::builder()
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             provider_secret_transaction_mutex: Mutex::new(()),
+            file_blob_transaction_mutex: Mutex::new(()),
             mutation_transaction_mutex: Mutex::new(()),
             commit_barrier: RwLock::new(()),
             settings: RwLock::new(persisted.settings),
@@ -1627,10 +1839,6 @@ impl MockApiState {
     fn next_id(&self, prefix: &str) -> String {
         let id = self.id_seq.fetch_add(1, Ordering::Relaxed) + 1;
         format!("{prefix}-{id}")
-    }
-
-    fn next_file_id(&self) -> u64 {
-        self.id_seq.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     fn next_provider_secret_ref(&self, provider_id: &str) -> String {
@@ -1939,12 +2147,14 @@ enum PureStateMutationScope {
     Conversations,
     SettingsAndConversations,
     ProviderMetadata,
+    FileMetadata,
 }
 
 #[derive(Debug)]
 enum StateMutationError {
     BadRequest(&'static str),
     NotFound(&'static str),
+    Conflict(&'static str),
     Validation(&'static str),
     Persistence(PersistenceError),
 }
@@ -1995,6 +2205,21 @@ fn validate_pure_state_transaction(
             ));
         }
         validate_provider_metadata_transaction(staged)?;
+    } else if matches!(scope, PureStateMutationScope::FileMetadata) {
+        if staged.id_seq < before.id_seq {
+            return Err(StateMutationError::Validation(
+                "File mutation lowered the ID high-water mark",
+            ));
+        }
+        if staged.settings != before.settings
+            || staged.conversations != before.conversations
+            || staged.providers != before.providers
+        {
+            return Err(StateMutationError::Validation(
+                "File mutation crossed a protected component boundary",
+            ));
+        }
+        validate_file_metadata_transaction(staged)?;
     } else {
         if staged.id_seq != before.id_seq {
             return Err(StateMutationError::Validation(
@@ -2025,10 +2250,47 @@ fn validate_pure_state_transaction(
     Ok(())
 }
 
+fn validate_file_metadata_transaction(
+    persisted: &PersistedMockState,
+) -> Result<(), StateMutationError> {
+    let mut file_ids = HashSet::new();
+    let mut storage_keys = HashSet::new();
+
+    for file in &persisted.files {
+        let expected_relative_path = format!(
+            "{FILES_DIR_NAME}/{FILE_BLOBS_DIR_NAME}/{}",
+            file.storage_key
+        );
+        if file.id == 0 || !file_ids.insert(file.id) {
+            return Err(StateMutationError::Validation(
+                "Staged managed file identifiers are invalid",
+            ));
+        }
+        if !is_safe_storage_key(&file.storage_key)
+            || !storage_keys.insert(file.storage_key.as_str())
+            || file.relative_path != expected_relative_path
+        {
+            return Err(StateMutationError::Validation(
+                "Staged managed file storage metadata is invalid",
+            ));
+        }
+    }
+    if persisted.id_seq < max_persisted_file_id(&persisted.files) {
+        return Err(StateMutationError::Validation(
+            "Staged managed file ID high-water mark is invalid",
+        ));
+    }
+
+    Ok(())
+}
+
 fn validate_provider_metadata_transaction(
     persisted: &PersistedMockState,
 ) -> Result<(), StateMutationError> {
-    let Some(settings_providers) = persisted.settings.get("providers").and_then(Value::as_array)
+    let Some(settings_providers) = persisted
+        .settings
+        .get("providers")
+        .and_then(Value::as_array)
     else {
         return Err(StateMutationError::Validation(
             "Staged settings provider list is invalid",
@@ -2066,9 +2328,7 @@ fn validate_provider_metadata_transaction(
         }
         if !settings_providers.iter().any(|settings_provider| {
             settings_provider.get("id").and_then(Value::as_str) == Some(provider.id.as_str())
-                && settings_provider
-                    .get("secretRef")
-                    .and_then(Value::as_str)
+                && settings_provider.get("secretRef").and_then(Value::as_str)
                     == Some(provider.secret_ref.as_str())
         }) {
             return Err(StateMutationError::Validation(
@@ -2159,6 +2419,7 @@ fn state_mutation_error_response(context: &'static str, error: StateMutationErro
     match error {
         StateMutationError::BadRequest(message) => bad_request_response(message),
         StateMutationError::NotFound(message) => not_found_response(message),
+        StateMutationError::Conflict(message) => conflict_response(message),
         StateMutationError::Validation(reason) => {
             debug_assert!(!reason.is_empty());
             eprintln!("RikkaDesk state transaction validation failed in {context}");
@@ -2795,10 +3056,21 @@ async fn send_message(
     let created_at = now_iso();
     let user_text = first_text_part(&payload.parts);
     let user_has_non_text_parts = has_non_text_parts(&payload.parts);
+    let managed_file_ids = managed_file_ids_from_parts(&payload.parts);
     let request_parts = payload.parts.clone();
     let capture_intent = is_capture_local_image_intent(&payload);
 
     let mutation_guard = state.mutation_transaction_mutex.lock().await;
+    if !managed_file_ids.is_empty() {
+        let files = state.files.read().await;
+        if managed_file_ids.iter().any(|file_id| {
+            !files
+                .iter()
+                .any(|file| file.id == *file_id && file.deleted_at.is_none())
+        }) {
+            return bad_request_response("Attachment is unavailable");
+        }
+    }
     let updated_after_user_message = {
         let _commit_guard = state.commit_barrier.write().await;
         let mut conversations = state.conversations.write().await;
@@ -3484,9 +3756,27 @@ async fn not_implemented() -> impl IntoResponse {
     )
 }
 
-struct PreparedFileUpload {
-    metadata: ManagedFileMetadata,
+struct ValidatedFileUpload {
+    display_name: String,
+    mime: String,
+    size_bytes: u64,
+    kind: String,
     bytes: Vec<u8>,
+}
+
+struct PublishedFileUpload {
+    display_name: String,
+    mime: String,
+    size_bytes: u64,
+    kind: String,
+    storage_key: String,
+}
+
+#[derive(Debug)]
+enum FileUploadTransactionError {
+    BlobOperation,
+    State(StateMutationError),
+    Compensation,
 }
 
 async fn upload_files(
@@ -3534,27 +3824,11 @@ async fn upload_files(
             Ok(mime) => mime,
             Err(message) => return bad_request_response(message),
         };
-        let kind = upload_kind_for_mime(mime);
-        let id = state.next_file_id();
-        let storage_key = storage_key_for_file(id);
-        let now = now_iso();
-        let metadata = ManagedFileMetadata {
-            id,
-            storage_key: storage_key.clone(),
+        prepared.push(ValidatedFileUpload {
             display_name,
             mime: mime.to_string(),
             size_bytes: size as u64,
-            sha256: None,
-            kind: kind.to_string(),
-            relative_path: format!("{FILES_DIR_NAME}/{FILE_BLOBS_DIR_NAME}/{storage_key}"),
-            created_at: now.clone(),
-            updated_at: now,
-            source: "upload".to_string(),
-            deleted_at: None,
-        };
-
-        prepared.push(PreparedFileUpload {
-            metadata,
+            kind: upload_kind_for_mime(mime).to_string(),
             bytes: bytes.to_vec(),
         });
     }
@@ -3563,29 +3837,108 @@ async fn upload_files(
         return bad_request_response("No files were uploaded");
     }
 
-    if save_prepared_file_uploads(&state, &prepared).await.is_err() {
-        return internal_error_response("File upload failed");
-    }
-
-    let mutation_guard = state.mutation_transaction_mutex.lock().await;
-    let uploaded = {
-        let _commit_guard = state.commit_barrier.write().await;
-        let mut files = state.files.write().await;
-        let uploaded = prepared
-            .iter()
-            .map(|upload| UploadedFileResponse::from_metadata(&upload.metadata))
-            .collect::<Vec<_>>();
-        files.extend(prepared.into_iter().map(|upload| upload.metadata));
-        uploaded
+    let uploaded = match commit_file_upload_batch(&state, prepared).await {
+        Ok(uploaded) => uploaded,
+        Err(error) => return file_upload_transaction_error_response(error),
     };
 
-    if let Err(response) = persist_live_state_for_request_while_mutation_locked(&state).await {
-        return response;
-    }
-    state.revision.fetch_add(1, Ordering::Release);
-    drop(mutation_guard);
-
     Json(UploadFilesResponse { files: uploaded }).into_response()
+}
+
+fn file_upload_transaction_error_response(error: FileUploadTransactionError) -> Response {
+    match error {
+        FileUploadTransactionError::BlobOperation => internal_error_response("File upload failed"),
+        FileUploadTransactionError::State(error) => {
+            state_mutation_error_response("file upload", error)
+        }
+        FileUploadTransactionError::Compensation => {
+            internal_error_response("File upload failed and local blob cleanup requires attention")
+        }
+    }
+}
+
+async fn commit_file_upload_batch(
+    state: &Arc<MockApiState>,
+    uploads: Vec<ValidatedFileUpload>,
+) -> Result<Vec<UploadedFileResponse>, FileUploadTransactionError> {
+    let _file_guard = state.file_blob_transaction_mutex.lock().await;
+    let mut published_uploads = Vec::with_capacity(uploads.len());
+
+    for upload in uploads {
+        let published = match prepare_managed_blob(&state.blob_store, upload.bytes).await {
+            Ok(published) => published,
+            Err(error) => {
+                let cleanup_keys = published_uploads
+                    .iter()
+                    .map(|item: &PublishedFileUpload| item.storage_key.clone())
+                    .collect::<Vec<_>>();
+                let cleanup_failed = cleanup_new_managed_blobs(&state.blob_store, cleanup_keys)
+                    .await
+                    .is_err();
+                if error == ManagedBlobOperationError::Cleanup || cleanup_failed {
+                    eprintln!("RikkaDesk managed blob compensation cleanup failed");
+                    return Err(FileUploadTransactionError::Compensation);
+                }
+                return Err(FileUploadTransactionError::BlobOperation);
+            }
+        };
+        published_uploads.push(PublishedFileUpload {
+            display_name: upload.display_name,
+            mime: upload.mime,
+            size_bytes: upload.size_bytes,
+            kind: upload.kind,
+            storage_key: published.storage_key,
+        });
+    }
+
+    let cleanup_keys = published_uploads
+        .iter()
+        .map(|upload| upload.storage_key.clone())
+        .collect::<Vec<_>>();
+    let transaction_result =
+        transact_persisted_state(state, PureStateMutationScope::FileMetadata, move |staged| {
+            let mut uploaded = Vec::with_capacity(published_uploads.len());
+            for upload in published_uploads {
+                let id = next_staged_file_id(staged);
+                let now = now_iso();
+                let metadata = ManagedFileMetadata {
+                    id,
+                    storage_key: upload.storage_key.clone(),
+                    display_name: upload.display_name,
+                    mime: upload.mime,
+                    size_bytes: upload.size_bytes,
+                    sha256: None,
+                    kind: upload.kind,
+                    relative_path: format!(
+                        "{FILES_DIR_NAME}/{FILE_BLOBS_DIR_NAME}/{}",
+                        upload.storage_key
+                    ),
+                    created_at: now.clone(),
+                    updated_at: now,
+                    source: "upload".to_string(),
+                    deleted_at: None,
+                };
+                uploaded.push(UploadedFileResponse::from_metadata(&metadata));
+                staged.files.push(metadata);
+            }
+            Ok(uploaded)
+        })
+        .await;
+
+    match transaction_result {
+        Ok(uploaded) => Ok(uploaded),
+        Err(error) => {
+            if cleanup_new_managed_blobs(&state.blob_store, cleanup_keys)
+                .await
+                .is_err()
+            {
+                eprintln!("RikkaDesk managed blob compensation cleanup failed");
+                Err(FileUploadTransactionError::Compensation)
+            } else {
+                Err(FileUploadTransactionError::State(error))
+            }
+        }
+    }
 }
 
 async fn file_metadata(
@@ -3593,6 +3946,7 @@ async fn file_metadata(
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
     let metadata = {
+        let _commit_guard = state.commit_barrier.read().await;
         let files = state.files.read().await;
         files
             .iter()
@@ -3610,7 +3964,9 @@ async fn file_path(
     State(state): State<Arc<MockApiState>>,
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
+    let _file_guard = state.file_blob_transaction_mutex.lock().await;
     let metadata = {
+        let _commit_guard = state.commit_barrier.read().await;
         let files = state.files.read().await;
         files
             .iter()
@@ -3622,7 +3978,7 @@ async fn file_path(
         return not_found_response("File not found");
     };
 
-    let Some(path) = state.persistence.file_blob_path(&metadata.storage_key) else {
+    let Some(path) = state.blob_store.final_path(&metadata.storage_key) else {
         return internal_error_response("File is unavailable");
     };
 
@@ -3659,90 +4015,105 @@ async fn delete_file(
     State(state): State<Arc<MockApiState>>,
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
+    let _file_guard = state.file_blob_transaction_mutex.lock().await;
     let metadata = {
+        let _commit_guard = state.commit_barrier.read().await;
         let files = state.files.read().await;
-        files
-            .iter()
-            .find(|file| file.id == id && file.deleted_at.is_none())
-            .cloned()
+        files.iter().find(|file| file.id == id).cloned()
     };
 
     let Some(metadata) = metadata else {
         return not_found_response("File not found");
     };
 
-    if let Some(path) = state.persistence.file_blob_path(&metadata.storage_key) {
-        match fs::remove_file(path).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(_) => return internal_error_response("File delete failed"),
+    if metadata.deleted_at.is_some() {
+        if delete_managed_blob(&state.blob_store, metadata.storage_key)
+            .await
+            .is_err()
+        {
+            eprintln!("RikkaDesk managed blob cleanup failed after file tombstone commit");
         }
+        return Json(json!({ "status": "deleted" })).into_response();
     }
 
-    let mutation_guard = state.mutation_transaction_mutex.lock().await;
+    let transaction_result = transact_persisted_state(
+        &state,
+        PureStateMutationScope::FileMetadata,
+        move |staged| {
+            if is_managed_file_referenced(&staged.conversations, id) {
+                return Err(StateMutationError::Conflict(
+                    "File is referenced by a saved message",
+                ));
+            }
+            let Some(file) = staged.files.iter_mut().find(|file| file.id == id) else {
+                return Err(StateMutationError::NotFound("File not found"));
+            };
+            if file.deleted_at.is_none() {
+                let now = now_iso();
+                file.deleted_at = Some(now.clone());
+                file.updated_at = now;
+            }
+            Ok(())
+        },
+    )
+    .await;
+
+    if let Err(error) = transaction_result {
+        return state_mutation_error_response("file delete", error);
+    }
+
+    if delete_managed_blob(&state.blob_store, metadata.storage_key)
+        .await
+        .is_err()
     {
-        let _commit_guard = state.commit_barrier.write().await;
-        let now = now_iso();
-        let mut files = state.files.write().await;
-        if let Some(file) = files.iter_mut().find(|file| file.id == id) {
-            file.deleted_at = Some(now.clone());
-            file.updated_at = now;
-        }
+        eprintln!("RikkaDesk managed blob cleanup failed after file tombstone commit");
     }
-
-    if let Err(response) = persist_live_state_for_request_while_mutation_locked(&state).await {
-        return response;
-    }
-    state.revision.fetch_add(1, Ordering::Release);
-    drop(mutation_guard);
 
     Json(json!({ "status": "deleted" })).into_response()
 }
 
-async fn save_prepared_file_uploads(
-    state: &Arc<MockApiState>,
-    uploads: &[PreparedFileUpload],
-) -> Result<(), ()> {
-    let blobs_dir = state.persistence.file_blobs_dir();
-    fs::create_dir_all(&blobs_dir).await.map_err(|_| ())?;
-
-    let mut written = Vec::new();
-    for upload in uploads {
-        let Some(path) = state
-            .persistence
-            .file_blob_path(&upload.metadata.storage_key)
-        else {
-            cleanup_uploaded_blobs(written).await;
-            return Err(());
-        };
-        let tmp_path = path.with_extension("tmp");
-        if fs::write(&tmp_path, &upload.bytes).await.is_err() {
-            let _ = fs::remove_file(&tmp_path).await;
-            cleanup_uploaded_blobs(written).await;
-            return Err(());
-        }
-        if fs::rename(&tmp_path, &path).await.is_err() {
-            let _ = fs::remove_file(&tmp_path).await;
-            cleanup_uploaded_blobs(written).await;
-            return Err(());
-        }
-        written.push(path);
-    }
-
-    Ok(())
+async fn prepare_managed_blob(
+    blob_store: &ManagedBlobStore,
+    bytes: Vec<u8>,
+) -> Result<PublishedManagedBlob, ManagedBlobOperationError> {
+    let blob_store = blob_store.clone();
+    tokio::task::spawn_blocking(move || blob_store.prepare_and_publish(&bytes))
+        .await
+        .map_err(|_| ManagedBlobOperationError::Operation)?
 }
 
-async fn cleanup_uploaded_blobs(paths: Vec<PathBuf>) {
-    for path in paths {
-        let _ = fs::remove_file(path).await;
-    }
+async fn cleanup_new_managed_blobs(
+    blob_store: &ManagedBlobStore,
+    storage_keys: Vec<String>,
+) -> Result<(), ()> {
+    let blob_store = blob_store.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut failed = false;
+        for storage_key in storage_keys {
+            if blob_store.delete_storage_key(&storage_key).is_err() {
+                failed = true;
+            }
+        }
+        (!failed).then_some(()).ok_or(())
+    })
+    .await
+    .map_err(|_| ())?
+}
+
+async fn delete_managed_blob(blob_store: &ManagedBlobStore, storage_key: String) -> Result<(), ()> {
+    let blob_store = blob_store.clone();
+    tokio::task::spawn_blocking(move || blob_store.delete_storage_key(&storage_key))
+        .await
+        .map_err(|_| ())?
 }
 
 async fn managed_file_for_provider_image_input(
     state: &Arc<MockApiState>,
     file_id: u64,
 ) -> Result<ManagedImageProviderInput, String> {
+    let _file_guard = state.file_blob_transaction_mutex.lock().await;
     let metadata = {
+        let _commit_guard = state.commit_barrier.read().await;
         let files = state.files.read().await;
         files
             .iter()
@@ -3761,7 +4132,7 @@ async fn managed_file_for_provider_image_input(
         return Err("Image attachment is too large for capture testing".to_string());
     }
 
-    let Some(path) = state.persistence.file_blob_path(&metadata.storage_key) else {
+    let Some(path) = state.blob_store.final_path(&metadata.storage_key) else {
         return Err("Image attachment is unavailable".to_string());
     };
     let bytes = fs::read(path)
@@ -4299,6 +4670,31 @@ fn provider_bound_image_file_ids(parts: &[Value]) -> Result<Vec<u64>, String> {
     }
 
     Ok(file_ids)
+}
+
+fn is_managed_file_referenced(
+    conversations: &HashMap<String, ConversationDto>,
+    file_id: u64,
+) -> bool {
+    conversations.values().any(|conversation| {
+        conversation.messages.iter().any(|node| {
+            node.messages
+                .iter()
+                .any(|message| managed_file_ids_from_parts(&message.parts).contains(&file_id))
+        })
+    })
+}
+
+fn managed_file_ids_from_parts(parts: &[Value]) -> HashSet<u64> {
+    parts
+        .iter()
+        .filter_map(|part| {
+            part.get("metadata")
+                .and_then(Value::as_object)
+                .and_then(|metadata| metadata.get("fileId"))
+                .and_then(Value::as_u64)
+        })
+        .collect()
 }
 
 fn is_provider_image_mime(mime: &str) -> bool {
@@ -5717,6 +6113,17 @@ fn not_found_response(message: &str) -> Response {
         .into_response()
 }
 
+fn conflict_response(message: &str) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": message,
+            "code": 409,
+        })),
+    )
+        .into_response()
+}
+
 fn internal_error_response(message: impl Into<String>) -> Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -6152,6 +6559,11 @@ fn next_staged_id(staged: &mut PersistedMockState, prefix: &str) -> String {
     format!("{prefix}-{}", staged.id_seq)
 }
 
+fn next_staged_file_id(staged: &mut PersistedMockState) -> u64 {
+    staged.id_seq += 1;
+    staged.id_seq
+}
+
 fn secret_ref_for_provider(provider_id: &str) -> String {
     format!("{PROVIDER_SECRET_REF_PREFIX}{provider_id}:api-key")
 }
@@ -6265,10 +6677,6 @@ fn is_safe_storage_key(storage_key: &str) -> bool {
         && storage_key
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
-}
-
-fn storage_key_for_file(id: u64) -> String {
-    format!("file-{id}-{}", now_millis())
 }
 
 fn sanitize_upload_file_name(file_name: Option<&str>) -> String {
@@ -6953,6 +7361,110 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct FaultingManagedBlobFileOps {
+        write_failure_at: Option<u64>,
+        publish_failure_at: Option<u64>,
+        delete_failures: AtomicU64,
+        write_calls: AtomicU64,
+        publish_calls: AtomicU64,
+        remove_calls: AtomicU64,
+    }
+
+    impl FaultingManagedBlobFileOps {
+        fn fail_write_at(call: u64) -> Self {
+            Self {
+                write_failure_at: Some(call),
+                ..Self::default()
+            }
+        }
+
+        fn fail_publish_at(call: u64) -> Self {
+            Self {
+                publish_failure_at: Some(call),
+                ..Self::default()
+            }
+        }
+
+        fn fail_delete_times(count: u64) -> Self {
+            Self {
+                delete_failures: AtomicU64::new(count),
+                ..Self::default()
+            }
+        }
+
+        fn consume_failure(counter: &AtomicU64) -> bool {
+            counter
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                    if value == 0 {
+                        None
+                    } else {
+                        Some(value - 1)
+                    }
+                })
+                .is_ok()
+        }
+
+        fn remove_call_count(&self) -> u64 {
+            self.remove_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ManagedBlobFileOps for FaultingManagedBlobFileOps {
+        fn create_dir_all(&self, path: &FilePath) -> io::Result<()> {
+            RealManagedBlobFileOps.create_dir_all(path)
+        }
+
+        fn path_exists(&self, path: &FilePath) -> io::Result<bool> {
+            RealManagedBlobFileOps.path_exists(path)
+        }
+
+        fn create_temp(&self, path: &FilePath) -> io::Result<std_fs::File> {
+            RealManagedBlobFileOps.create_temp(path)
+        }
+
+        fn write_all(&self, file: &mut std_fs::File, data: &[u8]) -> io::Result<()> {
+            let call = self.write_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.write_failure_at == Some(call) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "synthetic managed blob write failure",
+                ));
+            }
+            RealManagedBlobFileOps.write_all(file, data)
+        }
+
+        fn flush(&self, file: &mut std_fs::File) -> io::Result<()> {
+            RealManagedBlobFileOps.flush(file)
+        }
+
+        fn sync_all(&self, file: &std_fs::File) -> io::Result<()> {
+            RealManagedBlobFileOps.sync_all(file)
+        }
+
+        fn publish(&self, temp: &FilePath, final_path: &FilePath) -> io::Result<()> {
+            let call = self.publish_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.publish_failure_at == Some(call) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "synthetic managed blob publish failure",
+                ));
+            }
+            RealManagedBlobFileOps.publish(temp, final_path)
+        }
+
+        fn remove_file(&self, path: &FilePath) -> io::Result<()> {
+            self.remove_calls.fetch_add(1, Ordering::SeqCst);
+            if Self::consume_failure(&self.delete_failures) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "synthetic managed blob delete failure",
+                ));
+            }
+            RealManagedBlobFileOps.remove_file(path)
+        }
+    }
+
+    #[derive(Default)]
     struct ProviderTransactionTestSecretStore {
         secrets: std::sync::Mutex<HashMap<String, String>>,
         set_calls: AtomicU64,
@@ -7100,6 +7612,23 @@ mod tests {
         failure_stage: Option<TestFailureStage>,
         secret_store: Arc<dyn SecretStore>,
     ) -> Arc<MockApiState> {
+        transaction_test_state_with_stores(
+            temp,
+            persisted,
+            failure_stage,
+            secret_store,
+            Arc::new(RealManagedBlobFileOps),
+        )
+        .await
+    }
+
+    async fn transaction_test_state_with_stores(
+        temp: &SyntheticTempDir,
+        persisted: PersistedMockState,
+        failure_stage: Option<TestFailureStage>,
+        secret_store: Arc<dyn SecretStore>,
+        blob_file_ops: Arc<dyn ManagedBlobFileOps>,
+    ) -> Arc<MockApiState> {
         test_persistence(temp)
             .save(&persisted)
             .await
@@ -7108,7 +7637,12 @@ mod tests {
             || test_persistence(temp),
             |stage| faulting_test_persistence(temp, stage),
         );
-        Arc::new(MockApiState::new(persistence, secret_store, persisted))
+        Arc::new(MockApiState::new_with_blob_file_ops(
+            persistence,
+            secret_store,
+            persisted,
+            blob_file_ops,
+        ))
     }
 
     async fn live_conversation(state: &MockApiState, id: &str) -> ConversationDto {
@@ -7218,6 +7752,136 @@ mod tests {
             .await
             .expect("synthetic response body should be readable");
         serde_json::from_slice(&body).expect("synthetic response body should be JSON")
+    }
+
+    fn synthetic_png_upload(display_name: &str) -> ValidatedFileUpload {
+        ValidatedFileUpload {
+            display_name: display_name.to_string(),
+            mime: "image/png".to_string(),
+            size_bytes: 12,
+            kind: "image".to_string(),
+            bytes: vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0],
+        }
+    }
+
+    fn synthetic_text_upload(display_name: &str) -> ValidatedFileUpload {
+        let bytes = b"synthetic managed file text".to_vec();
+        ValidatedFileUpload {
+            display_name: display_name.to_string(),
+            mime: "text/plain".to_string(),
+            size_bytes: bytes.len() as u64,
+            kind: "document".to_string(),
+            bytes,
+        }
+    }
+
+    fn synthetic_blob_paths(state: &MockApiState) -> Vec<PathBuf> {
+        let Ok(entries) = std_fs::read_dir(&state.blob_store.blobs_dir) else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.is_file())
+            .collect()
+    }
+
+    fn synthetic_final_blob_count(state: &MockApiState) -> usize {
+        synthetic_blob_paths(state)
+            .iter()
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| !name.starts_with(FILE_BLOB_TEMP_PREFIX))
+            })
+            .count()
+    }
+
+    fn synthetic_temp_blob_count(state: &MockApiState) -> usize {
+        synthetic_blob_paths(state)
+            .iter()
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(FILE_BLOB_TEMP_PREFIX))
+            })
+            .count()
+    }
+
+    async fn add_synthetic_file_reference(
+        state: &Arc<MockApiState>,
+        file_id: u64,
+        part_type: &str,
+    ) {
+        let part_type = part_type.to_string();
+        transact_persisted_state(
+            state,
+            PureStateMutationScope::Conversations,
+            move |staged| {
+                let message = &mut staged
+                    .conversations
+                    .get_mut(MOCK_WELCOME_CONVERSATION_ID)
+                    .expect("synthetic welcome conversation should exist")
+                    .messages[0]
+                    .messages[0];
+                message.parts.push(json!({
+                    "type": part_type,
+                    "metadata": { "fileId": file_id }
+                }));
+                Ok(())
+            },
+        )
+        .await
+        .expect("synthetic file reference should persist");
+    }
+
+    fn synthetic_managed_file_metadata(id: u64, storage_key: &str) -> ManagedFileMetadata {
+        ManagedFileMetadata {
+            id,
+            storage_key: storage_key.to_string(),
+            display_name: "synthetic-file.txt".to_string(),
+            mime: "text/plain".to_string(),
+            size_bytes: 27,
+            sha256: None,
+            kind: "document".to_string(),
+            relative_path: format!("{FILES_DIR_NAME}/{FILE_BLOBS_DIR_NAME}/{storage_key}"),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            source: "synthetic".to_string(),
+            deleted_at: None,
+        }
+    }
+
+    async fn seeded_file_transaction_state(
+        temp: &SyntheticTempDir,
+        failure_stage: Option<TestFailureStage>,
+        blob_file_ops: Arc<dyn ManagedBlobFileOps>,
+    ) -> Arc<MockApiState> {
+        let storage_key = "synthetic-seeded-blob";
+        let mut persisted = default_persisted_state();
+        persisted.id_seq = 42;
+        persisted
+            .files
+            .push(synthetic_managed_file_metadata(42, storage_key));
+        let state = transaction_test_state_with_stores(
+            temp,
+            persisted,
+            failure_stage,
+            Arc::new(TestSecretStore),
+            blob_file_ops,
+        )
+        .await;
+        std_fs::create_dir_all(&state.blob_store.blobs_dir)
+            .expect("synthetic blob directory should be created");
+        std_fs::write(
+            state
+                .blob_store
+                .final_path(storage_key)
+                .expect("synthetic storage key should be safe"),
+            b"synthetic managed file text",
+        )
+        .expect("synthetic managed blob should be seeded");
+        state
     }
 
     fn is_test_backup_path(path: &FilePath) -> bool {
@@ -8747,6 +9411,674 @@ mod tests {
                 "{value} should be rejected"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn file_transaction_single_upload_success() {
+        let temp = SyntheticTempDir::new("file-single-upload");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+
+        let uploaded =
+            commit_file_upload_batch(&state, vec![synthetic_png_upload("synthetic-image.png")])
+                .await
+                .expect("synthetic upload should commit");
+        let file_id = uploaded[0].id;
+
+        assert_eq!(uploaded.len(), 1);
+        assert_eq!(state.files.read().await.len(), 1);
+        assert_eq!(synthetic_final_blob_count(&state), 1);
+        assert_eq!(synthetic_temp_blob_count(&state), 0);
+        assert_eq!(state.revision.load(Ordering::Acquire), 1);
+        assert_eq!(
+            read_test_state(&test_persistence(&temp))["files"]
+                .as_array()
+                .expect("disk files should be an array")
+                .len(),
+            1
+        );
+
+        let response = file_path(State(state), Path(file_id)).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("x-content-type-options"),
+            Some(&HeaderValue::from_static("nosniff"))
+        );
+    }
+
+    #[tokio::test]
+    async fn file_transaction_batch_upload_success() {
+        let temp = SyntheticTempDir::new("file-batch-upload");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+
+        let uploaded = commit_file_upload_batch(
+            &state,
+            vec![
+                synthetic_png_upload("synthetic-one.png"),
+                synthetic_text_upload("synthetic-two.txt"),
+            ],
+        )
+        .await
+        .expect("synthetic batch should commit");
+        let ids = uploaded.iter().map(|file| file.id).collect::<HashSet<_>>();
+        let storage_keys = state
+            .files
+            .read()
+            .await
+            .iter()
+            .map(|file| file.storage_key.clone())
+            .collect::<HashSet<_>>();
+
+        assert_eq!(uploaded.len(), 2);
+        assert_eq!(ids.len(), 2);
+        assert_eq!(storage_keys.len(), 2);
+        assert_eq!(synthetic_final_blob_count(&state), 2);
+        assert_eq!(synthetic_temp_blob_count(&state), 0);
+        assert_eq!(state.revision.load(Ordering::Acquire), 1);
+        assert_eq!(
+            read_test_state(&test_persistence(&temp))["files"]
+                .as_array()
+                .expect("disk files should be an array")
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn file_transaction_blob_write_failure_preserves_state() {
+        let temp = SyntheticTempDir::new("file-write-failure");
+        let state = transaction_test_state_with_stores(
+            &temp,
+            default_persisted_state(),
+            None,
+            Arc::new(TestSecretStore),
+            Arc::new(FaultingManagedBlobFileOps::fail_write_at(1)),
+        )
+        .await;
+        let initial_id_seq = state.id_seq.load(Ordering::Relaxed);
+
+        let result = commit_file_upload_batch(
+            &state,
+            vec![synthetic_png_upload("synthetic-write-failure.png")],
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(FileUploadTransactionError::BlobOperation)
+        ));
+        assert!(state.files.read().await.is_empty());
+        assert!(read_test_state(&test_persistence(&temp))["files"]
+            .as_array()
+            .is_some_and(Vec::is_empty));
+        assert_eq!(synthetic_final_blob_count(&state), 0);
+        assert_eq!(synthetic_temp_blob_count(&state), 0);
+        assert_eq!(state.id_seq.load(Ordering::Relaxed), initial_id_seq);
+        assert_eq!(state.revision.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn file_transaction_blob_publish_failure_mid_batch_is_atomic() {
+        let temp = SyntheticTempDir::new("file-publish-mid-batch");
+        let state = transaction_test_state_with_stores(
+            &temp,
+            default_persisted_state(),
+            None,
+            Arc::new(TestSecretStore),
+            Arc::new(FaultingManagedBlobFileOps::fail_publish_at(2)),
+        )
+        .await;
+        let initial_id_seq = state.id_seq.load(Ordering::Relaxed);
+
+        let result = commit_file_upload_batch(
+            &state,
+            vec![
+                synthetic_png_upload("synthetic-first.png"),
+                synthetic_text_upload("synthetic-second.txt"),
+            ],
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(FileUploadTransactionError::BlobOperation)
+        ));
+        assert!(state.files.read().await.is_empty());
+        assert_eq!(synthetic_final_blob_count(&state), 0);
+        assert_eq!(synthetic_temp_blob_count(&state), 0);
+        assert_eq!(state.id_seq.load(Ordering::Relaxed), initial_id_seq);
+        assert_eq!(state.revision.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn blob_compensation_state_failure_removes_published_blobs() {
+        let temp = SyntheticTempDir::new("blob-state-compensation");
+        let state = transaction_test_state(
+            &temp,
+            default_persisted_state(),
+            Some(TestFailureStage::Replace),
+        )
+        .await;
+        let initial_id_seq = state.id_seq.load(Ordering::Relaxed);
+
+        let result = commit_file_upload_batch(
+            &state,
+            vec![
+                synthetic_png_upload("synthetic-state-failure.png"),
+                synthetic_text_upload("synthetic-state-failure.txt"),
+            ],
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(FileUploadTransactionError::State(
+                StateMutationError::Persistence(_)
+            ))
+        ));
+        assert!(state.files.read().await.is_empty());
+        assert!(read_test_state(&test_persistence(&temp))["files"]
+            .as_array()
+            .is_some_and(Vec::is_empty));
+        assert_eq!(synthetic_final_blob_count(&state), 0);
+        assert_eq!(synthetic_temp_blob_count(&state), 0);
+        assert_eq!(state.id_seq.load(Ordering::Relaxed), initial_id_seq);
+        assert_eq!(state.revision.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn blob_compensation_cleanup_failure_leaves_unreferenced_orphan() {
+        let temp = SyntheticTempDir::new("blob-compensation-failure");
+        let blob_ops = Arc::new(FaultingManagedBlobFileOps::fail_delete_times(3));
+        let state = transaction_test_state_with_stores(
+            &temp,
+            default_persisted_state(),
+            Some(TestFailureStage::Replace),
+            Arc::new(TestSecretStore),
+            blob_ops.clone(),
+        )
+        .await;
+
+        let result = commit_file_upload_batch(
+            &state,
+            vec![synthetic_png_upload("synthetic-cleanup-failure.png")],
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(FileUploadTransactionError::Compensation)
+        ));
+        assert!(state.files.read().await.is_empty());
+        assert!(read_test_state(&test_persistence(&temp))["files"]
+            .as_array()
+            .is_some_and(Vec::is_empty));
+        assert_eq!(synthetic_final_blob_count(&state), 1);
+        assert_eq!(blob_ops.remove_call_count(), 3);
+        assert_eq!(state.revision.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn file_delete_draft_unreferenced_file_success() {
+        let temp = SyntheticTempDir::new("file-delete-unreferenced");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let file_id =
+            commit_file_upload_batch(&state, vec![synthetic_text_upload("synthetic-draft.txt")])
+                .await
+                .expect("synthetic draft should upload")[0]
+                .id;
+
+        let response = delete_file(State(state.clone()), Path(file_id))
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(state.files.read().await[0].deleted_at.is_some());
+        assert!(read_test_state(&test_persistence(&temp))["files"][0]["deletedAt"].is_string());
+        assert_eq!(synthetic_final_blob_count(&state), 0);
+        assert_eq!(
+            file_path(State(state), Path(file_id))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn file_delete_persistence_failure_preserves_blob() {
+        let temp = SyntheticTempDir::new("file-delete-state-failure");
+        let state = seeded_file_transaction_state(
+            &temp,
+            Some(TestFailureStage::Replace),
+            Arc::new(RealManagedBlobFileOps),
+        )
+        .await;
+
+        let response = delete_file(State(state.clone()), Path(42))
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(state.files.read().await[0].deleted_at.is_none());
+        assert!(read_test_state(&test_persistence(&temp))["files"][0]["deletedAt"].is_null());
+        assert_eq!(synthetic_final_blob_count(&state), 1);
+        assert_eq!(
+            file_path(State(state), Path(42))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn file_delete_blob_cleanup_failure_is_partial_success() {
+        let temp = SyntheticTempDir::new("file-delete-cleanup-failure");
+        let blob_ops = Arc::new(FaultingManagedBlobFileOps::fail_delete_times(3));
+        let state = seeded_file_transaction_state(&temp, None, blob_ops.clone()).await;
+
+        let response = delete_file(State(state.clone()), Path(42))
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(state.files.read().await[0].deleted_at.is_some());
+        assert_eq!(synthetic_final_blob_count(&state), 1);
+        assert_eq!(blob_ops.remove_call_count(), 3);
+        assert_eq!(
+            file_path(State(state), Path(42))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn file_delete_repeated_is_idempotent() {
+        let temp = SyntheticTempDir::new("file-delete-idempotent");
+        let state =
+            seeded_file_transaction_state(&temp, None, Arc::new(RealManagedBlobFileOps)).await;
+
+        let first = delete_file(State(state.clone()), Path(42))
+            .await
+            .into_response();
+        let revision_after_first = state.revision.load(Ordering::Acquire);
+        let second = delete_file(State(state.clone()), Path(42))
+            .await
+            .into_response();
+
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(state.revision.load(Ordering::Acquire), revision_after_first);
+        assert!(state.files.read().await[0].deleted_at.is_some());
+        assert_eq!(synthetic_final_blob_count(&state), 0);
+    }
+
+    #[tokio::test]
+    async fn file_delete_referenced_file_returns_conflict() {
+        let temp = SyntheticTempDir::new("file-delete-referenced");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let file_id = commit_file_upload_batch(
+            &state,
+            vec![synthetic_png_upload("synthetic-referenced.png")],
+        )
+        .await
+        .expect("synthetic file should upload")[0]
+            .id;
+        add_synthetic_file_reference(&state, file_id, "image").await;
+        let revision_before_delete = state.revision.load(Ordering::Acquire);
+
+        let response = delete_file(State(state.clone()), Path(file_id))
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(state.files.read().await[0].deleted_at.is_none());
+        assert_eq!(synthetic_final_blob_count(&state), 1);
+        assert_eq!(
+            state.revision.load(Ordering::Acquire),
+            revision_before_delete
+        );
+    }
+
+    #[test]
+    fn file_reference_detects_image_part() {
+        let mut persisted = default_persisted_state();
+        persisted
+            .conversations
+            .get_mut(MOCK_WELCOME_CONVERSATION_ID)
+            .expect("synthetic welcome conversation should exist")
+            .messages[0]
+            .messages[0]
+            .parts
+            .push(json!({ "type": "image", "metadata": { "fileId": 42 } }));
+
+        assert!(is_managed_file_referenced(&persisted.conversations, 42));
+    }
+
+    #[test]
+    fn file_reference_detects_document_part() {
+        let mut persisted = default_persisted_state();
+        persisted
+            .conversations
+            .get_mut(MOCK_WELCOME_CONVERSATION_ID)
+            .expect("synthetic welcome conversation should exist")
+            .messages[0]
+            .messages[0]
+            .parts
+            .push(json!({ "type": "document", "metadata": { "fileId": 42 } }));
+
+        assert!(is_managed_file_referenced(&persisted.conversations, 42));
+    }
+
+    #[test]
+    fn file_reference_ignores_legacy_url_without_numeric_metadata() {
+        let mut persisted = default_persisted_state();
+        persisted
+            .conversations
+            .get_mut(MOCK_WELCOME_CONVERSATION_ID)
+            .expect("synthetic welcome conversation should exist")
+            .messages[0]
+            .messages[0]
+            .parts
+            .push(json!({
+                "type": "image",
+                "url": "/api/files/path/42",
+                "metadata": { "fileId": "../../42" }
+            }));
+
+        assert!(!is_managed_file_referenced(&persisted.conversations, 42));
+    }
+
+    #[tokio::test]
+    async fn file_reference_deleted_message_does_not_auto_gc_blob() {
+        let temp = SyntheticTempDir::new("file-reference-message-delete");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let file_id = commit_file_upload_batch(
+            &state,
+            vec![synthetic_png_upload("synthetic-message-reference.png")],
+        )
+        .await
+        .expect("synthetic file should upload")[0]
+            .id;
+        add_synthetic_file_reference(&state, file_id, "image").await;
+
+        let response = delete_message(
+            State(state.clone()),
+            Path((
+                MOCK_WELCOME_CONVERSATION_ID.to_string(),
+                "welcome-message-1".to_string(),
+            )),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let conversations = state.conversations.read().await;
+        assert!(!is_managed_file_referenced(&conversations, file_id));
+        drop(conversations);
+        assert!(state.files.read().await[0].deleted_at.is_none());
+        assert_eq!(synthetic_final_blob_count(&state), 1);
+    }
+
+    #[tokio::test]
+    async fn file_reference_send_rejects_tombstoned_attachment() {
+        let temp = SyntheticTempDir::new("file-reference-send-tombstone");
+        let state =
+            seeded_file_transaction_state(&temp, None, Arc::new(RealManagedBlobFileOps)).await;
+        let delete_response = delete_file(State(state.clone()), Path(42))
+            .await
+            .into_response();
+        assert_eq!(delete_response.status(), StatusCode::OK);
+        let revision_after_delete = state.revision.load(Ordering::Acquire);
+
+        let response = send_message(
+            State(state.clone()),
+            Path("synthetic-tombstoned-attachment-chat".to_string()),
+            Json(SendMessageRequest {
+                parts: vec![json!({
+                    "type": "document",
+                    "metadata": { "fileId": 42 }
+                })],
+                mode_injection_ids: None,
+                lorebook_ids: None,
+                image_input_confirmed: None,
+                image_input_mode: None,
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!state
+            .conversations
+            .read()
+            .await
+            .contains_key("synthetic-tombstoned-attachment-chat"));
+        assert_eq!(
+            state.revision.load(Ordering::Acquire),
+            revision_after_delete
+        );
+    }
+
+    #[tokio::test]
+    async fn file_transaction_concurrent_uploads_are_serialized() {
+        let temp = SyntheticTempDir::new("file-concurrent-uploads");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+
+        let first_state = state.clone();
+        let first = tokio::spawn(async move {
+            commit_file_upload_batch(
+                &first_state,
+                vec![synthetic_png_upload("synthetic-concurrent-one.png")],
+            )
+            .await
+        });
+        let second_state = state.clone();
+        let second = tokio::spawn(async move {
+            commit_file_upload_batch(
+                &second_state,
+                vec![synthetic_text_upload("synthetic-concurrent-two.txt")],
+            )
+            .await
+        });
+
+        let first = first
+            .await
+            .expect("first upload task should finish")
+            .expect("first upload should commit");
+        let second = second
+            .await
+            .expect("second upload task should finish")
+            .expect("second upload should commit");
+        let ids = [first[0].id, second[0].id]
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let keys = state
+            .files
+            .read()
+            .await
+            .iter()
+            .map(|file| file.storage_key.clone())
+            .collect::<HashSet<_>>();
+
+        assert_eq!(ids.len(), 2);
+        assert_eq!(keys.len(), 2);
+        assert_eq!(state.files.read().await.len(), 2);
+        assert_eq!(synthetic_final_blob_count(&state), 2);
+        assert_eq!(state.revision.load(Ordering::Acquire), 2);
+    }
+
+    #[tokio::test]
+    async fn file_transaction_preserves_concurrent_category_a_update() {
+        let temp = SyntheticTempDir::new("file-category-a-concurrent");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+
+        let upload_state = state.clone();
+        let upload = tokio::spawn(async move {
+            commit_file_upload_batch(
+                &upload_state,
+                vec![synthetic_png_upload("synthetic-category-a.png")],
+            )
+            .await
+        });
+        let settings_state = state.clone();
+        let settings = tokio::spawn(async move {
+            update_favorite_models(
+                State(settings_state),
+                Json(UpdateFavoriteModelsRequest {
+                    model_ids: vec!["synthetic-favorite-model".to_string()],
+                }),
+            )
+            .await
+            .into_response()
+            .status()
+        });
+
+        upload
+            .await
+            .expect("upload task should finish")
+            .expect("upload should commit");
+        assert_eq!(
+            settings.await.expect("settings task should finish"),
+            StatusCode::OK
+        );
+        assert_eq!(state.files.read().await.len(), 1);
+        assert_eq!(
+            state.settings.read().await["favoriteModels"],
+            json!(["synthetic-favorite-model"])
+        );
+        let disk = read_test_state(&test_persistence(&temp));
+        assert_eq!(disk["files"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            disk["settings"]["favoriteModels"],
+            json!(["synthetic-favorite-model"])
+        );
+    }
+
+    #[tokio::test]
+    async fn file_transaction_no_deadlock_with_provider_transaction() {
+        let temp = SyntheticTempDir::new("file-provider-concurrent");
+        let persisted = synthetic_provider_state();
+        let old_secret_ref = persisted.providers[0].secret_ref.clone();
+        let secret_store = Arc::new(ProviderTransactionTestSecretStore::default());
+        secret_store.seed(&old_secret_ref);
+        let state = transaction_test_state_with_stores(
+            &temp,
+            persisted,
+            None,
+            secret_store.clone(),
+            Arc::new(RealManagedBlobFileOps),
+        )
+        .await;
+
+        let upload_state = state.clone();
+        let upload = tokio::spawn(async move {
+            commit_file_upload_batch(
+                &upload_state,
+                vec![synthetic_png_upload("synthetic-provider-concurrent.png")],
+            )
+            .await
+        });
+        let provider_state = state.clone();
+        let provider = tokio::spawn(async move {
+            update_desktop_provider_secret(
+                State(provider_state),
+                Path("synthetic-provider".to_string()),
+                Json(synthetic_provider_secret_request(
+                    "synthetic-file-provider-key",
+                )),
+            )
+            .await
+            .into_response()
+            .status()
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            upload
+                .await
+                .expect("upload task should finish")
+                .expect("upload should commit");
+            assert_eq!(
+                provider.await.expect("provider task should finish"),
+                StatusCode::OK
+            );
+        })
+        .await
+        .expect("file and provider transactions must not deadlock");
+
+        assert_eq!(state.files.read().await.len(), 1);
+        let current_secret_ref = state.providers.read().await[0].secret_ref.clone();
+        assert!(secret_store.contains(&current_secret_ref));
+        assert_eq!(state.revision.load(Ordering::Acquire), 2);
+    }
+
+    #[tokio::test]
+    async fn file_transaction_delete_and_get_are_serialized() {
+        let temp = SyntheticTempDir::new("file-delete-get-concurrent");
+        let state =
+            seeded_file_transaction_state(&temp, None, Arc::new(RealManagedBlobFileOps)).await;
+
+        let read_state = state.clone();
+        let read = tokio::spawn(async move {
+            file_path(State(read_state), Path(42))
+                .await
+                .into_response()
+                .status()
+        });
+        let delete_state = state.clone();
+        let delete = tokio::spawn(async move {
+            delete_file(State(delete_state), Path(42))
+                .await
+                .into_response()
+                .status()
+        });
+
+        let read_status = read.await.expect("read task should finish");
+        let delete_status = delete.await.expect("delete task should finish");
+        assert!(matches!(
+            read_status,
+            StatusCode::OK | StatusCode::NOT_FOUND
+        ));
+        assert_eq!(delete_status, StatusCode::OK);
+        assert_eq!(
+            file_path(State(state), Path(42))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn file_transaction_safe_errors_hide_blob_material() {
+        let response =
+            file_upload_transaction_error_response(FileUploadTransactionError::Compensation);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("safe file error body should be readable");
+        let body = String::from_utf8(body.to_vec()).expect("safe file error should be UTF-8");
+
+        assert!(!body.contains("synthetic managed file text"));
+        assert!(!body.contains("synthetic-file.txt"));
+        assert!(!body.contains("synthetic-seeded-blob"));
+        assert!(!body.contains("state.v1.json"));
+        assert!(!body.contains("C:\\"));
+    }
+
+    #[tokio::test]
+    async fn file_transaction_uses_synthetic_blob_root_only() {
+        let temp = SyntheticTempDir::new("file-synthetic-root");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+
+        commit_file_upload_batch(&state, vec![synthetic_png_upload("synthetic-root.png")])
+            .await
+            .expect("synthetic upload should commit");
+
+        assert!(state.blob_store.blobs_dir.starts_with(&temp.path));
+        assert_eq!(synthetic_final_blob_count(&state), 1);
     }
 
     #[tokio::test]
