@@ -4,7 +4,9 @@ RikkaDesk is an unofficial desktop derivative / experiment based on RikkaHub. Th
 
 Do not paste real API keys into documentation, commit messages, terminal transcripts, screenshots, or issue comments.
 
-Current private hotfix tag: `rikkadesk-v0.1.0-beta.13`.
+Current private beta baseline: `rikkadesk-v0.1.0-beta.13`.
+
+Current private hotfix tag: `rikkadesk-v0.1.0-beta.14`.
 
 Previous private beta tag: `rikkadesk-v0.1.0-beta.12`.
 
@@ -614,7 +616,9 @@ Before sharing a local beta installer:
 - Run `pnpm run desktop:build` from a clean working tree.
 - Keep hashes and artifact paths in the private beta notes.
 - Tell testers not to share logs containing prompts or local data.
-- For beta.13, verify `rikkadesk-v0.1.0-beta.12` still points to its original commit and `rikkadesk-v0.1.0-beta.13` points to the accepted hotfix docs commit.
+- Confirm `rikkadesk-v0.1.0-beta.13` remains on its original commit.
+- Confirm `rikkadesk-v0.1.0-beta.14` points to `af1f9d8502f3afd198c7b00139d25c7be3b8907c`.
+- Do not move or overwrite any existing tag.
 
 ## Known Limits
 
