@@ -42,7 +42,7 @@ Implemented behavior:
 - State mutation handlers await the persistence result and return a safe HTTP 5xx response on failure instead of reporting success.
 - Streaming completion cannot return an HTTP response, so persistence failure is recorded only as a fixed operation context and failure stage. No state content, message, provider config, secret, or local path is logged.
 
-P1-C1 removes this live-ahead-of-disk behavior for the pure settings and conversation mutations listed below. Provider/SecretStore, file/blob, and streaming paths remain transitional and can still leave one live component or external resource ahead of disk after a failed save. Their compensation and finalization rules remain P1-C2 through P1-C4 work.
+P1-C1 removes this live-ahead-of-disk behavior for the pure settings and conversation mutations listed below. P1-C2 extends staged state commits to Provider metadata and coordinates them with copy-on-write SecretStore operations. File/blob and streaming paths remain transitional and can still leave one live component or external resource ahead of disk after a failed save; P1-C3 and P1-C4 own those remaining rules.
 
 P1-A does not claim complete power-loss protection, a transactional boundary between state and managed blobs, backup/restore support, or complete corruption recovery.
 
@@ -299,7 +299,10 @@ Provider state stores a non-secret `secretRef`, generated in the form:
 
 ```text
 rikkadesk:provider:<provider-id>:api-key
+rikkadesk:provider:<provider-id>:api-key:<millis>:<process>:<sequence>
 ```
+
+The first form is the deterministic empty/legacy reference. P1-C2 key create/update uses the second copy-on-write form so an active encrypted blob is never overwritten before the corresponding Provider state commit.
 
 On Windows, the reference is encoded into a safe filename and mapped to:
 
@@ -309,9 +312,19 @@ mock-api/secrets/<encoded-secret-ref>.bin
 
 The blob contains DPAPI-protected bytes, not plaintext. `state.v1.json` does not contain the API key.
 
-### Provider Deletion
+### Provider Secret Mutation And Deletion
 
-Deleting a provider first deletes its secret blob. If secret deletion fails, provider deletion stops. If secret deletion succeeds but later state persistence fails, disk state may still contain the provider and `secretRef` while its blob is gone.
+P1-C2 serializes all Provider mutations with a Provider/SecretStore mutex and commits Provider metadata through the P1-C1 staged-state helper:
+
+- New/replacement keys are written to a new `secretRef`; state failure compensates by deleting only that operation-created blob.
+- Blank-key upsert retains the existing ref and performs no SecretStore write.
+- Clear commits a new empty ref before deleting the old encrypted blob.
+- Provider delete commits Provider/settings removal before deleting the old encrypted blob.
+- Import confirm ignores source `hasSecret`, creates no key/blob, and never restores a source `secretRef`.
+
+Handled persistence failure leaves the prior live/durable Provider state and prior secret intact. Old-blob cleanup failure after a committed clear/update/delete returns logical success with a fixed redacted warning; the old blob is no longer referenced and remains an encrypted orphan. A process crash can also leave an orphan between new-blob preparation and state commit, or between state commit and old-blob cleanup. State and DPAPI/keyring storage are therefore not claimed to be fully atomic. Startup orphan reconciliation is deferred.
+
+On Windows, `hasSecret` existence checks use file metadata and do not read/decrypt the blob. Actual provider use still calls the controlled SecretStore read and DPAPI unprotect path.
 
 ### Backup Combinations
 
@@ -730,13 +743,18 @@ The complete call-site inventory, lock order, external-side-effect matrix, compe
 - Removed GET-time persisted conversation creation. Detail and stream GETs return a virtual empty DTO for a missing ID without changing conversations, `id_seq`, or disk.
 - Added a runtime-only monotonic revision; it is not written to schema v6. ID gaps remain allowed, duplicate IDs are validated, and `id_seq` is never decremented.
 - Coordinated transitional Provider/SecretStore, file/blob, send/regenerate/stop, and background write windows with the mutation mutex and commit barrier without changing their external side-effect order.
-- Kept Provider/SecretStore compensation, blob consistency, and streaming transaction semantics out of this step. Failed transitional writers may still leave live/external state ahead of disk until P1-C2, P1-C3, or P1-C4 resolves them.
+- P1-C1 intentionally kept Provider/SecretStore compensation, blob consistency, and streaming transaction semantics out of that step. Provider/SecretStore handled-failure semantics are now completed by P1-C2; file/blob and streaming risks remain for P1-C3/P1-C4.
 
-### P1-C2: Provider And SecretStore Compensation (Pending)
+### P1-C2: Provider And SecretStore Compensation (Completed)
 
-- Add reversible secret prepare/apply/rollback/finalize semantics.
-- Cover provider upsert with key, key replacement/clear, provider deletion, and secret reconciliation.
-- Never treat JSON rollback as sufficient to restore a deleted/replaced DPAPI or keyring value.
+- Added one Provider/SecretStore transaction mutex for import, upsert, key update/clear, and Provider delete.
+- Provider metadata, derived settings, and Provider ID allocation now use the existing staged state transaction; failed persistence leaves live/disk/revision and persisted ID high-water unchanged.
+- Key create/update uses a unique copy-on-write `secretRef`; failed state persistence compensates the new encrypted blob while preserving the old reference/blob.
+- Blank-key upsert performs no secret write and preserves existing `hasSecret` behavior.
+- Clear and Provider delete commit state before old-secret cleanup, so state failure cannot destroy the old key.
+- Import restores only validated non-sensitive metadata and always imports with `hasSecret: false`.
+- Compensation/cleanup uses a bounded three-attempt idempotent delete. Exhausted cleanup after state commit is fixed-warning partial success with an unreferenced encrypted orphan. Process-crash orphan reconciliation remains future work and no secret directory scan was added.
+- All tests use synthetic state and an in-memory fake SecretStore; no real app data, DPAPI blob, or API key is read.
 
 ### P1-C3: File Blob Transaction And Compensation (Pending)
 
@@ -749,7 +767,7 @@ The complete call-site inventory, lock order, external-side-effect matrix, compe
 - Keep provider waits outside transaction locks.
 - Add generation tokens, transient delta semantics, final/failure staged commits, retry visibility, and post-commit SSE ordering.
 
-Mode A/B backup packaging remains blocked until P1-C1 through P1-C4 pass their synthetic safety tests.
+Mode A/B backup packaging remains blocked until P1-C3 and P1-C4 pass their synthetic safety tests. P1-C1 and P1-C2 are complete.
 
 ### P2: Portable Metadata/Full Backup Package
 
@@ -838,7 +856,7 @@ Acceptance:
 
 ## Phase 12 Status And Remaining Blockers
 
-Current P1-A/P1-B/P1-C1 status:
+Current P1-A/P1-B/P1-C1/P1-C2 status:
 
 - Atomic replacement state write exists: Yes for the P1-A single-file commit path; no pre-delete remains.
 - Corrupt backup is fail-closed: Yes after P1-B; the primary is retained and no default is written.
@@ -846,14 +864,15 @@ Current P1-A/P1-B/P1-C1 status:
 - Persistence save mutex exists: Yes.
 - Persistence errors reach mutation handlers: Yes; background completion logs a safe stage-only error.
 - Pure settings/conversation persistence failure leaves live state unchanged: Yes after P1-C1.
-- All mutation classes have rollback/compensation: No; Provider/SecretStore, blobs, and streaming remain pending.
+- Provider/SecretStore handled-failure compensation exists: Yes after P1-C2; process-crash encrypted orphan reconciliation remains pending.
+- All mutation classes have rollback/compensation: No; managed blobs and streaming remain pending.
 - Silent automatic reset after read/parse/schema failure exists: No.
 - Future schema is fail-closed: Yes; it is not treated as corrupt or migrated.
 - Schema 1-5 pre-migration backup exists: Yes.
 - Automatic non-NotFound reset exists: No.
-- Runtime mutation consistency risk exists: Reduced for Category A; still present in P1-C2 through P1-C4 scopes.
+- Runtime mutation consistency risk exists: Reduced for Category A and Provider/SecretStore operations; still present in P1-C3/P1-C4 scopes.
 - State/blob consistency risk exists: Yes.
 - DPAPI secret blobs are portable across machines/users: No.
 - A formal backup/restore package currently exists: No.
 
-Recommended next step: Phase 12 P1-C2 Provider and SecretStore compensation. Mode A/B packaging, managed blob restore, and backup/restore UI remain deferred until P1-C2 through P1-C4 establish the remaining consistent runtime boundaries.
+Recommended next step: Phase 12 P1-C3 file blob transaction and compensation. Mode A/B packaging, managed blob restore, and backup/restore UI remain deferred until P1-C3 and P1-C4 establish the remaining consistent runtime boundaries.

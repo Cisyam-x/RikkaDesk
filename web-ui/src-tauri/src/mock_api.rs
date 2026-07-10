@@ -268,7 +268,7 @@ trait SecretStore: Send + Sync {
     fn get_secret(&self, secret_ref: &str) -> SecretStoreResult<Option<String>>;
     fn delete_secret(&self, secret_ref: &str) -> SecretStoreResult<()>;
 
-    fn has_secret(&self, secret_ref: &str) -> SecretStoreResult<bool> {
+    fn secret_exists(&self, secret_ref: &str) -> SecretStoreResult<bool> {
         self.get_secret(secret_ref).map(|value| value.is_some())
     }
 }
@@ -364,6 +364,14 @@ impl SecretStore for WindowsDpapiSecretStore {
         match std_fs::remove_file(self.secret_path(secret_ref)) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(secret_io_error(error)),
+        }
+    }
+
+    fn secret_exists(&self, secret_ref: &str) -> SecretStoreResult<bool> {
+        match std_fs::metadata(self.secret_path(secret_ref)) {
+            Ok(metadata) => Ok(metadata.is_file()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(secret_io_error(error)),
         }
     }
@@ -1043,6 +1051,8 @@ struct BuiltDesktopProvider {
     api_key: Option<String>,
     removed_model_ids: Vec<String>,
     used_models_request: bool,
+    staged_id_seq: u64,
+    is_new_provider: bool,
 }
 
 #[derive(Serialize)]
@@ -1554,6 +1564,7 @@ struct MockApiState {
     persistence: MockPersistence,
     secret_store: Arc<dyn SecretStore>,
     http_client: reqwest::Client,
+    provider_secret_transaction_mutex: Mutex<()>,
     mutation_transaction_mutex: Mutex<()>,
     commit_barrier: RwLock<()>,
     settings: RwLock<Value>,
@@ -1565,6 +1576,7 @@ struct MockApiState {
     settings_tx: broadcast::Sender<SsePayload>,
     list_tx: broadcast::Sender<SsePayload>,
     seq: AtomicU64,
+    secret_seq: AtomicU64,
     id_seq: AtomicU64,
     revision: AtomicU64,
 }
@@ -1590,6 +1602,7 @@ impl MockApiState {
             http_client: reqwest::Client::builder()
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
+            provider_secret_transaction_mutex: Mutex::new(()),
             mutation_transaction_mutex: Mutex::new(()),
             commit_barrier: RwLock::new(()),
             settings: RwLock::new(persisted.settings),
@@ -1601,6 +1614,7 @@ impl MockApiState {
             settings_tx,
             list_tx,
             seq: AtomicU64::new(1),
+            secret_seq: AtomicU64::new(1),
             id_seq: AtomicU64::new(initial_id_seq),
             revision: AtomicU64::new(0),
         }
@@ -1617,6 +1631,15 @@ impl MockApiState {
 
     fn next_file_id(&self) -> u64 {
         self.id_seq.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn next_provider_secret_ref(&self, provider_id: &str) -> String {
+        let sequence = self.secret_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        format!(
+            "{PROVIDER_SECRET_REF_PREFIX}{provider_id}:api-key:{}:{}:{sequence}",
+            now_millis(),
+            std::process::id()
+        )
     }
 }
 
@@ -1915,6 +1938,7 @@ enum PureStateMutationScope {
     Settings,
     Conversations,
     SettingsAndConversations,
+    ProviderMetadata,
 }
 
 #[derive(Debug)]
@@ -1959,28 +1983,98 @@ fn validate_pure_state_transaction(
 ) -> Result<(), StateMutationError> {
     validate_persisted_state_for_transaction(staged)?;
 
-    if staged.id_seq != before.id_seq {
-        return Err(StateMutationError::Validation(
-            "Pure state mutation changed the ID high-water mark",
-        ));
+    if matches!(scope, PureStateMutationScope::ProviderMetadata) {
+        if staged.id_seq < before.id_seq {
+            return Err(StateMutationError::Validation(
+                "Provider mutation lowered the ID high-water mark",
+            ));
+        }
+        if staged.conversations != before.conversations || staged.files != before.files {
+            return Err(StateMutationError::Validation(
+                "Provider mutation crossed a protected component boundary",
+            ));
+        }
+        validate_provider_metadata_transaction(staged)?;
+    } else {
+        if staged.id_seq != before.id_seq {
+            return Err(StateMutationError::Validation(
+                "Pure state mutation changed the ID high-water mark",
+            ));
+        }
+        if staged.providers != before.providers || staged.files != before.files {
+            return Err(StateMutationError::Validation(
+                "Pure state mutation crossed a protected component boundary",
+            ));
+        }
+        if matches!(scope, PureStateMutationScope::Settings)
+            && staged.conversations != before.conversations
+        {
+            return Err(StateMutationError::Validation(
+                "Settings mutation changed conversations",
+            ));
+        }
+        if matches!(scope, PureStateMutationScope::Conversations)
+            && staged.settings != before.settings
+        {
+            return Err(StateMutationError::Validation(
+                "Conversation mutation changed settings",
+            ));
+        }
     }
-    if staged.providers != before.providers || staged.files != before.files {
+
+    Ok(())
+}
+
+fn validate_provider_metadata_transaction(
+    persisted: &PersistedMockState,
+) -> Result<(), StateMutationError> {
+    let Some(settings_providers) = persisted.settings.get("providers").and_then(Value::as_array)
+    else {
         return Err(StateMutationError::Validation(
-            "Pure state mutation crossed a protected component boundary",
+            "Staged settings provider list is invalid",
         ));
-    }
-    if matches!(scope, PureStateMutationScope::Settings)
-        && staged.conversations != before.conversations
-    {
-        return Err(StateMutationError::Validation(
-            "Settings mutation changed conversations",
-        ));
-    }
-    if matches!(scope, PureStateMutationScope::Conversations) && staged.settings != before.settings
-    {
-        return Err(StateMutationError::Validation(
-            "Conversation mutation changed settings",
-        ));
+    };
+    let mut provider_ids = HashSet::new();
+    let mut provider_secret_refs = HashSet::new();
+    let mut model_record_ids = HashSet::new();
+
+    for provider in &persisted.providers {
+        if !is_safe_config_id(&provider.id) || !provider_ids.insert(provider.id.as_str()) {
+            return Err(StateMutationError::Validation(
+                "Staged provider identifiers are invalid",
+            ));
+        }
+        if provider.secret_ref.is_empty()
+            || provider.secret_ref.len() > 512
+            || !provider_secret_refs.insert(provider.secret_ref.as_str())
+        {
+            return Err(StateMutationError::Validation(
+                "Staged provider secret references are invalid",
+            ));
+        }
+        if provider.models.is_empty() {
+            return Err(StateMutationError::Validation(
+                "Staged provider model list is empty",
+            ));
+        }
+        for model in &provider.models {
+            if !is_safe_config_id(&model.id) || !model_record_ids.insert(model.id.as_str()) {
+                return Err(StateMutationError::Validation(
+                    "Staged provider model identifiers are invalid",
+                ));
+            }
+        }
+        if !settings_providers.iter().any(|settings_provider| {
+            settings_provider.get("id").and_then(Value::as_str) == Some(provider.id.as_str())
+                && settings_provider
+                    .get("secretRef")
+                    .and_then(Value::as_str)
+                    == Some(provider.secret_ref.as_str())
+        }) {
+            return Err(StateMutationError::Validation(
+                "Staged provider settings reference is inconsistent",
+            ));
+        }
     }
 
     Ok(())
@@ -2144,73 +2238,95 @@ async fn confirm_desktop_provider_import(
         Err(response) => return response,
     };
 
-    let mut imported_configs = Vec::with_capacity(providers.len());
-    let mut imported = Vec::with_capacity(providers.len());
-    for provider in providers {
-        let id = state.next_id("desktop-provider");
-        let models = provider
-            .models
-            .iter()
-            .map(|model| DesktopProviderModelConfig {
-                id: state.next_id("desktop-model"),
-                model_id: model.model_id.clone(),
-                display_name: model.display_name.clone(),
-                input_modalities: model.input_modalities.clone(),
-                output_modalities: model.output_modalities.clone(),
-            })
-            .collect::<Vec<_>>();
-        let imported_models = models
-            .iter()
-            .map(|model| ProviderImportConfirmModel {
-                id: model.id.clone(),
-                model_id: model.model_id.clone(),
-                display_name: model.display_name.clone(),
-                input_modalities: model.input_modalities.clone(),
-                output_modalities: model.output_modalities.clone(),
-            })
-            .collect::<Vec<_>>();
-        let config = DesktopProviderConfig {
-            secret_ref: secret_ref_for_provider(&id),
-            id: id.clone(),
-            provider_type: provider.provider_type.clone(),
-            enabled: provider.enabled,
-            name: provider.name.clone(),
-            base_url: provider.base_url.clone(),
-            models,
-            legacy_model: None,
-            custom_headers: provider.custom_headers.clone(),
-            custom_body: provider.custom_body.clone(),
+    let provider_guard = state.provider_secret_transaction_mutex.lock().await;
+    let mut imported_secret_refs = Vec::with_capacity(providers.len());
+    for _ in 0..providers.len() {
+        let secret_ref = match unused_provider_secret_ref(&state, "imported-provider") {
+            Ok(secret_ref) => secret_ref,
+            Err(()) => {
+                eprintln!("RikkaDesk provider empty secret reference allocation failed");
+                return internal_error_response("Secret store is unavailable");
+            }
         };
-
-        let advanced_config = provider_import_advanced_summary(&provider);
-        imported.push(ProviderImportConfirmItem {
-            id,
-            provider_type: provider.provider_type,
-            enabled: provider.enabled,
-            name: provider.name,
-            base_url: provider.base_url,
-            has_secret: false,
-            models: imported_models,
-            advanced_config,
-        });
-        imported_configs.push(config);
+        imported_secret_refs.push(secret_ref);
     }
+    let imported = if providers.is_empty() {
+        Vec::new()
+    } else {
+        match transact_persisted_state(
+            &state,
+            PureStateMutationScope::ProviderMetadata,
+            move |staged| {
+                let mut imported_configs = Vec::with_capacity(providers.len());
+                let mut imported = Vec::with_capacity(providers.len());
 
-    if !imported_configs.is_empty() {
-        let mutation_guard = state.mutation_transaction_mutex.lock().await;
+                for (provider, secret_ref) in providers.into_iter().zip(imported_secret_refs) {
+                    let id = next_staged_id(staged, "desktop-provider");
+                    let models = provider
+                        .models
+                        .iter()
+                        .map(|model| DesktopProviderModelConfig {
+                            id: next_staged_id(staged, "desktop-model"),
+                            model_id: model.model_id.clone(),
+                            display_name: model.display_name.clone(),
+                            input_modalities: model.input_modalities.clone(),
+                            output_modalities: model.output_modalities.clone(),
+                        })
+                        .collect::<Vec<_>>();
+                    let imported_models = models
+                        .iter()
+                        .map(|model| ProviderImportConfirmModel {
+                            id: model.id.clone(),
+                            model_id: model.model_id.clone(),
+                            display_name: model.display_name.clone(),
+                            input_modalities: model.input_modalities.clone(),
+                            output_modalities: model.output_modalities.clone(),
+                        })
+                        .collect::<Vec<_>>();
+                    let config = DesktopProviderConfig {
+                        secret_ref,
+                        id: id.clone(),
+                        provider_type: provider.provider_type.clone(),
+                        enabled: provider.enabled,
+                        name: provider.name.clone(),
+                        base_url: provider.base_url.clone(),
+                        models,
+                        legacy_model: None,
+                        custom_headers: provider.custom_headers.clone(),
+                        custom_body: provider.custom_body.clone(),
+                    };
+
+                    let advanced_config = provider_import_advanced_summary(&provider);
+                    imported.push(ProviderImportConfirmItem {
+                        id,
+                        provider_type: provider.provider_type,
+                        enabled: provider.enabled,
+                        name: provider.name,
+                        base_url: provider.base_url,
+                        has_secret: false,
+                        models: imported_models,
+                        advanced_config,
+                    });
+                    imported_configs.push(config);
+                }
+
+                staged.providers.extend(imported_configs);
+                sync_settings_with_desktop_providers(&mut staged.settings, &staged.providers);
+                Ok(imported)
+            },
+        )
+        .await
         {
-            let _commit_guard = state.commit_barrier.write().await;
-            let mut settings = state.settings.write().await;
-            let mut providers = state.providers.write().await;
-            providers.extend(imported_configs);
-            sync_settings_with_desktop_providers(&mut settings, &providers);
+            Ok(imported) => imported,
+            Err(error) => {
+                drop(provider_guard);
+                return state_mutation_error_response("provider import", error);
+            }
         }
+    };
+    drop(provider_guard);
 
-        if let Err(response) = persist_live_state_for_request_while_mutation_locked(&state).await {
-            return response;
-        }
-        state.revision.fetch_add(1, Ordering::Release);
-        drop(mutation_guard);
+    if !imported.is_empty() {
         broadcast_settings_update(&state).await;
     }
 
@@ -2226,71 +2342,119 @@ async fn upsert_desktop_provider(
     State(state): State<Arc<MockApiState>>,
     Json(payload): Json<UpsertDesktopProviderRequest>,
 ) -> impl IntoResponse {
-    match build_desktop_provider(&state, payload).await {
-        Ok(BuiltDesktopProvider {
-            provider,
-            api_key,
-            removed_model_ids,
-            used_models_request,
-        }) => {
-            if let Some(api_key) = api_key {
-                if let Err(error) = state
-                    .secret_store
-                    .set_secret(&provider.secret_ref, &api_key)
-                {
-                    eprintln!("RikkaDesk provider secret save failed: {error}");
-                    return internal_error_response("Secret store is unavailable");
-                }
-            }
+    let provider_guard = state.provider_secret_transaction_mutex.lock().await;
+    let BuiltDesktopProvider {
+        mut provider,
+        api_key,
+        removed_model_ids,
+        used_models_request,
+        staged_id_seq,
+        is_new_provider,
+    } = match build_desktop_provider(&state, payload).await {
+        Ok(built) => built,
+        Err(response) => return response,
+    };
 
-            let mutation_guard = state.mutation_transaction_mutex.lock().await;
-            {
-                let _commit_guard = state.commit_barrier.write().await;
-                let mut settings = state.settings.write().await;
-                let mut providers = state.providers.write().await;
-                if let Some(existing) = providers.iter_mut().find(|item| item.id == provider.id) {
-                    *existing = provider.clone();
-                } else {
-                    providers.push(provider.clone());
-                }
-                sync_settings_with_desktop_providers(&mut settings, &providers);
-                if !removed_model_ids.is_empty() {
-                    remove_models_from_favorites(
-                        &mut settings,
-                        removed_model_ids.iter().map(String::as_str),
-                    );
-                }
-                if !used_models_request {
-                    if let Some(model_id) = provider.primary_model_id_for_settings() {
-                        set_current_model_in_settings(&mut settings, model_id);
-                    }
-                }
-                ensure_current_model_exists(&mut settings);
+    let previous_secret_ref = provider.secret_ref.clone();
+    let prepared_secret_ref = if let Some(api_key) = api_key.as_deref() {
+        let secret_ref = match unused_provider_secret_ref(&state, &provider.id) {
+            Ok(secret_ref) => secret_ref,
+            Err(()) => {
+                eprintln!("RikkaDesk provider secret reference allocation failed");
+                return internal_error_response("Secret store is unavailable");
             }
-
-            if let Err(response) =
-                persist_live_state_for_request_while_mutation_locked(&state).await
-            {
-                return response;
-            }
-            state.revision.fetch_add(1, Ordering::Release);
-            drop(mutation_guard);
-            broadcast_settings_update(&state).await;
-
-            let has_secret = match state.secret_store.has_secret(&provider.secret_ref) {
-                Ok(has_secret) => has_secret,
-                Err(error) => {
-                    eprintln!("RikkaDesk provider secret status failed: {error}");
+        };
+        if prepare_new_secret(state.secret_store.as_ref(), &secret_ref, api_key).is_err() {
+            eprintln!("RikkaDesk provider secret prepare failed");
+            return internal_error_response("Secret store is unavailable");
+        }
+        provider.secret_ref = secret_ref.clone();
+        Some(secret_ref)
+    } else {
+        if is_new_provider {
+            provider.secret_ref = match unused_provider_secret_ref(&state, &provider.id) {
+                Ok(secret_ref) => secret_ref,
+                Err(()) => {
+                    eprintln!("RikkaDesk provider empty secret reference allocation failed");
                     return internal_error_response("Secret store is unavailable");
                 }
             };
+        }
+        None
+    };
 
-            match DesktopProviderResponse::from_config(&provider, has_secret) {
-                Ok(response) => Json(response).into_response(),
-                Err(error) => internal_error_response(error),
+    let has_secret = if prepared_secret_ref.is_some() {
+        true
+    } else if is_new_provider {
+        false
+    } else {
+        match state.secret_store.secret_exists(&provider.secret_ref) {
+            Ok(has_secret) => has_secret,
+            Err(_) => {
+                eprintln!("RikkaDesk provider secret status check failed");
+                return internal_error_response("Secret store is unavailable");
             }
         }
-        Err(response) => response,
+    };
+
+    let provider_for_commit = provider.clone();
+    let transaction_result = transact_persisted_state(
+        &state,
+        PureStateMutationScope::ProviderMetadata,
+        move |staged| {
+            staged.id_seq = staged.id_seq.max(staged_id_seq);
+            if let Some(existing) = staged
+                .providers
+                .iter_mut()
+                .find(|item| item.id == provider_for_commit.id)
+            {
+                *existing = provider_for_commit.clone();
+            } else {
+                staged.providers.push(provider_for_commit.clone());
+            }
+            sync_settings_with_desktop_providers(&mut staged.settings, &staged.providers);
+            if !removed_model_ids.is_empty() {
+                remove_models_from_favorites(
+                    &mut staged.settings,
+                    removed_model_ids.iter().map(String::as_str),
+                );
+            }
+            if !used_models_request {
+                if let Some(model_id) = provider_for_commit.primary_model_id_for_settings() {
+                    set_current_model_in_settings(&mut staged.settings, model_id);
+                }
+            }
+            ensure_current_model_exists(&mut staged.settings);
+            Ok(())
+        },
+    )
+    .await;
+
+    if let Err(error) = transaction_result {
+        let response = state_mutation_error_response("provider upsert", error);
+        if let Some(secret_ref) = prepared_secret_ref.as_deref() {
+            if compensate_new_secret(state.secret_store.as_ref(), secret_ref).is_err() {
+                eprintln!("RikkaDesk provider secret compensation failed after state rejection");
+                return internal_error_response(
+                    "Provider update failed and local secret cleanup requires attention",
+                );
+            }
+        }
+        return response;
+    }
+
+    if prepared_secret_ref.is_some()
+        && !is_new_provider
+        && previous_secret_ref != provider.secret_ref
+    {
+        cleanup_secret_after_state_commit(state.secret_store.as_ref(), &previous_secret_ref);
+    }
+    drop(provider_guard);
+    broadcast_settings_update(&state).await;
+
+    match DesktopProviderResponse::from_config(&provider, has_secret) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => internal_error_response(error),
     }
 }
 async fn update_desktop_provider_secret(
@@ -2305,6 +2469,7 @@ async fn update_desktop_provider_secret(
         return bad_request_response("apiKey is required");
     }
 
+    let provider_guard = state.provider_secret_transaction_mutex.lock().await;
     let provider = {
         let providers = state.providers.read().await;
         providers.iter().find(|item| item.id == id).cloned()
@@ -2314,14 +2479,52 @@ async fn update_desktop_provider_secret(
         return not_found_response("Provider not found");
     };
 
-    if let Err(error) = state
-        .secret_store
-        .set_secret(&provider.secret_ref, &api_key)
-    {
-        eprintln!("RikkaDesk provider secret update failed: {error}");
+    let new_secret_ref = match unused_provider_secret_ref(&state, &provider.id) {
+        Ok(secret_ref) => secret_ref,
+        Err(()) => {
+            eprintln!("RikkaDesk provider secret reference allocation failed");
+            return internal_error_response("Secret store is unavailable");
+        }
+    };
+    if prepare_new_secret(state.secret_store.as_ref(), &new_secret_ref, &api_key).is_err() {
+        eprintln!("RikkaDesk provider secret prepare failed");
         return internal_error_response("Secret store is unavailable");
     }
 
+    let provider_id = provider.id.clone();
+    let committed_secret_ref = new_secret_ref.clone();
+    let transaction_result = transact_persisted_state(
+        &state,
+        PureStateMutationScope::ProviderMetadata,
+        move |staged| {
+            let Some(existing) = staged
+                .providers
+                .iter_mut()
+                .find(|item| item.id == provider_id)
+            else {
+                return Err(StateMutationError::NotFound("Provider not found"));
+            };
+            existing.secret_ref = committed_secret_ref;
+            sync_settings_with_desktop_providers(&mut staged.settings, &staged.providers);
+            Ok(())
+        },
+    )
+    .await;
+
+    if let Err(error) = transaction_result {
+        let response = state_mutation_error_response("provider key update", error);
+        if compensate_new_secret(state.secret_store.as_ref(), &new_secret_ref).is_err() {
+            eprintln!("RikkaDesk provider secret compensation failed after state rejection");
+            return internal_error_response(
+                "Provider update failed and local secret cleanup requires attention",
+            );
+        }
+        return response;
+    }
+
+    cleanup_secret_after_state_commit(state.secret_store.as_ref(), &provider.secret_ref);
+    drop(provider_guard);
+    broadcast_settings_update(&state).await;
     Json(json!({ "status": "ok", "hasSecret": true })).into_response()
 }
 
@@ -2329,6 +2532,7 @@ async fn delete_desktop_provider_secret(
     State(state): State<Arc<MockApiState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    let provider_guard = state.provider_secret_transaction_mutex.lock().await;
     let provider = {
         let providers = state.providers.read().await;
         providers.iter().find(|item| item.id == id).cloned()
@@ -2338,11 +2542,40 @@ async fn delete_desktop_provider_secret(
         return not_found_response("Provider not found");
     };
 
-    if let Err(error) = state.secret_store.delete_secret(&provider.secret_ref) {
-        eprintln!("RikkaDesk provider secret delete failed: {error}");
-        return internal_error_response("Secret store is unavailable");
+    let cleared_secret_ref = match unused_provider_secret_ref(&state, &provider.id) {
+        Ok(secret_ref) => secret_ref,
+        Err(()) => {
+            eprintln!("RikkaDesk provider empty secret reference allocation failed");
+            return internal_error_response("Secret store is unavailable");
+        }
+    };
+    let provider_id = provider.id.clone();
+    let committed_secret_ref = cleared_secret_ref.clone();
+    let transaction_result = transact_persisted_state(
+        &state,
+        PureStateMutationScope::ProviderMetadata,
+        move |staged| {
+            let Some(existing) = staged
+                .providers
+                .iter_mut()
+                .find(|item| item.id == provider_id)
+            else {
+                return Err(StateMutationError::NotFound("Provider not found"));
+            };
+            existing.secret_ref = committed_secret_ref;
+            sync_settings_with_desktop_providers(&mut staged.settings, &staged.providers);
+            Ok(())
+        },
+    )
+    .await;
+
+    if let Err(error) = transaction_result {
+        return state_mutation_error_response("provider key clear", error);
     }
 
+    cleanup_secret_after_state_commit(state.secret_store.as_ref(), &provider.secret_ref);
+    drop(provider_guard);
+    broadcast_settings_update(&state).await;
     Json(json!({ "status": "ok", "hasSecret": false })).into_response()
 }
 
@@ -2350,6 +2583,7 @@ async fn delete_desktop_provider(
     State(state): State<Arc<MockApiState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    let provider_guard = state.provider_secret_transaction_mutex.lock().await;
     let provider = {
         let providers = state.providers.read().await;
         providers.iter().find(|item| item.id == id).cloned()
@@ -2359,27 +2593,37 @@ async fn delete_desktop_provider(
         return not_found_response("Provider not found");
     };
 
-    if let Err(error) = state.secret_store.delete_secret(&provider.secret_ref) {
-        eprintln!("RikkaDesk provider secret delete failed: {error}");
-        return internal_error_response("Secret store is unavailable");
+    let provider_id = provider.id.clone();
+    let removed_model_ids = provider
+        .model_ids_for_settings()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let transaction_result = transact_persisted_state(
+        &state,
+        PureStateMutationScope::ProviderMetadata,
+        move |staged| {
+            let before_len = staged.providers.len();
+            staged.providers.retain(|item| item.id != provider_id);
+            if staged.providers.len() == before_len {
+                return Err(StateMutationError::NotFound("Provider not found"));
+            }
+            sync_settings_with_desktop_providers(&mut staged.settings, &staged.providers);
+            remove_models_from_favorites(
+                &mut staged.settings,
+                removed_model_ids.iter().map(String::as_str),
+            );
+            ensure_current_model_exists(&mut staged.settings);
+            Ok(())
+        },
+    )
+    .await;
+
+    if let Err(error) = transaction_result {
+        return state_mutation_error_response("provider delete", error);
     }
 
-    let mutation_guard = state.mutation_transaction_mutex.lock().await;
-    {
-        let _commit_guard = state.commit_barrier.write().await;
-        let mut settings = state.settings.write().await;
-        let mut providers = state.providers.write().await;
-        providers.retain(|item| item.id != provider.id);
-        sync_settings_with_desktop_providers(&mut settings, &providers);
-        remove_models_from_favorites(&mut settings, provider.model_ids_for_settings());
-        ensure_current_model_exists(&mut settings);
-    }
-
-    if let Err(response) = persist_live_state_for_request_while_mutation_locked(&state).await {
-        return response;
-    }
-    state.revision.fetch_add(1, Ordering::Release);
-    drop(mutation_guard);
+    cleanup_secret_after_state_commit(state.secret_store.as_ref(), &provider.secret_ref);
+    drop(provider_guard);
     broadcast_settings_update(&state).await;
     broadcast_list_invalidate(&state).await;
 
@@ -3543,13 +3787,14 @@ async fn managed_file_for_provider_image_input(
 async fn desktop_provider_responses(
     state: &Arc<MockApiState>,
 ) -> Result<Vec<DesktopProviderResponse>, String> {
-    let providers = state.providers.read().await;
+    let providers = state.providers.read().await.clone();
     providers
         .iter()
         .map(|provider| {
             state
                 .secret_store
-                .has_secret(&provider.secret_ref)
+                .secret_exists(&provider.secret_ref)
+                .map_err(|_| "Secret store is unavailable".to_string())
                 .and_then(|has_secret| DesktopProviderResponse::from_config(provider, has_secret))
         })
         .collect()
@@ -3564,7 +3809,8 @@ async fn provider_export_items(
         .map(|provider| {
             state
                 .secret_store
-                .has_secret(&provider.secret_ref)
+                .secret_exists(&provider.secret_ref)
+                .map_err(|_| "Secret store is unavailable".to_string())
                 .and_then(|has_secret| {
                     if provider.models.is_empty() {
                         return Err("Provider has no models".to_string());
@@ -4960,6 +5206,14 @@ async fn build_desktop_provider(
     state: &Arc<MockApiState>,
     payload: UpsertDesktopProviderRequest,
 ) -> Result<BuiltDesktopProvider, Response> {
+    let mut staged = persisted_snapshot_from_live(state).await;
+    build_desktop_provider_from_staged(&mut staged, payload)
+}
+
+fn build_desktop_provider_from_staged(
+    staged: &mut PersistedMockState,
+    payload: UpsertDesktopProviderRequest,
+) -> Result<BuiltDesktopProvider, Response> {
     let requested_type = payload
         .provider_type
         .as_deref()
@@ -4977,8 +5231,7 @@ async fn build_desktop_provider(
         .map(str::trim)
         .filter(|id| !id.is_empty())
     {
-        let providers = state.providers.read().await;
-        providers.iter().find(|item| item.id == id).cloned()
+        staged.providers.iter().find(|item| item.id == id).cloned()
     } else {
         None
     };
@@ -4990,7 +5243,7 @@ async fn build_desktop_provider(
         .filter(|id| !id.is_empty())
         .map(ToOwned::to_owned)
         .or_else(|| existing.as_ref().map(|provider| provider.id.clone()))
-        .unwrap_or_else(|| state.next_id("desktop-provider"));
+        .unwrap_or_else(|| next_staged_id(staged, "desktop-provider"));
 
     if !is_safe_config_id(&id) {
         return Err(bad_request_response(
@@ -5018,10 +5271,10 @@ async fn build_desktop_provider(
 
     let used_models_request = payload.models.is_some();
     let models = if let Some(models) = payload.models.as_ref() {
-        build_models_from_multi_request(state, existing.as_ref(), models)?
+        build_models_from_multi_request(staged, existing.as_ref(), models)?
     } else {
         build_models_from_singular_request(
-            state,
+            staged,
             existing.as_ref(),
             payload.model_id.as_deref(),
             payload.display_name.as_deref(),
@@ -5092,11 +5345,13 @@ async fn build_desktop_provider(
         api_key,
         removed_model_ids,
         used_models_request,
+        staged_id_seq: staged.id_seq,
+        is_new_provider: existing.is_none(),
     })
 }
 
 fn build_models_from_multi_request(
-    state: &Arc<MockApiState>,
+    staged: &mut PersistedMockState,
     existing: Option<&DesktopProviderConfig>,
     requests: &[UpsertDesktopProviderModelRequest],
 ) -> Result<Vec<DesktopProviderModelConfig>, Response> {
@@ -5174,7 +5429,7 @@ fn build_models_from_multi_request(
 
         let record_id = requested_record_id
             .or_else(|| existing_model.map(|model| model.id.clone()))
-            .unwrap_or_else(|| state.next_id("desktop-model"));
+            .unwrap_or_else(|| next_staged_id(staged, "desktop-model"));
 
         if !seen_record_ids.insert(record_id.clone()) {
             return Err(bad_request_response(&format!(
@@ -5214,7 +5469,7 @@ fn build_models_from_multi_request(
 }
 
 fn build_models_from_singular_request(
-    state: &Arc<MockApiState>,
+    staged: &mut PersistedMockState,
     existing: Option<&DesktopProviderConfig>,
     model_id: Option<&str>,
     display_name: Option<&str>,
@@ -5250,7 +5505,7 @@ fn build_models_from_singular_request(
     let model_record_id = existing
         .and_then(DesktopProviderConfig::primary_model)
         .map(|model| model.id.clone())
-        .unwrap_or_else(|| state.next_id("desktop-model"));
+        .unwrap_or_else(|| next_staged_id(staged, "desktop-model"));
 
     let mut models = existing
         .map(|provider| provider.models.clone())
@@ -5892,8 +6147,95 @@ fn first_settings_model_id(settings: &Value) -> Option<String> {
         })
 }
 
+fn next_staged_id(staged: &mut PersistedMockState, prefix: &str) -> String {
+    staged.id_seq += 1;
+    format!("{prefix}-{}", staged.id_seq)
+}
+
 fn secret_ref_for_provider(provider_id: &str) -> String {
     format!("{PROVIDER_SECRET_REF_PREFIX}{provider_id}:api-key")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderSecretCleanupStatus {
+    Clean,
+    Residual,
+}
+
+fn is_controlled_provider_secret_ref(secret_ref: &str) -> bool {
+    secret_ref.starts_with(PROVIDER_SECRET_REF_PREFIX)
+        && secret_ref.len() <= 512
+        && secret_ref
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':'))
+}
+
+fn prepare_new_secret(
+    secret_store: &dyn SecretStore,
+    secret_ref: &str,
+    value: &str,
+) -> Result<(), ()> {
+    if !is_controlled_provider_secret_ref(secret_ref) {
+        return Err(());
+    }
+    if !matches!(secret_store.secret_exists(secret_ref), Ok(false)) {
+        return Err(());
+    }
+    secret_store.set_secret(secret_ref, value).map_err(|_| ())
+}
+
+fn unused_provider_secret_ref(state: &MockApiState, provider_id: &str) -> Result<String, ()> {
+    const MAX_ATTEMPTS: usize = 32;
+
+    for _ in 0..MAX_ATTEMPTS {
+        let secret_ref = state.next_provider_secret_ref(provider_id);
+        match state.secret_store.secret_exists(&secret_ref) {
+            Ok(false) => return Ok(secret_ref),
+            Ok(true) => continue,
+            Err(_) => return Err(()),
+        }
+    }
+
+    Err(())
+}
+
+fn delete_secret_for_ref(secret_store: &dyn SecretStore, secret_ref: &str) -> Result<(), ()> {
+    if !is_controlled_provider_secret_ref(secret_ref) {
+        return Err(());
+    }
+    secret_store.delete_secret(secret_ref).map_err(|_| ())
+}
+
+fn compensate_new_secret(secret_store: &dyn SecretStore, secret_ref: &str) -> Result<(), ()> {
+    delete_secret_for_ref_with_retry(secret_store, secret_ref)
+}
+
+fn cleanup_secret_after_state_commit(
+    secret_store: &dyn SecretStore,
+    secret_ref: &str,
+) -> ProviderSecretCleanupStatus {
+    match delete_secret_for_ref_with_retry(secret_store, secret_ref) {
+        Ok(()) => ProviderSecretCleanupStatus::Clean,
+        Err(()) => {
+            eprintln!("RikkaDesk provider secret cleanup failed after state commit");
+            ProviderSecretCleanupStatus::Residual
+        }
+    }
+}
+
+fn delete_secret_for_ref_with_retry(
+    secret_store: &dyn SecretStore,
+    secret_ref: &str,
+) -> Result<(), ()> {
+    const MAX_ATTEMPTS: usize = 3;
+
+    for _ in 0..MAX_ATTEMPTS {
+        if delete_secret_for_ref(secret_store, secret_ref).is_ok() {
+            return Ok(());
+        }
+    }
+
+    Err(())
 }
 
 fn secret_storage_key_for_ref(secret_ref: &str) -> String {
@@ -6610,6 +6952,109 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct ProviderTransactionTestSecretStore {
+        secrets: std::sync::Mutex<HashMap<String, String>>,
+        set_calls: AtomicU64,
+        delete_calls: AtomicU64,
+        fail_next_set: AtomicU64,
+        fail_next_delete: AtomicU64,
+    }
+
+    impl ProviderTransactionTestSecretStore {
+        fn seed(&self, secret_ref: &str) {
+            self.secrets
+                .lock()
+                .expect("synthetic secret store lock should be available")
+                .insert(secret_ref.to_string(), "synthetic-secret-value".to_string());
+        }
+
+        fn contains(&self, secret_ref: &str) -> bool {
+            self.secrets
+                .lock()
+                .expect("synthetic secret store lock should be available")
+                .contains_key(secret_ref)
+        }
+
+        fn len(&self) -> usize {
+            self.secrets
+                .lock()
+                .expect("synthetic secret store lock should be available")
+                .len()
+        }
+
+        fn set_call_count(&self) -> u64 {
+            self.set_calls.load(Ordering::SeqCst)
+        }
+
+        fn delete_call_count(&self) -> u64 {
+            self.delete_calls.load(Ordering::SeqCst)
+        }
+
+        fn fail_next_set(&self) {
+            self.fail_next_set.store(1, Ordering::SeqCst);
+        }
+
+        fn fail_next_delete(&self) {
+            self.fail_next_delete.store(1, Ordering::SeqCst);
+        }
+
+        fn fail_delete_times(&self, count: u64) {
+            self.fail_next_delete.store(count, Ordering::SeqCst);
+        }
+
+        fn consume_failure(counter: &AtomicU64) -> bool {
+            counter
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                    if value == 0 {
+                        None
+                    } else {
+                        Some(value - 1)
+                    }
+                })
+                .is_ok()
+        }
+    }
+
+    impl SecretStore for ProviderTransactionTestSecretStore {
+        fn set_secret(&self, secret_ref: &str, value: &str) -> SecretStoreResult<()> {
+            self.set_calls.fetch_add(1, Ordering::SeqCst);
+            if Self::consume_failure(&self.fail_next_set) {
+                return Err("synthetic secret write failure".to_string());
+            }
+            self.secrets
+                .lock()
+                .expect("synthetic secret store lock should be available")
+                .insert(secret_ref.to_string(), value.to_string());
+            Ok(())
+        }
+
+        fn get_secret(&self, secret_ref: &str) -> SecretStoreResult<Option<String>> {
+            Ok(self
+                .secrets
+                .lock()
+                .expect("synthetic secret store lock should be available")
+                .get(secret_ref)
+                .cloned())
+        }
+
+        fn delete_secret(&self, secret_ref: &str) -> SecretStoreResult<()> {
+            self.delete_calls.fetch_add(1, Ordering::SeqCst);
+            if Self::consume_failure(&self.fail_next_delete) {
+                return Err("synthetic secret delete failure".to_string());
+            }
+            self.secrets
+                .lock()
+                .expect("synthetic secret store lock should be available")
+                .remove(secret_ref);
+            Ok(())
+        }
+
+        fn secret_exists(&self, secret_ref: &str) -> SecretStoreResult<bool> {
+            Ok(self.contains(secret_ref))
+        }
+    }
+
     fn test_persistence(temp: &SyntheticTempDir) -> MockPersistence {
         MockPersistence::new(temp.path.clone())
     }
@@ -6640,6 +7085,21 @@ mod tests {
         persisted: PersistedMockState,
         failure_stage: Option<TestFailureStage>,
     ) -> Arc<MockApiState> {
+        transaction_test_state_with_secret_store(
+            temp,
+            persisted,
+            failure_stage,
+            Arc::new(TestSecretStore),
+        )
+        .await
+    }
+
+    async fn transaction_test_state_with_secret_store(
+        temp: &SyntheticTempDir,
+        persisted: PersistedMockState,
+        failure_stage: Option<TestFailureStage>,
+        secret_store: Arc<dyn SecretStore>,
+    ) -> Arc<MockApiState> {
         test_persistence(temp)
             .save(&persisted)
             .await
@@ -6648,11 +7108,7 @@ mod tests {
             || test_persistence(temp),
             |stage| faulting_test_persistence(temp, stage),
         );
-        Arc::new(MockApiState::new(
-            persistence,
-            Arc::new(TestSecretStore),
-            persisted,
-        ))
+        Arc::new(MockApiState::new(persistence, secret_store, persisted))
     }
 
     async fn live_conversation(state: &MockApiState, id: &str) -> ConversationDto {
@@ -6667,6 +7123,101 @@ mod tests {
 
     fn disk_conversation(temp: &SyntheticTempDir, id: &str) -> Value {
         read_test_state(&test_persistence(temp))["conversations"][id].clone()
+    }
+
+    fn synthetic_desktop_provider() -> DesktopProviderConfig {
+        let id = "synthetic-provider".to_string();
+        DesktopProviderConfig {
+            secret_ref: secret_ref_for_provider(&id),
+            id,
+            provider_type: OPENAI_COMPATIBLE_PROVIDER_TYPE.to_string(),
+            enabled: true,
+            name: "Synthetic Provider".to_string(),
+            base_url: "http://127.0.0.1:9999/v1".to_string(),
+            models: vec![DesktopProviderModelConfig {
+                id: "synthetic-provider-model".to_string(),
+                model_id: "synthetic-model-api".to_string(),
+                display_name: "Synthetic Model".to_string(),
+                input_modalities: default_input_modalities(),
+                output_modalities: default_output_modalities(),
+            }],
+            legacy_model: None,
+            custom_headers: Vec::new(),
+            custom_body: None,
+        }
+    }
+
+    fn synthetic_provider_state() -> PersistedMockState {
+        let mut persisted = default_persisted_state();
+        persisted.id_seq = 100;
+        persisted.providers.push(synthetic_desktop_provider());
+        sync_settings_with_desktop_providers(&mut persisted.settings, &persisted.providers);
+        persisted
+    }
+
+    fn synthetic_provider_upsert_request(
+        id: Option<&str>,
+        api_key: Option<&str>,
+    ) -> UpsertDesktopProviderRequest {
+        UpsertDesktopProviderRequest {
+            id: id.map(ToOwned::to_owned),
+            provider_type: Some(OPENAI_COMPATIBLE_PROVIDER_TYPE.to_string()),
+            enabled: Some(true),
+            name: Some("Synthetic Updated Provider".to_string()),
+            base_url: Some("http://127.0.0.1:9999/v1".to_string()),
+            models: None,
+            model_id: Some("synthetic-model-api".to_string()),
+            display_name: Some("Synthetic Model".to_string()),
+            api_key: api_key.map(ToOwned::to_owned),
+            custom_headers: None,
+            custom_body: CustomBodyUpdate::Missing,
+        }
+    }
+
+    fn synthetic_provider_secret_request(api_key: &str) -> UpsertDesktopProviderRequest {
+        UpsertDesktopProviderRequest {
+            id: None,
+            provider_type: None,
+            enabled: None,
+            name: None,
+            base_url: None,
+            models: None,
+            model_id: None,
+            display_name: None,
+            api_key: Some(api_key.to_string()),
+            custom_headers: None,
+            custom_body: CustomBodyUpdate::Missing,
+        }
+    }
+
+    fn synthetic_provider_import_document() -> Value {
+        json!({
+            "version": PROVIDER_IMPORT_EXPORT_VERSION,
+            "app": "RikkaDesk",
+            "exportedAt": "2026-01-01T00:00:00Z",
+            "providers": [{
+                "type": OPENAI_COMPATIBLE_PROVIDER_TYPE,
+                "enabled": true,
+                "name": "Synthetic Imported Provider",
+                "baseUrl": "http://127.0.0.1:9999/v1",
+                "hasSecret": true,
+                "models": [{
+                    "modelId": "synthetic-import-model",
+                    "displayName": "Synthetic Import Model",
+                    "inputModalities": [MODEL_MODALITY_TEXT],
+                    "outputModalities": [MODEL_MODALITY_TEXT]
+                }],
+                "customHeaders": [],
+                "customBody": null
+            }]
+        })
+    }
+
+    async fn response_json(response: Response) -> Value {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("synthetic response body should be readable");
+        serde_json::from_slice(&body).expect("synthetic response body should be JSON")
     }
 
     fn is_test_backup_path(path: &FilePath) -> bool {
@@ -8196,6 +8747,729 @@ mod tests {
                 "{value} should be rejected"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn provider_import_transaction_success_has_no_secret() {
+        let temp = SyntheticTempDir::new("provider-import-success");
+        let secret_store = Arc::new(ProviderTransactionTestSecretStore::default());
+        let state = transaction_test_state_with_secret_store(
+            &temp,
+            default_persisted_state(),
+            None,
+            secret_store.clone(),
+        )
+        .await;
+
+        let response = confirm_desktop_provider_import(
+            State(state.clone()),
+            Ok(Json(synthetic_provider_import_document())),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+
+        assert_eq!(body["importedCount"], json!(1));
+        assert_eq!(body["providers"][0]["hasSecret"], json!(false));
+        assert_eq!(state.providers.read().await.len(), 1);
+        assert_eq!(secret_store.set_call_count(), 0);
+        assert_eq!(secret_store.len(), 0);
+        assert_eq!(state.revision.load(Ordering::Acquire), 1);
+        assert_eq!(
+            read_test_state(&test_persistence(&temp))["providers"]
+                .as_array()
+                .expect("disk providers should be an array")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_import_transaction_failure_preserves_state() {
+        let temp = SyntheticTempDir::new("provider-import-failure");
+        let secret_store = Arc::new(ProviderTransactionTestSecretStore::default());
+        let state = transaction_test_state_with_secret_store(
+            &temp,
+            default_persisted_state(),
+            Some(TestFailureStage::Replace),
+            secret_store.clone(),
+        )
+        .await;
+
+        let response = confirm_desktop_provider_import(
+            State(state.clone()),
+            Ok(Json(synthetic_provider_import_document())),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(state.providers.read().await.is_empty());
+        assert!(read_test_state(&test_persistence(&temp))["providers"]
+            .as_array()
+            .is_some_and(Vec::is_empty));
+        assert_eq!(secret_store.set_call_count(), 0);
+        assert_eq!(secret_store.delete_call_count(), 0);
+        assert_eq!(state.revision.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn provider_transaction_blank_key_upsert_preserves_secret() {
+        let temp = SyntheticTempDir::new("provider-blank-key");
+        let persisted = synthetic_provider_state();
+        let old_secret_ref = persisted.providers[0].secret_ref.clone();
+        let secret_store = Arc::new(ProviderTransactionTestSecretStore::default());
+        secret_store.seed(&old_secret_ref);
+        let state =
+            transaction_test_state_with_secret_store(&temp, persisted, None, secret_store.clone())
+                .await;
+
+        let response = upsert_desktop_provider(
+            State(state.clone()),
+            Json(synthetic_provider_upsert_request(
+                Some("synthetic-provider"),
+                Some("   "),
+            )),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+
+        assert_eq!(body["hasSecret"], json!(true));
+        assert!(state.providers.read().await[0].secret_ref == old_secret_ref);
+        assert!(secret_store.contains(&old_secret_ref));
+        assert_eq!(secret_store.set_call_count(), 0);
+        assert_eq!(secret_store.delete_call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn provider_transaction_create_key_success() {
+        let temp = SyntheticTempDir::new("provider-create-key");
+        let secret_store = Arc::new(ProviderTransactionTestSecretStore::default());
+        let state = transaction_test_state_with_secret_store(
+            &temp,
+            default_persisted_state(),
+            None,
+            secret_store.clone(),
+        )
+        .await;
+        let initial_id_seq = state.id_seq.load(Ordering::Relaxed);
+
+        let response = upsert_desktop_provider(
+            State(state.clone()),
+            Json(synthetic_provider_upsert_request(
+                None,
+                Some("synthetic-create-key"),
+            )),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        let providers = state.providers.read().await;
+        let secret_ref = providers[0].secret_ref.clone();
+
+        assert_eq!(body["hasSecret"], json!(true));
+        assert!(is_controlled_provider_secret_ref(&secret_ref));
+        assert!(secret_store.contains(&secret_ref));
+        assert_eq!(secret_store.len(), 1);
+        assert!(state.id_seq.load(Ordering::Relaxed) > initial_id_seq);
+        assert_eq!(state.revision.load(Ordering::Acquire), 1);
+        assert!(
+            read_test_state(&test_persistence(&temp))["providers"][0]["secretRef"]
+                == json!(secret_ref)
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_transaction_secret_write_failure_preserves_state() {
+        let temp = SyntheticTempDir::new("provider-secret-write-failure");
+        let secret_store = Arc::new(ProviderTransactionTestSecretStore::default());
+        secret_store.fail_next_set();
+        let state = transaction_test_state_with_secret_store(
+            &temp,
+            default_persisted_state(),
+            None,
+            secret_store.clone(),
+        )
+        .await;
+        let initial_id_seq = state.id_seq.load(Ordering::Relaxed);
+
+        let response = upsert_desktop_provider(
+            State(state.clone()),
+            Json(synthetic_provider_upsert_request(
+                None,
+                Some("synthetic-write-failure-key"),
+            )),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(state.providers.read().await.is_empty());
+        assert!(read_test_state(&test_persistence(&temp))["providers"]
+            .as_array()
+            .is_some_and(Vec::is_empty));
+        assert_eq!(secret_store.len(), 0);
+        assert_eq!(state.id_seq.load(Ordering::Relaxed), initial_id_seq);
+        assert_eq!(state.revision.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn secret_compensation_removes_new_secret_after_create_persistence_failure() {
+        let temp = SyntheticTempDir::new("secret-compensation-create");
+        let secret_store = Arc::new(ProviderTransactionTestSecretStore::default());
+        let state = transaction_test_state_with_secret_store(
+            &temp,
+            default_persisted_state(),
+            Some(TestFailureStage::Replace),
+            secret_store.clone(),
+        )
+        .await;
+        let initial_id_seq = state.id_seq.load(Ordering::Relaxed);
+
+        let response = upsert_desktop_provider(
+            State(state.clone()),
+            Json(synthetic_provider_upsert_request(
+                None,
+                Some("synthetic-compensation-key"),
+            )),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(state.providers.read().await.is_empty());
+        assert_eq!(secret_store.set_call_count(), 1);
+        assert_eq!(secret_store.delete_call_count(), 1);
+        assert_eq!(secret_store.len(), 0);
+        assert_eq!(state.id_seq.load(Ordering::Relaxed), initial_id_seq);
+        assert_eq!(state.revision.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn secret_compensation_retries_transient_delete_failure() {
+        let temp = SyntheticTempDir::new("secret-compensation-retry");
+        let secret_store = Arc::new(ProviderTransactionTestSecretStore::default());
+        secret_store.fail_next_delete();
+        let state = transaction_test_state_with_secret_store(
+            &temp,
+            default_persisted_state(),
+            Some(TestFailureStage::Replace),
+            secret_store.clone(),
+        )
+        .await;
+
+        let response = upsert_desktop_provider(
+            State(state.clone()),
+            Json(synthetic_provider_upsert_request(
+                None,
+                Some("synthetic-compensation-retry-key"),
+            )),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(state.providers.read().await.is_empty());
+        assert_eq!(secret_store.delete_call_count(), 2);
+        assert_eq!(secret_store.len(), 0);
+        assert_eq!(state.revision.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn provider_transaction_key_update_success_rotates_secret() {
+        let temp = SyntheticTempDir::new("provider-key-update");
+        let persisted = synthetic_provider_state();
+        let old_secret_ref = persisted.providers[0].secret_ref.clone();
+        let secret_store = Arc::new(ProviderTransactionTestSecretStore::default());
+        secret_store.seed(&old_secret_ref);
+        let state =
+            transaction_test_state_with_secret_store(&temp, persisted, None, secret_store.clone())
+                .await;
+
+        let response = update_desktop_provider_secret(
+            State(state.clone()),
+            Path("synthetic-provider".to_string()),
+            Json(synthetic_provider_secret_request("synthetic-update-key")),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        let new_secret_ref = state.providers.read().await[0].secret_ref.clone();
+
+        assert_eq!(body["hasSecret"], json!(true));
+        assert!(new_secret_ref != old_secret_ref);
+        assert!(secret_store.contains(&new_secret_ref));
+        assert!(!secret_store.contains(&old_secret_ref));
+        assert_eq!(secret_store.len(), 1);
+        assert!(
+            read_test_state(&test_persistence(&temp))["providers"][0]["secretRef"]
+                == json!(new_secret_ref)
+        );
+    }
+
+    #[tokio::test]
+    async fn secret_compensation_removes_new_secret_after_update_persistence_failure() {
+        let temp = SyntheticTempDir::new("secret-compensation-update");
+        let persisted = synthetic_provider_state();
+        let old_secret_ref = persisted.providers[0].secret_ref.clone();
+        let secret_store = Arc::new(ProviderTransactionTestSecretStore::default());
+        secret_store.seed(&old_secret_ref);
+        let state = transaction_test_state_with_secret_store(
+            &temp,
+            persisted,
+            Some(TestFailureStage::Replace),
+            secret_store.clone(),
+        )
+        .await;
+
+        let response = update_desktop_provider_secret(
+            State(state.clone()),
+            Path("synthetic-provider".to_string()),
+            Json(synthetic_provider_secret_request(
+                "synthetic-update-failure-key",
+            )),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(state.providers.read().await[0].secret_ref == old_secret_ref);
+        assert!(secret_store.contains(&old_secret_ref));
+        assert_eq!(secret_store.len(), 1);
+        assert_eq!(secret_store.delete_call_count(), 1);
+        assert_eq!(state.revision.load(Ordering::Acquire), 0);
+        assert!(
+            read_test_state(&test_persistence(&temp))["providers"][0]["secretRef"]
+                == json!(old_secret_ref)
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_transaction_key_update_cleanup_failure_is_partial_success() {
+        let temp = SyntheticTempDir::new("provider-key-cleanup-failure");
+        let persisted = synthetic_provider_state();
+        let old_secret_ref = persisted.providers[0].secret_ref.clone();
+        let secret_store = Arc::new(ProviderTransactionTestSecretStore::default());
+        secret_store.seed(&old_secret_ref);
+        secret_store.fail_delete_times(3);
+        let state =
+            transaction_test_state_with_secret_store(&temp, persisted, None, secret_store.clone())
+                .await;
+
+        let response = update_desktop_provider_secret(
+            State(state.clone()),
+            Path("synthetic-provider".to_string()),
+            Json(synthetic_provider_secret_request(
+                "synthetic-cleanup-failure-key",
+            )),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let new_secret_ref = state.providers.read().await[0].secret_ref.clone();
+
+        assert!(new_secret_ref != old_secret_ref);
+        assert!(secret_store.contains(&new_secret_ref));
+        assert!(secret_store.contains(&old_secret_ref));
+        assert_eq!(secret_store.len(), 2);
+        assert_eq!(state.revision.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn key_clear_transaction_success() {
+        let temp = SyntheticTempDir::new("key-clear-success");
+        let persisted = synthetic_provider_state();
+        let old_secret_ref = persisted.providers[0].secret_ref.clone();
+        let secret_store = Arc::new(ProviderTransactionTestSecretStore::default());
+        secret_store.seed(&old_secret_ref);
+        let state =
+            transaction_test_state_with_secret_store(&temp, persisted, None, secret_store.clone())
+                .await;
+
+        let response = delete_desktop_provider_secret(
+            State(state.clone()),
+            Path("synthetic-provider".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        let cleared_secret_ref = state.providers.read().await[0].secret_ref.clone();
+
+        assert_eq!(body["hasSecret"], json!(false));
+        assert!(cleared_secret_ref != old_secret_ref);
+        assert!(!secret_store.contains(&old_secret_ref));
+        assert!(!secret_store.contains(&cleared_secret_ref));
+        assert_eq!(secret_store.len(), 0);
+        let responses = desktop_provider_responses(&state)
+            .await
+            .expect("provider response should succeed");
+        assert!(!responses[0].has_secret);
+    }
+
+    #[tokio::test]
+    async fn key_clear_transaction_persistence_failure_preserves_secret() {
+        let temp = SyntheticTempDir::new("key-clear-persistence-failure");
+        let persisted = synthetic_provider_state();
+        let old_secret_ref = persisted.providers[0].secret_ref.clone();
+        let secret_store = Arc::new(ProviderTransactionTestSecretStore::default());
+        secret_store.seed(&old_secret_ref);
+        let state = transaction_test_state_with_secret_store(
+            &temp,
+            persisted,
+            Some(TestFailureStage::Replace),
+            secret_store.clone(),
+        )
+        .await;
+
+        let response = delete_desktop_provider_secret(
+            State(state.clone()),
+            Path("synthetic-provider".to_string()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(state.providers.read().await[0].secret_ref == old_secret_ref);
+        assert!(secret_store.contains(&old_secret_ref));
+        assert_eq!(secret_store.delete_call_count(), 0);
+        assert_eq!(state.revision.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn key_clear_transaction_cleanup_failure_is_partial_success() {
+        let temp = SyntheticTempDir::new("key-clear-cleanup-failure");
+        let persisted = synthetic_provider_state();
+        let old_secret_ref = persisted.providers[0].secret_ref.clone();
+        let secret_store = Arc::new(ProviderTransactionTestSecretStore::default());
+        secret_store.seed(&old_secret_ref);
+        secret_store.fail_delete_times(3);
+        let state =
+            transaction_test_state_with_secret_store(&temp, persisted, None, secret_store.clone())
+                .await;
+
+        let response = delete_desktop_provider_secret(
+            State(state.clone()),
+            Path("synthetic-provider".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let cleared_secret_ref = state.providers.read().await[0].secret_ref.clone();
+
+        assert!(cleared_secret_ref != old_secret_ref);
+        assert!(secret_store.contains(&old_secret_ref));
+        assert!(!secret_store.contains(&cleared_secret_ref));
+        let responses = desktop_provider_responses(&state)
+            .await
+            .expect("provider response should succeed");
+        assert!(!responses[0].has_secret);
+    }
+
+    #[tokio::test]
+    async fn provider_delete_transaction_success() {
+        let temp = SyntheticTempDir::new("provider-delete-success");
+        let persisted = synthetic_provider_state();
+        let old_secret_ref = persisted.providers[0].secret_ref.clone();
+        let secret_store = Arc::new(ProviderTransactionTestSecretStore::default());
+        secret_store.seed(&old_secret_ref);
+        let state =
+            transaction_test_state_with_secret_store(&temp, persisted, None, secret_store.clone())
+                .await;
+
+        let response =
+            delete_desktop_provider(State(state.clone()), Path("synthetic-provider".to_string()))
+                .await
+                .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(state.providers.read().await.is_empty());
+        assert_eq!(secret_store.len(), 0);
+        assert!(read_test_state(&test_persistence(&temp))["providers"]
+            .as_array()
+            .is_some_and(Vec::is_empty));
+    }
+
+    #[tokio::test]
+    async fn provider_delete_transaction_persistence_failure_preserves_provider_and_secret() {
+        let temp = SyntheticTempDir::new("provider-delete-persistence-failure");
+        let persisted = synthetic_provider_state();
+        let old_secret_ref = persisted.providers[0].secret_ref.clone();
+        let secret_store = Arc::new(ProviderTransactionTestSecretStore::default());
+        secret_store.seed(&old_secret_ref);
+        let state = transaction_test_state_with_secret_store(
+            &temp,
+            persisted,
+            Some(TestFailureStage::Replace),
+            secret_store.clone(),
+        )
+        .await;
+
+        let response =
+            delete_desktop_provider(State(state.clone()), Path("synthetic-provider".to_string()))
+                .await
+                .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(state.providers.read().await.len(), 1);
+        assert!(secret_store.contains(&old_secret_ref));
+        assert_eq!(secret_store.delete_call_count(), 0);
+        assert_eq!(state.revision.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn provider_delete_transaction_cleanup_failure_is_partial_success() {
+        let temp = SyntheticTempDir::new("provider-delete-cleanup-failure");
+        let persisted = synthetic_provider_state();
+        let old_secret_ref = persisted.providers[0].secret_ref.clone();
+        let secret_store = Arc::new(ProviderTransactionTestSecretStore::default());
+        secret_store.seed(&old_secret_ref);
+        secret_store.fail_delete_times(3);
+        let state =
+            transaction_test_state_with_secret_store(&temp, persisted, None, secret_store.clone())
+                .await;
+
+        let response =
+            delete_desktop_provider(State(state.clone()), Path("synthetic-provider".to_string()))
+                .await
+                .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(state.providers.read().await.is_empty());
+        assert!(secret_store.contains(&old_secret_ref));
+        assert!(read_test_state(&test_persistence(&temp))["providers"]
+            .as_array()
+            .is_some_and(Vec::is_empty));
+    }
+
+    #[tokio::test]
+    async fn provider_transaction_concurrent_key_updates_are_serialized() {
+        let temp = SyntheticTempDir::new("provider-concurrent-key-update");
+        let persisted = synthetic_provider_state();
+        let old_secret_ref = persisted.providers[0].secret_ref.clone();
+        let secret_store = Arc::new(ProviderTransactionTestSecretStore::default());
+        secret_store.seed(&old_secret_ref);
+        let state =
+            transaction_test_state_with_secret_store(&temp, persisted, None, secret_store.clone())
+                .await;
+
+        let first_state = state.clone();
+        let first = tokio::spawn(async move {
+            update_desktop_provider_secret(
+                State(first_state),
+                Path("synthetic-provider".to_string()),
+                Json(synthetic_provider_secret_request(
+                    "synthetic-concurrent-one",
+                )),
+            )
+            .await
+            .into_response()
+            .status()
+        });
+        let second_state = state.clone();
+        let second = tokio::spawn(async move {
+            update_desktop_provider_secret(
+                State(second_state),
+                Path("synthetic-provider".to_string()),
+                Json(synthetic_provider_secret_request(
+                    "synthetic-concurrent-two",
+                )),
+            )
+            .await
+            .into_response()
+            .status()
+        });
+
+        assert_eq!(
+            first.await.expect("first update should finish"),
+            StatusCode::OK
+        );
+        assert_eq!(
+            second.await.expect("second update should finish"),
+            StatusCode::OK
+        );
+        let final_secret_ref = state.providers.read().await[0].secret_ref.clone();
+        assert!(secret_store.contains(&final_secret_ref));
+        assert!(!secret_store.contains(&old_secret_ref));
+        assert_eq!(secret_store.len(), 1);
+        assert_eq!(state.revision.load(Ordering::Acquire), 2);
+    }
+
+    #[tokio::test]
+    async fn provider_transaction_preserves_concurrent_category_a_update() {
+        let temp = SyntheticTempDir::new("provider-category-a-concurrent");
+        let persisted = synthetic_provider_state();
+        let old_secret_ref = persisted.providers[0].secret_ref.clone();
+        let secret_store = Arc::new(ProviderTransactionTestSecretStore::default());
+        secret_store.seed(&old_secret_ref);
+        let state =
+            transaction_test_state_with_secret_store(&temp, persisted, None, secret_store.clone())
+                .await;
+
+        let provider_state = state.clone();
+        let provider_update = tokio::spawn(async move {
+            update_desktop_provider_secret(
+                State(provider_state),
+                Path("synthetic-provider".to_string()),
+                Json(synthetic_provider_secret_request(
+                    "synthetic-category-a-key",
+                )),
+            )
+            .await
+            .into_response()
+            .status()
+        });
+        let settings_state = state.clone();
+        let settings_update = tokio::spawn(async move {
+            update_favorite_models(
+                State(settings_state),
+                Json(UpdateFavoriteModelsRequest {
+                    model_ids: vec!["synthetic-provider-model".to_string()],
+                }),
+            )
+            .await
+            .into_response()
+            .status()
+        });
+
+        assert_eq!(
+            provider_update
+                .await
+                .expect("provider update should finish"),
+            StatusCode::OK
+        );
+        assert_eq!(
+            settings_update
+                .await
+                .expect("settings update should finish"),
+            StatusCode::OK
+        );
+        assert_eq!(
+            state.settings.read().await["favoriteModels"],
+            json!(["synthetic-provider-model"])
+        );
+        assert_eq!(
+            read_test_state(&test_persistence(&temp))["settings"]["favoriteModels"],
+            json!(["synthetic-provider-model"])
+        );
+        let final_secret_ref = state.providers.read().await[0].secret_ref.clone();
+        assert!(secret_store.contains(&final_secret_ref));
+    }
+
+    #[tokio::test]
+    async fn provider_transaction_blank_upsert_and_clear_are_serialized() {
+        let temp = SyntheticTempDir::new("provider-blank-clear-concurrent");
+        let persisted = synthetic_provider_state();
+        let old_secret_ref = persisted.providers[0].secret_ref.clone();
+        let secret_store = Arc::new(ProviderTransactionTestSecretStore::default());
+        secret_store.seed(&old_secret_ref);
+        let state =
+            transaction_test_state_with_secret_store(&temp, persisted, None, secret_store.clone())
+                .await;
+
+        let upsert_state = state.clone();
+        let upsert = tokio::spawn(async move {
+            upsert_desktop_provider(
+                State(upsert_state),
+                Json(synthetic_provider_upsert_request(
+                    Some("synthetic-provider"),
+                    Some("   "),
+                )),
+            )
+            .await
+            .into_response()
+            .status()
+        });
+        let clear_state = state.clone();
+        let clear = tokio::spawn(async move {
+            delete_desktop_provider_secret(
+                State(clear_state),
+                Path("synthetic-provider".to_string()),
+            )
+            .await
+            .into_response()
+            .status()
+        });
+
+        assert_eq!(
+            upsert.await.expect("blank upsert should finish"),
+            StatusCode::OK
+        );
+        assert_eq!(
+            clear.await.expect("key clear should finish"),
+            StatusCode::OK
+        );
+        assert_eq!(secret_store.set_call_count(), 0);
+        assert_eq!(secret_store.len(), 0);
+        let responses = desktop_provider_responses(&state)
+            .await
+            .expect("provider response should succeed");
+        assert!(!responses[0].has_secret);
+    }
+
+    #[tokio::test]
+    async fn provider_transaction_safe_errors_hide_secret_material() {
+        let temp = SyntheticTempDir::new("provider-safe-error");
+        let persisted = synthetic_provider_state();
+        let old_secret_ref = persisted.providers[0].secret_ref.clone();
+        let secret_store = Arc::new(ProviderTransactionTestSecretStore::default());
+        secret_store.seed(&old_secret_ref);
+        secret_store.fail_next_set();
+        let state =
+            transaction_test_state_with_secret_store(&temp, persisted, None, secret_store).await;
+        let fake_key = "synthetic-safe-error-key";
+
+        let response = update_desktop_provider_secret(
+            State(state),
+            Path("synthetic-provider".to_string()),
+            Json(synthetic_provider_secret_request(fake_key)),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("safe error body should be readable");
+        let body = String::from_utf8(body.to_vec()).expect("safe error body should be UTF-8");
+
+        assert!(!body.contains(fake_key));
+        assert!(!body.contains(&old_secret_ref));
+        assert!(!body.contains(temp.path.to_string_lossy().as_ref()));
+        assert!(!body.contains("synthetic secret"));
+    }
+
+    #[tokio::test]
+    async fn provider_transaction_has_secret_consistency_matrix() {
+        let temp = SyntheticTempDir::new("provider-has-secret-matrix");
+        let persisted = synthetic_provider_state();
+        let old_secret_ref = persisted.providers[0].secret_ref.clone();
+        let secret_store = Arc::new(ProviderTransactionTestSecretStore::default());
+        secret_store.seed(&old_secret_ref);
+        let state =
+            transaction_test_state_with_secret_store(&temp, persisted, None, secret_store).await;
+
+        let before = desktop_provider_responses(&state)
+            .await
+            .expect("configured provider response should succeed");
+        assert!(before[0].has_secret);
+
+        let response = delete_desktop_provider_secret(
+            State(state.clone()),
+            Path("synthetic-provider".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let after = desktop_provider_responses(&state)
+            .await
+            .expect("cleared provider response should succeed");
+        assert!(!after[0].has_secret);
     }
 
     #[test]

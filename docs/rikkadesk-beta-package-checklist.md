@@ -198,7 +198,20 @@ Phase 12 P1-B initializes defaults only when the primary state is missing. Other
 
 Phase 12 P1-C1 stages pure settings and conversation mutations, persists the staged snapshot through the P1-A atomic writer, and commits live state only after persistence succeeds. Covered operations are assistant selection, current assistant model, favorites, title, pin/unpin, conversation delete, text message edit, and message delete. Missing conversation detail/stream GETs now return a virtual DTO without creating persisted state. Run the synthetic `staged_transaction`, `mutation_transaction`, `transaction_failure`, and `get_does_not_mutate` test groups and confirm success events occur only after commit.
 
-P1-C1 does not make every mutation class atomic. Provider/SecretStore compensation remains P1-C2, file/blob consistency remains P1-C3, and send/regenerate/stop/streaming finalization remains P1-C4. Backup Mode A/B packaging is still blocked. Do not claim that SecretStore and JSON state, managed blobs and metadata, or streaming deltas are fully transactional.
+Phase 12 P1-C2 serializes Provider/SecretStore mutations and commits Provider metadata through the same staged-state helper. Key create/update uses a new copy-on-write `secretRef`; failed state persistence deletes the operation-created encrypted blob and retains the old state/secret. Blank-key upsert keeps the old key. Clear/delete commits state before old-secret cleanup. Import never restores source `secretRef` or `hasSecret` and creates no secret. Run the synthetic `provider_transaction`, `secret_compensation`, `provider_import`, `provider_delete`, and `key_clear` groups plus the full Rust test suite.
+
+P1-C2 verification must cover:
+
+- Provider import success/failure, with `hasSecret: false` and no SecretStore write.
+- Provider create/update key success, secret prepare failure, state persistence failure, and new-secret compensation.
+- Blank-key upsert preserving the existing secret without a SecretStore write.
+- Key clear and Provider delete preserving the old ref/blob on state failure.
+- Post-commit cleanup failure returning logical success with a fixed redacted warning and leaving only an unreferenced encrypted orphan.
+- Concurrent key updates, Provider mutation plus Category A mutation, and blank-key upsert plus clear completing without deadlock or lost state.
+- Safe errors containing no key, encrypted bytes, secret ref, storage path, or state body.
+- Synthetic temp state and an in-memory fake SecretStore only. Never read real app data or `mock-api/secrets/*.bin`.
+
+P1-C1/P1-C2 do not make every mutation class atomic. File/blob consistency remains P1-C3, and send/regenerate/stop/streaming finalization remains P1-C4. Backup Mode A/B packaging is still blocked. Do not claim that SecretStore and JSON state are fully atomic across process crashes: an unreferenced encrypted orphan can remain between new-secret prepare and state commit or between state commit and old-secret cleanup. Managed blobs/metadata and streaming deltas are also not yet fully transactional.
 
 It may contain:
 

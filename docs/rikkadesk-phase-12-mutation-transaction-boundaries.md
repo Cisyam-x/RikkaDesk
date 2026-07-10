@@ -1,8 +1,8 @@
 # RikkaDesk Phase 12 Mutation Transaction Boundaries
 
-This document began as the Phase 12 P1-C0 audit and design for runtime mutation transactions. It now also records the completed P1-C1 implementation for pure persisted-state mutations while retaining the SecretStore, managed blob, network, and streaming boundaries for later phases.
+This document began as the Phase 12 P1-C0 audit and design for runtime mutation transactions. It now records the completed P1-C1 pure-state implementation and P1-C2 Provider/SecretStore compensation while retaining managed blob, network, and streaming boundaries for later phases.
 
-P1-C1 changes the Rust mock API transaction path only. It does not add backup/restore, read real app data or secret blobs, change `schemaVersion: 6`, change provider import/export version 4, or enable real-provider image input by default.
+P1-C1 and P1-C2 change the Rust mock API transaction path only. They do not add backup/restore, read real app data or secret blobs, change `schemaVersion: 6`, change provider import/export version 4, or enable real-provider image input by default.
 
 ## Current State Model
 
@@ -22,9 +22,11 @@ Runtime-only data is separate:
 - SSE `seq: AtomicU64`
 - HTTP client
 - SecretStore
+- Provider/SecretStore transaction mutex
+- Provider secret-ref sequence
 - persistence/save mutex and file operations
 
-P1-A serializes writes and atomically replaces the state file. P1-B makes startup and migration fail closed. P1-C1 now stages pure settings/conversation mutations, persists the explicit staged snapshot, and commits live state only after persistence succeeds. Provider/SecretStore, file/blob, and streaming mutations remain transitional paths; their short state-write windows are serialized with P1-C1, but their cross-resource compensation is still pending.
+P1-A serializes writes and atomically replaces the state file. P1-B makes startup and migration fail closed. P1-C1 stages pure settings/conversation mutations, persists the explicit staged snapshot, and commits live state only after persistence succeeds. P1-C2 now applies the same state transaction to Provider metadata and coordinates it with copy-on-write SecretStore operations. File/blob and streaming mutations remain transitional paths.
 
 ## P1-C1 Implementation Status
 
@@ -45,18 +47,36 @@ The implementation adds one process-local `mutation_transaction_mutex`, one live
 
 P1-C1 success is published only after disk persistence and the live commit finish. Persistence or validation failure leaves pure live state, disk state, and revision unchanged and emits no success update.
 
-Transitional Category B/C/D writers now use the same mutation mutex and commit barrier for their short live-state write/persist window. This prevents interleaving with a P1-C1 commit and prevents an older persistence snapshot from overwriting a newer transaction. It does not compensate a SecretStore change, remove an orphan blob, restore a deleted blob, or make streaming deltas durable. A failed transitional writer can still leave its live component ahead of disk; P1-C2, P1-C3, and P1-C4 own those remaining semantics.
+Transitional Category B/D writers use the same mutation mutex and commit barrier for their short live-state write/persist window. This prevents interleaving with a staged commit and prevents an older persistence snapshot from overwriting a newer transaction. It does not remove an orphan managed file blob, restore a deleted blob, or make streaming deltas durable. P1-C3 and P1-C4 own those remaining semantics.
+
+## P1-C2 Implementation Status
+
+All Provider mutations now acquire one process-local `provider_secret_transaction_mutex`. SecretStore prepare/cleanup runs without component locks, the commit barrier, or the global state mutation mutex. The final Provider metadata mutation runs through `transact_persisted_state` with the Provider scope, so persistence failure leaves live Provider/settings state, durable state, `id_seq`, and revision unchanged.
+
+Implemented Provider handlers:
+
+- `POST /api/desktop/providers/import/confirm`
+- `POST /api/desktop/providers`
+- `POST /api/desktop/providers/{id}/secret`
+- `DELETE /api/desktop/providers/{id}/secret`
+- `DELETE /api/desktop/providers/{id}`
+
+API key create/update uses a newly generated immutable `secretRef`; no existing encrypted blob is overwritten in place. A new blob is prepared first, the staged Provider metadata is persisted and committed, and the old blob is cleaned only after commit. State rejection compensates by deleting the operation-created blob. Blank-key upsert preserves the existing reference and performs no SecretStore write. Clear rotates to a new empty reference and delete removes Provider metadata; both defer old-blob deletion until after state commit. Import ignores source `hasSecret`, never accepts/restores a source `secretRef`, creates no secret blob, and returns `hasSecret: false`.
+
+Secret compensation and cleanup use a bounded three-attempt idempotent delete. Old-secret cleanup failure after a successful state commit is logical success with a fixed redacted warning. The committed state does not reference the old encrypted blob, so it is an orphan rather than a dangling active reference. No complex partial-success UI was added. Handled state failures compensate operation-created blobs; if all compensation attempts are prevented by an underlying SecretStore failure, the API returns a distinct fixed safe error and requires later reconciliation.
+
+JSON state and DPAPI/keyring storage are not one atomic resource. A process crash after a new encrypted blob is prepared but before state commit, or after state commit but before old-blob cleanup, can leave an unreferenced encrypted orphan. Startup orphan discovery/reconciliation is deferred. P1-C2 does not claim portable secret backup or complete cross-resource atomicity.
 
 ## Mutation Call-Site Inventory
 
 | Endpoint or task | Live structures changed | Persistence | External/runtime side effect | Current persistence-failure behavior | Safe direct rollback? | Category |
 |---|---|---|---|---|---|---|
-| Provider import confirm | providers, derived settings, `id_seq` | Yes | settings SSE | Transitional writer is serialized, but failed persistence can leave live state ahead | Defer with the provider domain | C2 |
-| Provider upsert without key | providers, derived settings/favorites/current model, `id_seq` | Yes | settings SSE | Transitional writer is serialized, but failed persistence can leave live state ahead | Defer with the provider domain | C2 |
-| Provider upsert with key | providers, derived settings, `id_seq` | Yes | SecretStore write happens first | Secret can change and live state remains even when state save fails | Requires secret compensation and staged state | C |
-| Provider API key update | None in JSON state; existing `secretRef` is read | No | SecretStore replace | SecretStore error returns 500; successful secret change is immediate | SecretStore-owned atomic replace | C |
-| Provider API key clear | None in JSON state; existing `secretRef` remains | No | SecretStore delete | Delete error returns 500; successful clear is immediate | Intentional missing secret, not state rollback | C |
-| Provider delete | providers and derived settings/favorites/current model | Yes | SecretStore delete happens first; settings/list SSE after save | Save failure can leave live provider removed while disk still references a now-missing secret | Unsafe without reversible secret delete | C |
+| Provider import confirm | providers, derived settings, `id_seq` | Yes | settings SSE after commit; no SecretStore write | Failed stage leaves live/disk/revision unchanged | Implemented staged Provider transaction | C |
+| Provider upsert without key | providers, derived settings/favorites/current model, `id_seq` | Yes | settings SSE after commit; existing secret retained | Failed stage leaves live/disk/revision and secret unchanged | Implemented staged Provider transaction | C |
+| Provider upsert with key | providers, derived settings, `id_seq`, rotated `secretRef` | Yes | New encrypted blob prepared; old blob cleaned after commit | Failed stage deletes the new blob and retains old state/secret | Implemented copy-on-write compensation | C |
+| Provider API key update | Provider/derived settings with rotated `secretRef` | Yes | New encrypted blob prepared; old blob cleaned after commit | Failed stage deletes new blob and retains old state/secret | Implemented copy-on-write compensation | C |
+| Provider API key clear | Provider/derived settings with new empty `secretRef` | Yes | Old blob deleted after state commit | Failed stage keeps old reference/blob and `hasSecret: true` | Implemented commit-then-cleanup | C |
+| Provider delete | providers and derived settings/favorites/current model | Yes | Old blob deleted after commit; settings/list SSE after commit | Failed stage leaves provider and secret intact | Implemented commit-then-cleanup | C |
 | Assistant selection | settings | Yes | settings/list SSE | P1-C1 discards failed stage; live/disk/revision remain old | Implemented staged transaction | A |
 | Current assistant model | settings and assistant model field | Yes | settings SSE | P1-C1 discards failed stage; live/disk/revision remain old | Implemented staged transaction | A |
 | Favorite models | settings | Yes | settings SSE | P1-C1 discards failed stage; live/disk/revision remain old | Implemented staged transaction | A |
@@ -272,20 +292,21 @@ The optional runtime revision helps tests and diagnostics reject stale backgroun
 - Requires another state transaction on secret failure.
 - Exposes a larger inconsistency window and is not recommended as the default.
 
-### Recommended SecretStore Contract
+### Implemented P1-C2 Contract
 
-P1-C2 should design a non-logging operation object with `prepare`, `apply`, `rollback`, and `finalize` semantics. On Windows, reversible operations should use encrypted blob staging/quarantine rather than placing plaintext secrets in rollback state. Cross-platform keyring behavior needs an equivalent contract or must explicitly report that an operation cannot be made reversible.
+P1-C2 uses copy-on-write secret references instead of retaining plaintext rollback data or overwriting the active encrypted value. All helper failures are converted to fixed safe errors; API keys, encrypted bytes, refs, storage keys, and paths are not logged.
 
 Operation rules:
 
-- New provider plus key: prepare/create secret, persist staged provider/settings, commit live, finalize secret operation. State failure deletes the newly created secret.
-- Existing provider config plus replacement key: preserve a reversible encrypted prior value, apply replacement, persist staged state, commit, finalize. State failure restores the prior encrypted value.
-- API key update only: no JSON transaction is needed because `secretRef` does not change, but SecretStore replacement itself must be atomic.
-- API key clear only: delete failure returns 500. A successful clear intentionally leaves provider config and `secretRef` with `hasSecret: false`; that is not a dangling state error.
-- Provider delete: prepare a reversible secret deletion, persist staged provider/settings removal, commit live, then finalize deletion. State failure restores the secret before returning failure.
-- Compensation failure: return a distinct safe 5xx, emit no success event, retain a fixed-stage reconciliation marker, and do not log secret material or paths.
+- New provider plus key: create a unique ref, prepare its encrypted blob, persist staged provider/settings, commit live, then return success. State failure deletes only the new blob.
+- Existing provider plus replacement key: prepare a unique new ref/blob, stage the Provider to the new ref, commit, then delete the old ref/blob. State failure deletes the new blob; the old ref/blob remains active.
+- Blank-key Provider upsert: retain the existing ref and secret; a new Provider gets a deterministic empty ref and no blob.
+- API key clear: stage a new empty ref, persist and commit, then delete the old blob. State failure leaves the old ref/blob active.
+- Provider delete: persist and commit Provider/settings removal first, then delete the old blob. State failure leaves both Provider and secret active.
+- Import confirm: import only validated non-sensitive metadata, generate local IDs/empty refs, ignore source `hasSecret`, and perform no SecretStore write.
+- New-secret compensation failure: return a distinct fixed safe 5xx and no success event. Old-secret cleanup failure after commit keeps the logical state success, emits one fixed warning, and leaves an unreferenced encrypted orphan for future reconciliation.
 
-SecretStore does not belong in P1-C1.
+On Windows, `secret_exists` checks the controlled blob path without reading or decrypting blob content. `get_secret` remains the only provider-runtime path that reads and DPAPI-decrypts a configured API key. P1-C2 tests replace the real store with an in-memory synthetic store.
 
 ## Managed Blob Transaction Boundary
 
@@ -341,10 +362,10 @@ Background streaming is handled separately in P1-C4.
 
 | Endpoint/task | State commit failure | External side-effect failure | HTTP/SSE result |
 |---|---|---|---|
-| Provider import/upsert without key | Discard stage | None | Safe 5xx; no settings success event |
-| Provider upsert with key | Discard stage; compensate secret | Secret apply/rollback failure is distinct | Safe 5xx; no provider response/event |
-| Key update/clear | No state commit | SecretStore failure leaves old/known state | Safe 5xx; never return `hasSecret` success falsely |
-| Provider delete | Discard stage; restore prepared secret deletion | Compensation failure requires reconciliation | Safe 5xx; no list/settings success event |
+| Provider import/upsert without key | Discard stage | None; existing secret is untouched | Safe 5xx; no settings success event |
+| Provider upsert/key update with key | Discard stage; delete operation-created blob | Prepare/compensation failure is distinct and redacted | Safe 5xx; no provider response/event |
+| Key clear | Discard stage and retain old ref/blob | Post-commit old-blob cleanup failure is orphan-only partial success | State failure is safe 5xx; committed clear returns success with fixed warning only |
+| Provider delete | Discard stage and retain old ref/blob | Post-commit old-blob cleanup failure is orphan-only partial success | State failure is safe 5xx; committed delete remains success |
 | Assistant/model/favorites | Discard stage | None | Safe 5xx; no settings event |
 | Title/pin/edit/delete message | Discard stage | None | Safe 5xx; no conversation/list event |
 | Conversation delete | Discard stage; retain runtime sender/generation until commit | Runtime cleanup failure is local and retryable | Safe 5xx; no delete invalidate |
@@ -374,15 +395,17 @@ Scope:
 
 Provider import/upsert remains outside P1-C1 even when a request omits a key, so that all provider state and SecretStore ordering can be resolved together in P1-C2. Exclude SecretStore compensation, blob transactions, send/regenerate/stop semantics, and streaming finalization.
 
-### P1-C2: Provider And SecretStore Compensation
+### P1-C2: Provider And SecretStore Compensation (Completed)
 
 Scope:
 
+- Provider import and blank-key metadata upsert through staged state.
 - Provider upsert with key.
 - Key replacement and clear semantics.
 - Provider deletion.
-- Reversible secret operation contract.
-- Orphan/dangling-reference reconciliation and safe compensation errors.
+- Provider-specific serialization, copy-on-write refs, state-failure compensation, and safe cleanup errors.
+
+Completed P1-C2 prevents handled persistence failures from leaving state pointing to a newly missing secret and prevents key clear/delete from destroying the old secret before state durability. Process-crash orphan discovery and deletion are intentionally deferred; P1-C2 does not scan secret storage.
 
 ### P1-C3: File Blob Transaction And Compensation
 
@@ -420,10 +443,11 @@ Scope:
 ### Provider Secrets
 
 - New secret write plus state failure deletes the new secret.
-- Existing secret replacement plus state failure restores the prior encrypted value.
+- Existing secret replacement plus state failure deletes the new blob and retains the prior ref/blob.
 - Secret apply failure does not commit provider state.
-- Provider delete state failure restores prepared secret deletion.
-- Compensation failure produces a safe reconciliation state.
+- Key clear/provider delete state failure never deletes the prior blob.
+- Old-secret cleanup failure after commit keeps logical success and leaves only an unreferenced orphan.
+- Compensation/cleanup errors are fixed and redacted.
 - No orphan secret or state reference to an unexpectedly missing secret remains after successful compensation.
 
 ### Files
@@ -452,7 +476,7 @@ Do not implement Mode A/B backup packaging until these gates pass:
 
 ```text
 P1-C1 pure state transaction safety
-  -> P1-C2 provider secret consistency
+  -> P1-C2 provider secret consistency (completed)
   -> P1-C3 file/blob consistency
   -> P1-C4 streaming transaction safety
   -> Mode A/B backup package
@@ -460,7 +484,7 @@ P1-C1 pure state transaction safety
 
 Reason: a backup snapshot cannot be represented as consistent while runtime writers can expose uncommitted state, SecretStore operations can leave cross-resource inconsistencies, blobs can be missing/orphaned, or streaming can mutate persisted objects outside transaction boundaries.
 
-## P1-C1 Conclusions
+## P1-C1 And P1-C2 Conclusions
 
 - Recommended architecture: stage, persist, then commit live.
 - Global mutation mutex required: Yes.
@@ -468,13 +492,15 @@ Reason: a backup snapshot cannot be represented as consistent while runtime writ
 - Current component locks sufficient alone: No.
 - Long-term single persisted-state container recommended: Yes.
 - Live mutate then rollback recommended: No, except isolated runtime-only values.
-- SecretStore included in P1-C1: No; handle in P1-C2.
+- SecretStore included in P1-C1: No.
+- Provider/SecretStore compensation implemented in P1-C2: Yes, with copy-on-write refs and handled-failure compensation.
+- State and SecretStore fully atomic across process crashes: No; encrypted orphan windows remain documented.
 - File/blob operations included in P1-C1: No; unchanged metadata may be carried, but operations belong in P1-C3.
 - Background streaming handled separately: Yes, in P1-C4.
 - ID policy: gaps allowed, duplicates forbidden, never decrement `id_seq`.
 - Pure settings/conversation staged transactions implemented: Yes.
 - Missing conversation GET mutates persisted state: No.
 - Runtime revision persisted in schema v6: No.
-- Recovery/backup modes implemented by P1-C1: No.
+- Recovery/backup modes implemented by P1-C1/P1-C2: No.
 
-Recommended next step: P1-C2 Provider and SecretStore compensation. Mode A/B backup packaging remains blocked through P1-C4.
+Recommended next step: P1-C3 file blob transaction and compensation. Mode A/B backup packaging remains blocked through P1-C4.
