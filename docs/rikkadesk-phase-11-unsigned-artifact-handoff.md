@@ -196,6 +196,8 @@ Windows uninstall may retain app data and encrypted local secret blobs. This is 
 
 RikkaDesk app data is stored under:
 
+Formal app data backup/restore and migration safety is handled by Phase 12. Manual folder copies are not yet a supported portable backup format.
+
 ```powershell
 $env:APPDATA\com.cisyamx.rikkadesk
 ```
