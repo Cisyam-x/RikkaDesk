@@ -18,7 +18,7 @@ The original P0 audit was documentation only. Later sections record the implemen
 - Runtime mutation hardening: P1-C1 pure state, P1-C2 Provider/SecretStore, P1-C3 managed file/blob handled-failure semantics, and P1-C4 streaming lifecycle semantics are completed.
 - Portable backup export: backup package format v1 Mode A (`state-only`) and Mode B (`full-local-data`) are implemented without secrets.
 - Restore validation: P2-B no-write dry-run validation is implemented; it does not authorize or perform restore.
-- Actual restore: not implemented. P2-C0 defines the offline transaction protocol; P2-C1 staging, P2-C2 commit/rollback, and P2-C3 crash reconciliation remain future work.
+- Actual restore: not implemented. P2-C0 defines the offline transaction protocol; P2-C1 candidate staging is implemented; P2-C2 commit/rollback and P2-C3 crash reconciliation remain future work.
 
 ## P0 Decisions
 
@@ -780,6 +780,23 @@ P2-C0 defines the offline full-replacement restore protocol in `docs/rikkadesk-p
 
 P2-C0 changes documentation only. Actual restore remains unavailable.
 
+## P2-C1 Offline Staging Implementation Status
+
+P2-C1 implements an internal offline staging builder with no API/UI/runtime call path:
+
+- Every call completely re-runs P2-B format v1 package validation; a prior dry-run is never accepted as authorization.
+- A controlled operation ID allocates same-parent `mock-api.restore-stage.tmp.<operation-id>` and final `mock-api.restore-stage.<operation-id>` names without overwriting other stages.
+- Every Provider receives a fresh local controlled `secretRef`, every managed file receives a fresh `storageKey`/`relativePath`, and all Providers remain without a usable API key.
+- Mode A writes validated state with an empty blob directory and reports active attachments unavailable without deleting attachment parts or metadata.
+- Mode B stream-copies exactly every active package blob, including unreferenced active files, while rechecking source and staged size/SHA256. Tombstoned and unknown blobs are not copied.
+- Staged `state.v1.json` uses the P1-A durable unique-temp/flush/sync/rename primitive against the stage path, never formal persistence.
+- A pure read-only validator enforces the exact `state.v1.json`, `files/blobs`, and empty `secrets` layout, schema/state invariants, no runtime generation, controlled refs/keys, exact Mode B blob set, and no links/reparse points or package control files.
+- Capacity is checked before stage creation. Windows uses the existing `windows-sys` filesystem feature; tests use a fail-closed synthetic checker.
+- Only a fully validated temp stage is renamed to the candidate final name, then re-opened and validated again. Failures best-effort remove only the current operation's owned stage.
+- Forty-six dedicated synthetic tests use no real app data, backup, user file, secret blob, API key, or provider.
+
+The builder has no `MockApiState` or SecretStore parameter and does not write, rename, enumerate, or replace the current formal `mock-api` directory. It creates no pre-restore/failed-restore directory or journal and emits no SSE/revision/live commit. A final stage is only a candidate directory, not restored or official data. P2-C2 remains responsible for rollback snapshot, journal, commit, and rollback.
+
 ### P2-A: Portable Metadata/Full Backup Export Package (Completed)
 
 Goal:
@@ -903,6 +920,6 @@ Current P1-A/P1-B/P1-C1/P1-C2/P1-C3/P1-C4 status:
 - Runtime mutation consistency risk exists: Reduced through P1-C4 for Category A, Provider/SecretStore, managed file/blob, and streaming handled-failure paths. State/network are not one atomic transaction and active streams do not resume after restart.
 - State/blob consistency risk exists: Handled failures are compensated/tombstoned after P1-C3, but crash-only orphan windows and restore reconciliation remain.
 - DPAPI secret blobs are portable across machines/users: No.
-- A formal Mode A/B backup package exists: Yes, format v1 export plus P2-B strict validation/dry-run. Actual restore does not exist.
+- A formal Mode A/B backup package exists: Yes, format v1 export, P2-B strict validation/dry-run, and P2-C1 independently validated candidate staging. Actual restore does not exist.
 
-Recommended next step: P2-C1 offline staging builder with mandatory package revalidation, fresh secretRef/storageKey generation, and staged state/blob validation. P2-C1 must not rename or replace current app data.
+Recommended next step: P2-C2 rollback snapshot, journal, directory commit, and rollback. Do not expose actual restore until commit-boundary fault injection and rollback tests pass.

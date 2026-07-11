@@ -1,6 +1,6 @@
 # RikkaDesk Phase 12 Restore Transaction Protocol
 
-This document defines the Phase 12 P2-C0 protocol for a future actual full-replacement restore. P2-C0 is design only. It does not implement restore, expose an HTTP API or Tauri command, add UI, read app data or backup packages, access SecretStore, or modify the current schema.
+This document defines the Phase 12 P2-C0 protocol for a future actual full-replacement restore and records the P2-C1 offline staging implementation. P2-C1 builds synthetic/internal candidate staging directories only. It does not commit restore, expose an HTTP API or Tauri command, add UI, access SecretStore, or modify the current schema.
 
 ## Current Boundary
 
@@ -10,6 +10,7 @@ This document defines the Phase 12 P2-C0 protocol for a future actual full-repla
 - Portable backup format remains `rikkadesk-backup` version `1`.
 - Mode A (`state-only`) and Mode B (`full-local-data`) export are implemented.
 - Format v1 validation and no-write dry-run are implemented.
+- P2-C1 offline Mode A/Mode B candidate staging is implemented with complete package revalidation, fresh Provider references/file storage keys, capacity gating, atomic staged-state write, streamed blob copy, and independent validation before and after publication.
 - Actual restore, rollback execution, startup integration, and UI are not implemented.
 - Mode C, ZIP, merge restore, schema migration during restore, and stream resume remain deferred.
 
@@ -329,7 +330,7 @@ Logs, journal, UI, and reports must not include absolute paths, user names, stat
 
 ## Implementation Split
 
-### P2-C1: Offline Staging Builder
+### P2-C1: Offline Staging Builder (Completed)
 
 - Re-run P2-B validation for every attempt.
 - Copy the verified package into same-volume controlled staging.
@@ -337,6 +338,8 @@ Logs, journal, UI, and reports must not include absolute paths, user names, stat
 - Build and fully validate staged Mode A/B `mock-api` layout.
 - Add tamper, resource-limit, and no-SecretStore tests.
 - Do not rename current app data.
+
+The implementation accepts only a package root and trusted app-data parent. It has no `MockApiState` or SecretStore parameter, creates only its own `mock-api.restore-stage.tmp.<operation-id>` and validated `mock-api.restore-stage.<operation-id>` directories, and never creates a rollback snapshot or restore journal. Forty-six dedicated synthetic tests cover Mode A/B, fresh normalization, TOCTOU/hash checks, capacity, strict layout, failure cleanup, publication, independent revalidation, and unchanged current data.
 
 ### P2-C2: Rollback Snapshot, Journal, Commit, And Rollback
 
@@ -398,4 +401,4 @@ Every test uses synthetic temp directories, state, package bytes, and opaque non
 - Journal and startup validation prevent ambiguous state from launching.
 - P2-C does not support merge restore, Mode C, ZIP, schema auto-migration, or stream resume.
 
-The recommended next implementation is P2-C1 offline staging only. P2-C1 must not switch the formal `mock-api` directory.
+The recommended next implementation is P2-C2 rollback snapshot/journal/commit design and implementation. P2-C2 must revalidate a P2-C1 candidate and must not expose actual restore until rollback and all commit-boundary fault tests pass.

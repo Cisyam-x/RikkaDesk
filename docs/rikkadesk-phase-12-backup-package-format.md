@@ -232,8 +232,8 @@ The portable package and rollback snapshot are different artifacts:
 
 Actual staging must generate fresh local Provider secret references and file storage keys. It must not reuse P2-B deterministic planned values. After source validation, package content is copied and revalidated inside staging; commit reads only the staging copy. A prior dry-run never permits P2-C to skip this work.
 
-No actual restore writer, rollback operation, startup maintenance integration, HTTP API, Tauri command, or UI exists yet.
+P2-C1 now implements an internal staging writer only. It revalidates format v1 on every call, creates fresh local Provider references and file storage keys, builds an independently validated same-volume candidate `mock-api` directory, and never accesses SecretStore or current formal data. No actual restore commit, rollback operation, startup maintenance integration, HTTP API, Tauri command, or UI exists yet.
 
 ## Deferred Work
 
-P2-C1 must add offline staging without switching current data. P2-C2 must add mandatory rollback snapshot, journal, directory commit, and rollback. P2-C3 must add startup validation and interrupted-restore recovery. Restore UI/commands, ZIP packaging, Mode C, merge restore, automatic orphan reconciliation, active-stream recovery, and cross-resource crash atomicity remain unimplemented.
+P2-C1 offline candidate staging is implemented without switching current data. P2-C2 must add mandatory rollback snapshot, journal, directory commit, and rollback. P2-C3 must add startup validation and interrupted-restore recovery. Restore UI/commands, ZIP packaging, Mode C, merge restore, automatic orphan reconciliation, active-stream recovery, and cross-resource crash atomicity remain unimplemented.

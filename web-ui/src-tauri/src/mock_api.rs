@@ -48,7 +48,7 @@ use windows_sys::Win32::{
     Security::Cryptography::{
         CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
     },
-    Storage::FileSystem::ReplaceFileW,
+    Storage::FileSystem::{GetDiskFreeSpaceExW, ReplaceFileW},
 };
 
 const PREFERRED_ADDR: &str = "127.0.0.1:8080";
@@ -72,6 +72,11 @@ const RESTORE_STATE_MAX_BYTES: u64 = 128 * 1024 * 1024;
 const RESTORE_MANIFEST_MAX_FILES: usize = 100_000;
 const RESTORE_PLANNED_SECRET_REF_MARKER: &str = "restore-planned";
 const RESTORE_PLANNED_STORAGE_KEY_PREFIX: &str = "restore-file";
+const RESTORE_STAGE_TEMP_DIR_PREFIX: &str = "mock-api.restore-stage.tmp";
+const RESTORE_STAGE_FINAL_DIR_PREFIX: &str = "mock-api.restore-stage";
+const RESTORE_STAGE_CREATE_ATTEMPTS: usize = 64;
+const RESTORE_STAGE_CAPACITY_MARGIN_BYTES: u64 = 1024 * 1024;
+static RESTORE_STAGE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const STATE_SCHEMA_VERSION: u32 = 6;
 const FILE_METADATA_STATE_SCHEMA_VERSION: u32 = 5;
 const CUSTOM_REQUEST_CONFIG_STATE_SCHEMA_VERSION: u32 = 4;
@@ -1240,6 +1245,123 @@ impl fmt::Display for RestoreValidationError {
 }
 
 impl Error for RestoreValidationError {}
+
+#[allow(dead_code)]
+#[derive(Clone)]
+struct RestoreStagingRequest {
+    package_root: PathBuf,
+    app_data_parent: PathBuf,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct RestoreStagingResult {
+    operation_id: String,
+    mode: BackupManifestMode,
+    staging_directory: PathBuf,
+    provider_count: usize,
+    providers_requiring_api_key: usize,
+    active_file_count: usize,
+    staged_blob_count: usize,
+    unavailable_attachment_count: usize,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestoreStageError {
+    PackageInvalid,
+    DestinationInvalid,
+    NameCollision,
+    CapacityInsufficient,
+    CreateFailed,
+    StateWriteFailed,
+    BlobCopyFailed,
+    BlobHashMismatch,
+    ValidationFailed,
+    PublishFailed,
+    SecretAccessForbidden,
+}
+
+impl fmt::Display for RestoreStageError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::PackageInvalid => "restore staging failed during package validation",
+            Self::DestinationInvalid => "restore staging destination validation failed",
+            Self::NameCollision => "restore staging name allocation failed",
+            Self::CapacityInsufficient => "restore staging capacity validation failed",
+            Self::CreateFailed => "restore staging directory creation failed",
+            Self::StateWriteFailed => "restore staging failed during state write",
+            Self::BlobCopyFailed => "restore staging failed during blob copy",
+            Self::BlobHashMismatch => "restore staging blob validation failed",
+            Self::ValidationFailed => "restore staging failed during staged validation",
+            Self::PublishFailed => "restore staging failed during publication",
+            Self::SecretAccessForbidden => "restore staging secret access is forbidden",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl Error for RestoreStageError {}
+
+trait RestoreCapacityChecker: Send + Sync {
+    fn ensure_capacity(
+        &self,
+        app_data_parent: &FilePath,
+        required_bytes: u64,
+    ) -> Result<(), RestoreStageError>;
+}
+
+struct SystemRestoreCapacityChecker;
+
+impl RestoreCapacityChecker for SystemRestoreCapacityChecker {
+    fn ensure_capacity(
+        &self,
+        app_data_parent: &FilePath,
+        required_bytes: u64,
+    ) -> Result<(), RestoreStageError> {
+        restore_stage_ensure_system_capacity(app_data_parent, required_bytes)
+    }
+}
+
+trait RestoreStagingHooks: Send + Sync {
+    fn after_package_validation(&self, _package_root: &FilePath) -> Result<(), RestoreStageError> {
+        Ok(())
+    }
+
+    fn before_state_write(&self, _stage_root: &FilePath) -> Result<(), RestoreStageError> {
+        Ok(())
+    }
+
+    fn before_blob_copy(
+        &self,
+        _source: &FilePath,
+        _destination: &FilePath,
+        _index: usize,
+    ) -> Result<(), RestoreStageError> {
+        Ok(())
+    }
+
+    fn before_staged_validation(&self, _stage_root: &FilePath) -> Result<(), RestoreStageError> {
+        Ok(())
+    }
+
+    fn before_publish(
+        &self,
+        _temp_stage: &FilePath,
+        _final_stage: &FilePath,
+    ) -> Result<(), RestoreStageError> {
+        Ok(())
+    }
+
+    fn after_publish(&self, _final_stage: &FilePath) -> Result<(), RestoreStageError> {
+        Ok(())
+    }
+}
+
+struct NoopRestoreStagingHooks;
+
+impl RestoreStagingHooks for NoopRestoreStagingHooks {}
+
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -4021,6 +4143,575 @@ fn metadata_is_link_or_reparse(metadata: &std_fs::Metadata) -> bool {
         }
     }
     false
+}
+
+#[allow(dead_code)]
+async fn build_restore_staging(
+    request: RestoreStagingRequest,
+) -> Result<RestoreStagingResult, RestoreStageError> {
+    tokio::task::spawn_blocking(move || {
+        build_restore_staging_with(
+            request,
+            &SystemRestoreCapacityChecker,
+            &NoopRestoreStagingHooks,
+        )
+    })
+    .await
+    .map_err(|_| RestoreStageError::CreateFailed)?
+}
+
+fn build_restore_staging_with(
+    request: RestoreStagingRequest,
+    capacity_checker: &dyn RestoreCapacityChecker,
+    hooks: &dyn RestoreStagingHooks,
+) -> Result<RestoreStagingResult, RestoreStageError> {
+    let validated = validate_restore_package(&request.package_root)
+        .map_err(|_| RestoreStageError::PackageInvalid)?;
+    hooks.after_package_validation(&request.package_root)?;
+
+    let package_root = validate_restore_package_root(&request.package_root)
+        .map_err(|_| RestoreStageError::PackageInvalid)?;
+    let app_data_parent = validate_restore_stage_parent(&request.app_data_parent)?;
+    let (operation_id, temp_stage, final_stage) = allocate_restore_stage_paths(&app_data_parent)?;
+    let (staged_state, blob_plan) = normalize_restore_state_for_stage(&validated, &operation_id)?;
+    let state_bytes = serde_json::to_vec_pretty(&staged_state)
+        .map_err(|_| RestoreStageError::StateWriteFailed)?;
+    let required_bytes = restore_stage_required_capacity(&state_bytes, &blob_plan)?;
+    capacity_checker.ensure_capacity(&app_data_parent, required_bytes)?;
+
+    std_fs::create_dir(&temp_stage).map_err(|_| RestoreStageError::CreateFailed)?;
+    if let Err(error) = create_restore_stage_layout(&temp_stage) {
+        cleanup_owned_restore_stage(&app_data_parent, &temp_stage);
+        return Err(error);
+    }
+    let mut published = false;
+    let stage_result = (|| {
+        hooks.before_state_write(&temp_stage)?;
+        write_restore_stage_state(&temp_stage, &operation_id, &state_bytes)?;
+
+        if validated.mode == BackupManifestMode::FullLocalData {
+            let source_blob_root = package_root.join(BACKUP_BLOBS_DIR_NAME);
+            let canonical_source_blob_root = std_fs::canonicalize(&source_blob_root)
+                .map_err(|_| RestoreStageError::BlobCopyFailed)?;
+            let staged_blob_root = temp_stage.join(FILES_DIR_NAME).join(FILE_BLOBS_DIR_NAME);
+            for (index, blob) in blob_plan.iter().enumerate() {
+                let source = package_root.join(&blob.package_path);
+                let destination = staged_blob_root.join(&blob.planned_storage_key);
+                hooks.before_blob_copy(&source, &destination, index)?;
+                copy_restore_blob_to_stage(
+                    &source,
+                    &canonical_source_blob_root,
+                    &destination,
+                    blob.expected_size_bytes,
+                    &blob.expected_sha256,
+                )?;
+            }
+        }
+
+        hooks.before_staged_validation(&temp_stage)?;
+        validate_staged_mock_api_directory(&temp_stage, validated.mode)?;
+        hooks.before_publish(&temp_stage, &final_stage)?;
+        if restore_path_exists(&final_stage)? {
+            return Err(RestoreStageError::NameCollision);
+        }
+        std_fs::rename(&temp_stage, &final_stage).map_err(|_| RestoreStageError::PublishFailed)?;
+        published = true;
+        hooks.after_publish(&final_stage)?;
+        if let Err(error) = validate_staged_mock_api_directory(&final_stage, validated.mode) {
+            cleanup_owned_restore_stage(&app_data_parent, &final_stage);
+            return Err(error);
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = stage_result {
+        cleanup_owned_restore_stage(&app_data_parent, &temp_stage);
+        if published {
+            cleanup_owned_restore_stage(&app_data_parent, &final_stage);
+        }
+        return Err(error);
+    }
+
+    let active_file_count = staged_state
+        .files
+        .iter()
+        .filter(|file| file.deleted_at.is_none())
+        .count();
+    Ok(RestoreStagingResult {
+        operation_id,
+        mode: validated.mode,
+        staging_directory: final_stage,
+        provider_count: staged_state.providers.len(),
+        providers_requiring_api_key: staged_state.providers.len(),
+        active_file_count,
+        staged_blob_count: blob_plan.len(),
+        unavailable_attachment_count: if validated.mode == BackupManifestMode::StateOnly {
+            active_file_count
+        } else {
+            0
+        },
+    })
+}
+
+fn validate_restore_stage_parent(parent: &FilePath) -> Result<PathBuf, RestoreStageError> {
+    let metadata =
+        std_fs::symlink_metadata(parent).map_err(|_| RestoreStageError::DestinationInvalid)?;
+    if metadata_is_link_or_reparse(&metadata) || !metadata.is_dir() {
+        return Err(RestoreStageError::DestinationInvalid);
+    }
+    let canonical =
+        std_fs::canonicalize(parent).map_err(|_| RestoreStageError::DestinationInvalid)?;
+    let canonical_metadata =
+        std_fs::symlink_metadata(&canonical).map_err(|_| RestoreStageError::DestinationInvalid)?;
+    if metadata_is_link_or_reparse(&canonical_metadata) || !canonical_metadata.is_dir() {
+        return Err(RestoreStageError::DestinationInvalid);
+    }
+    Ok(canonical)
+}
+
+fn allocate_restore_stage_paths(
+    app_data_parent: &FilePath,
+) -> Result<(String, PathBuf, PathBuf), RestoreStageError> {
+    for _ in 0..RESTORE_STAGE_CREATE_ATTEMPTS {
+        let sequence = RESTORE_STAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let operation_id = format!("{}-{}-{sequence}", now_millis(), std::process::id());
+        let temp = app_data_parent.join(format!("{RESTORE_STAGE_TEMP_DIR_PREFIX}.{operation_id}"));
+        let final_stage =
+            app_data_parent.join(format!("{RESTORE_STAGE_FINAL_DIR_PREFIX}.{operation_id}"));
+        if !restore_path_exists(&temp)? && !restore_path_exists(&final_stage)? {
+            return Ok((operation_id, temp, final_stage));
+        }
+    }
+    Err(RestoreStageError::NameCollision)
+}
+
+fn restore_path_exists(path: &FilePath) -> Result<bool, RestoreStageError> {
+    match std_fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(RestoreStageError::DestinationInvalid),
+    }
+}
+
+fn normalize_restore_state_for_stage(
+    validated: &ValidatedRestorePackage,
+    operation_id: &str,
+) -> Result<(PersistedMockState, Vec<PlannedBlobRestore>), RestoreStageError> {
+    let mut state = validated.staged_state.clone();
+    let mut settings_secret_index = 0_u64;
+    sanitize_backup_secret_fields(&mut state.settings, &mut settings_secret_index);
+    for (index, provider) in state.providers.iter_mut().enumerate() {
+        let secret_ref =
+            format!("{PROVIDER_SECRET_REF_PREFIX}restore-{operation_id}-{index}:api-key");
+        if !is_controlled_provider_secret_ref(&secret_ref) {
+            return Err(RestoreStageError::ValidationFailed);
+        }
+        provider.secret_ref = secret_ref;
+    }
+    sync_settings_with_desktop_providers(&mut state.settings, &state.providers);
+
+    let manifest_by_id = validated
+        .manifest
+        .files
+        .iter()
+        .map(|file| (file.file_id, file))
+        .collect::<HashMap<_, _>>();
+    let mut blob_plan = Vec::new();
+    for (index, file) in state.files.iter_mut().enumerate() {
+        let storage_key = format!("restore-blob-{operation_id}-{index}");
+        if !is_safe_storage_key(&storage_key) {
+            return Err(RestoreStageError::ValidationFailed);
+        }
+        file.storage_key = storage_key.clone();
+        file.relative_path = format!("{FILES_DIR_NAME}/{FILE_BLOBS_DIR_NAME}/{storage_key}");
+        if validated.mode == BackupManifestMode::FullLocalData && file.deleted_at.is_none() {
+            let manifest_file = manifest_by_id
+                .get(&file.id)
+                .ok_or(RestoreStageError::PackageInvalid)?;
+            let expected_sha256 = normalize_sha256(&manifest_file.sha256)
+                .map_err(|_| RestoreStageError::PackageInvalid)?;
+            file.sha256 = Some(expected_sha256.clone());
+            blob_plan.push(PlannedBlobRestore {
+                file_id: file.id,
+                package_path: manifest_file.package_path.clone(),
+                planned_storage_key: storage_key,
+                expected_size_bytes: manifest_file.size_bytes,
+                expected_sha256,
+            });
+        }
+    }
+    blob_plan.sort_by_key(|item| item.file_id);
+    validate_restore_state_invariants(&state).map_err(|_| RestoreStageError::ValidationFailed)?;
+    Ok((state, blob_plan))
+}
+
+fn restore_stage_required_capacity(
+    state_bytes: &[u8],
+    blob_plan: &[PlannedBlobRestore],
+) -> Result<u64, RestoreStageError> {
+    let state_bytes = state_bytes.len() as u64;
+    let mut required = state_bytes
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(RESTORE_STAGE_CAPACITY_MARGIN_BYTES))
+        .ok_or(RestoreStageError::CapacityInsufficient)?;
+    for blob in blob_plan {
+        required = required
+            .checked_add(blob.expected_size_bytes)
+            .ok_or(RestoreStageError::CapacityInsufficient)?;
+    }
+    Ok(required)
+}
+
+#[cfg(windows)]
+fn restore_stage_ensure_system_capacity(
+    app_data_parent: &FilePath,
+    required_bytes: u64,
+) -> Result<(), RestoreStageError> {
+    let path = wide_path(app_data_parent.as_os_str());
+    let mut available = 0_u64;
+    let result = unsafe {
+        GetDiskFreeSpaceExW(
+            path.as_ptr(),
+            &mut available,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
+    if result == 0 {
+        return Err(RestoreStageError::CapacityInsufficient);
+    }
+    if available < required_bytes {
+        return Err(RestoreStageError::CapacityInsufficient);
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn restore_stage_ensure_system_capacity(
+    _app_data_parent: &FilePath,
+    _required_bytes: u64,
+) -> Result<(), RestoreStageError> {
+    Err(RestoreStageError::CapacityInsufficient)
+}
+
+fn create_restore_stage_layout(stage_root: &FilePath) -> Result<(), RestoreStageError> {
+    let files = stage_root.join(FILES_DIR_NAME);
+    if std_fs::create_dir(&files).is_err()
+        || std_fs::create_dir(files.join(FILE_BLOBS_DIR_NAME)).is_err()
+        || std_fs::create_dir(stage_root.join(SECRETS_DIR_NAME)).is_err()
+    {
+        return Err(RestoreStageError::CreateFailed);
+    }
+    Ok(())
+}
+
+fn write_restore_stage_state(
+    stage_root: &FilePath,
+    operation_id: &str,
+    state_bytes: &[u8],
+) -> Result<(), RestoreStageError> {
+    let state_path = stage_root.join(STATE_FILE_NAME);
+    let temp_path = stage_root.join(format!("{STATE_TMP_FILE_PREFIX}.{operation_id}"));
+    write_state_file_atomically(
+        &RealStateFileOps,
+        stage_root,
+        &state_path,
+        &temp_path,
+        state_bytes,
+    )
+    .map_err(|_| RestoreStageError::StateWriteFailed)
+}
+
+fn copy_restore_blob_to_stage(
+    source: &FilePath,
+    canonical_source_blob_root: &FilePath,
+    destination: &FilePath,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> Result<(), RestoreStageError> {
+    let metadata =
+        std_fs::symlink_metadata(source).map_err(|_| RestoreStageError::BlobCopyFailed)?;
+    if metadata_is_link_or_reparse(&metadata) || !metadata.is_file() {
+        return Err(RestoreStageError::BlobCopyFailed);
+    }
+    if metadata.len() != expected_size {
+        return Err(RestoreStageError::BlobHashMismatch);
+    }
+    let canonical_source =
+        std_fs::canonicalize(source).map_err(|_| RestoreStageError::BlobCopyFailed)?;
+    if canonical_source.parent() != Some(canonical_source_blob_root) {
+        return Err(RestoreStageError::BlobCopyFailed);
+    }
+
+    let mut source_file =
+        std_fs::File::open(&canonical_source).map_err(|_| RestoreStageError::BlobCopyFailed)?;
+    let mut destination_file = std_fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(destination)
+        .map_err(|_| RestoreStageError::BlobCopyFailed)?;
+    let copy_result = (|| {
+        let mut hasher = Sha256::new();
+        let mut size = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = source_file
+                .read(&mut buffer)
+                .map_err(|_| RestoreStageError::BlobCopyFailed)?;
+            if read == 0 {
+                break;
+            }
+            size = size
+                .checked_add(read as u64)
+                .ok_or(RestoreStageError::BlobHashMismatch)?;
+            if size > expected_size {
+                return Err(RestoreStageError::BlobHashMismatch);
+            }
+            destination_file
+                .write_all(&buffer[..read])
+                .map_err(|_| RestoreStageError::BlobCopyFailed)?;
+            hasher.update(&buffer[..read]);
+        }
+        destination_file
+            .flush()
+            .map_err(|_| RestoreStageError::BlobCopyFailed)?;
+        destination_file
+            .sync_all()
+            .map_err(|_| RestoreStageError::BlobCopyFailed)?;
+        let actual_sha256 = format!("{:x}", hasher.finalize());
+        if size != expected_size || actual_sha256 != expected_sha256 {
+            return Err(RestoreStageError::BlobHashMismatch);
+        }
+        Ok(())
+    })();
+    drop(destination_file);
+    if let Err(error) = copy_result {
+        let _ = std_fs::remove_file(destination);
+        return Err(error);
+    }
+
+    let staged_blob_root = destination
+        .parent()
+        .ok_or(RestoreStageError::BlobHashMismatch)?;
+    let canonical_staged_blob_root =
+        std_fs::canonicalize(staged_blob_root).map_err(|_| RestoreStageError::BlobHashMismatch)?;
+    let (hash, size) = hash_restore_blob(destination, &canonical_staged_blob_root, expected_size)
+        .map_err(|_| RestoreStageError::BlobHashMismatch)?;
+    if size != expected_size || hash != expected_sha256 {
+        let _ = std_fs::remove_file(destination);
+        return Err(RestoreStageError::BlobHashMismatch);
+    }
+    Ok(())
+}
+
+fn validate_staged_mock_api_directory(
+    stage_root: &FilePath,
+    mode: BackupManifestMode,
+) -> Result<PersistedMockState, RestoreStageError> {
+    let root_metadata =
+        std_fs::symlink_metadata(stage_root).map_err(|_| RestoreStageError::ValidationFailed)?;
+    if metadata_is_link_or_reparse(&root_metadata) || !root_metadata.is_dir() {
+        return Err(RestoreStageError::ValidationFailed);
+    }
+    let canonical_root =
+        std_fs::canonicalize(stage_root).map_err(|_| RestoreStageError::ValidationFailed)?;
+    validate_restore_stage_tree(&canonical_root)?;
+    let state_bytes = read_bounded_restore_file(
+        &canonical_root,
+        STATE_FILE_NAME,
+        RESTORE_STATE_MAX_BYTES,
+        RestoreValidationError::StateInvalid,
+    )
+    .map_err(|_| RestoreStageError::ValidationFailed)?;
+    let state = parse_and_validate_restore_state(&state_bytes, STATE_SCHEMA_VERSION)
+        .map_err(|_| RestoreStageError::ValidationFailed)?;
+    validate_restore_stage_state(&state, mode, &canonical_root)?;
+    Ok(state)
+}
+
+fn validate_restore_stage_tree(stage_root: &FilePath) -> Result<(), RestoreStageError> {
+    let top = restore_stage_directory_entries(stage_root)?;
+    let expected_top = HashSet::from([
+        STATE_FILE_NAME.to_string(),
+        FILES_DIR_NAME.to_string(),
+        SECRETS_DIR_NAME.to_string(),
+    ]);
+    if top.keys().cloned().collect::<HashSet<_>>() != expected_top
+        || !top[STATE_FILE_NAME].is_file()
+        || !top[FILES_DIR_NAME].is_dir()
+        || !top[SECRETS_DIR_NAME].is_dir()
+    {
+        return Err(RestoreStageError::ValidationFailed);
+    }
+
+    let files_root = stage_root.join(FILES_DIR_NAME);
+    let files = restore_stage_directory_entries(&files_root)?;
+    if files.len() != 1
+        || !files
+            .get(FILE_BLOBS_DIR_NAME)
+            .is_some_and(std_fs::Metadata::is_dir)
+    {
+        return Err(RestoreStageError::ValidationFailed);
+    }
+    if !restore_stage_directory_entries(&stage_root.join(SECRETS_DIR_NAME))?.is_empty() {
+        return Err(RestoreStageError::ValidationFailed);
+    }
+    Ok(())
+}
+
+fn restore_stage_directory_entries(
+    directory: &FilePath,
+) -> Result<HashMap<String, std_fs::Metadata>, RestoreStageError> {
+    let metadata =
+        std_fs::symlink_metadata(directory).map_err(|_| RestoreStageError::ValidationFailed)?;
+    if metadata_is_link_or_reparse(&metadata) || !metadata.is_dir() {
+        return Err(RestoreStageError::ValidationFailed);
+    }
+    let mut entries = HashMap::new();
+    let mut folded = HashSet::new();
+    for entry in std_fs::read_dir(directory).map_err(|_| RestoreStageError::ValidationFailed)? {
+        let entry = entry.map_err(|_| RestoreStageError::ValidationFailed)?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| RestoreStageError::ValidationFailed)?;
+        if !folded.insert(name.to_ascii_lowercase()) {
+            return Err(RestoreStageError::ValidationFailed);
+        }
+        let metadata = std_fs::symlink_metadata(entry.path())
+            .map_err(|_| RestoreStageError::ValidationFailed)?;
+        if metadata_is_link_or_reparse(&metadata) || entries.insert(name, metadata).is_some() {
+            return Err(RestoreStageError::ValidationFailed);
+        }
+    }
+    Ok(entries)
+}
+
+fn validate_restore_stage_state(
+    state: &PersistedMockState,
+    mode: BackupManifestMode,
+    stage_root: &FilePath,
+) -> Result<(), RestoreStageError> {
+    if state.schema_version != STATE_SCHEMA_VERSION
+        || state
+            .conversations
+            .values()
+            .any(|conversation| conversation.is_generating)
+        || restore_value_has_true_field(&state.settings, "hasSecret")
+        || state.providers.iter().any(|provider| {
+            !provider
+                .secret_ref
+                .starts_with(&format!("{PROVIDER_SECRET_REF_PREFIX}restore-"))
+                || !provider.secret_ref.ends_with(":api-key")
+                || !is_controlled_provider_secret_ref(&provider.secret_ref)
+        })
+    {
+        return Err(RestoreStageError::ValidationFailed);
+    }
+
+    let blob_root = stage_root.join(FILES_DIR_NAME).join(FILE_BLOBS_DIR_NAME);
+    let blob_entries = restore_stage_directory_entries(&blob_root)?;
+    if blob_entries
+        .iter()
+        .any(|(name, metadata)| !is_safe_storage_key(name) || !metadata.is_file())
+    {
+        return Err(RestoreStageError::ValidationFailed);
+    }
+
+    let active = state
+        .files
+        .iter()
+        .filter(|file| file.deleted_at.is_none())
+        .collect::<Vec<_>>();
+    let expected_active_keys = active
+        .iter()
+        .map(|file| file.storage_key.as_str())
+        .collect::<HashSet<_>>();
+    for file in &state.files {
+        let expected_relative = format!(
+            "{FILES_DIR_NAME}/{FILE_BLOBS_DIR_NAME}/{}",
+            file.storage_key
+        );
+        if !file.storage_key.starts_with("restore-blob-")
+            || !is_safe_storage_key(&file.storage_key)
+            || file.relative_path != expected_relative
+        {
+            return Err(RestoreStageError::ValidationFailed);
+        }
+    }
+
+    match mode {
+        BackupManifestMode::StateOnly => {
+            if !blob_entries.is_empty() {
+                return Err(RestoreStageError::ValidationFailed);
+            }
+        }
+        BackupManifestMode::FullLocalData => {
+            if blob_entries
+                .keys()
+                .map(String::as_str)
+                .collect::<HashSet<_>>()
+                != expected_active_keys
+            {
+                return Err(RestoreStageError::ValidationFailed);
+            }
+            let canonical_blob_root = std_fs::canonicalize(&blob_root)
+                .map_err(|_| RestoreStageError::ValidationFailed)?;
+            for file in active {
+                let expected_hash = file
+                    .sha256
+                    .as_deref()
+                    .ok_or(RestoreStageError::ValidationFailed)
+                    .and_then(|value| {
+                        normalize_sha256(value).map_err(|_| RestoreStageError::ValidationFailed)
+                    })?;
+                let (hash, size) = hash_restore_blob(
+                    &blob_root.join(&file.storage_key),
+                    &canonical_blob_root,
+                    file.size_bytes,
+                )
+                .map_err(|_| RestoreStageError::ValidationFailed)?;
+                if size != file.size_bytes || hash != expected_hash {
+                    return Err(RestoreStageError::ValidationFailed);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn restore_value_has_true_field(value: &Value, field_name: &str) -> bool {
+    match value {
+        Value::Object(object) => object.iter().any(|(name, value)| {
+            (name == field_name && value.as_bool() == Some(true))
+                || restore_value_has_true_field(value, field_name)
+        }),
+        Value::Array(items) => items
+            .iter()
+            .any(|value| restore_value_has_true_field(value, field_name)),
+        _ => false,
+    }
+}
+
+fn cleanup_owned_restore_stage(app_data_parent: &FilePath, stage_path: &FilePath) {
+    if stage_path.parent() != Some(app_data_parent) {
+        return;
+    }
+    let Some(name) = stage_path.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    if !name.starts_with(&format!("{RESTORE_STAGE_TEMP_DIR_PREFIX}."))
+        && !name.starts_with(&format!("{RESTORE_STAGE_FINAL_DIR_PREFIX}."))
+    {
+        return;
+    }
+    let Ok(metadata) = std_fs::symlink_metadata(stage_path) else {
+        return;
+    };
+    if metadata_is_link_or_reparse(&metadata) || !metadata.is_dir() {
+        return;
+    }
+    let _ = std_fs::remove_dir_all(stage_path);
 }
 
 #[cfg(test)]
@@ -17354,5 +18045,1518 @@ mod tests {
         restore_package_dry_run(&fixture.path).unwrap();
 
         assert_eq!(restore_package_fingerprint(&fixture.path), before);
+    }
+    struct SyntheticRestoreCapacityChecker {
+        available: Option<u64>,
+        requested: AtomicU64,
+    }
+
+    impl SyntheticRestoreCapacityChecker {
+        fn allowing() -> Self {
+            Self {
+                available: Some(u64::MAX),
+                requested: AtomicU64::new(0),
+            }
+        }
+
+        fn with_available(available: u64) -> Self {
+            Self {
+                available: Some(available),
+                requested: AtomicU64::new(0),
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                available: None,
+                requested: AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl RestoreCapacityChecker for SyntheticRestoreCapacityChecker {
+        fn ensure_capacity(
+            &self,
+            _app_data_parent: &FilePath,
+            required_bytes: u64,
+        ) -> Result<(), RestoreStageError> {
+            self.requested.store(required_bytes, Ordering::Relaxed);
+            match self.available {
+                Some(available) if available >= required_bytes => Ok(()),
+                _ => Err(RestoreStageError::CapacityInsufficient),
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum SyntheticRestoreStageHookAction {
+        None,
+        FailStateWrite,
+        FailBlobCopy,
+        AddUnknownEntry,
+        AddSecretEntry,
+        TamperStagedBlob,
+        FailPublish,
+        CreateFinalCollision,
+        TamperSourceBlob,
+        TamperAfterPublish,
+    }
+
+    struct SyntheticRestoreStageHooks {
+        action: SyntheticRestoreStageHookAction,
+    }
+
+    impl SyntheticRestoreStageHooks {
+        fn new(action: SyntheticRestoreStageHookAction) -> Self {
+            Self { action }
+        }
+    }
+
+    impl RestoreStagingHooks for SyntheticRestoreStageHooks {
+        fn after_package_validation(
+            &self,
+            package_root: &FilePath,
+        ) -> Result<(), RestoreStageError> {
+            if matches!(
+                self.action,
+                SyntheticRestoreStageHookAction::TamperSourceBlob
+            ) {
+                let path = package_root
+                    .join(BACKUP_BLOBS_DIR_NAME)
+                    .join("file-100.blob");
+                let size = std_fs::metadata(&path).unwrap().len() as usize;
+                std_fs::write(path, vec![b'X'; size]).unwrap();
+            }
+            Ok(())
+        }
+
+        fn before_state_write(&self, _stage_root: &FilePath) -> Result<(), RestoreStageError> {
+            if matches!(self.action, SyntheticRestoreStageHookAction::FailStateWrite) {
+                return Err(RestoreStageError::StateWriteFailed);
+            }
+            Ok(())
+        }
+
+        fn before_blob_copy(
+            &self,
+            _source: &FilePath,
+            _destination: &FilePath,
+            _index: usize,
+        ) -> Result<(), RestoreStageError> {
+            if matches!(self.action, SyntheticRestoreStageHookAction::FailBlobCopy) {
+                return Err(RestoreStageError::BlobCopyFailed);
+            }
+            Ok(())
+        }
+
+        fn before_staged_validation(&self, stage_root: &FilePath) -> Result<(), RestoreStageError> {
+            match self.action {
+                SyntheticRestoreStageHookAction::AddUnknownEntry => {
+                    std_fs::write(stage_root.join("manifest.json"), b"synthetic").unwrap();
+                }
+                SyntheticRestoreStageHookAction::AddSecretEntry => {
+                    std_fs::write(
+                        stage_root.join(SECRETS_DIR_NAME).join("synthetic.bin"),
+                        b"opaque synthetic bytes",
+                    )
+                    .unwrap();
+                }
+                SyntheticRestoreStageHookAction::TamperStagedBlob => {
+                    let blob_root = stage_root.join(FILES_DIR_NAME).join(FILE_BLOBS_DIR_NAME);
+                    let path = std_fs::read_dir(blob_root)
+                        .unwrap()
+                        .next()
+                        .unwrap()
+                        .unwrap()
+                        .path();
+                    let size = std_fs::metadata(&path).unwrap().len() as usize;
+                    std_fs::write(path, vec![b'Y'; size]).unwrap();
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+
+        fn before_publish(
+            &self,
+            _temp_stage: &FilePath,
+            final_stage: &FilePath,
+        ) -> Result<(), RestoreStageError> {
+            match self.action {
+                SyntheticRestoreStageHookAction::FailPublish => {
+                    return Err(RestoreStageError::PublishFailed)
+                }
+                SyntheticRestoreStageHookAction::CreateFinalCollision => {
+                    std_fs::create_dir(final_stage).unwrap();
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+
+        fn after_publish(&self, final_stage: &FilePath) -> Result<(), RestoreStageError> {
+            if matches!(
+                self.action,
+                SyntheticRestoreStageHookAction::TamperAfterPublish
+            ) {
+                std_fs::write(final_stage.join("unexpected.txt"), b"synthetic").unwrap();
+            }
+            Ok(())
+        }
+    }
+
+    fn restore_stage_parent(temp: &SyntheticTempDir, label: &str) -> PathBuf {
+        let parent = temp.path.join(format!("restore-stage-parent-{label}"));
+        std_fs::create_dir(&parent).unwrap();
+        parent
+    }
+
+    fn build_synthetic_restore_stage(
+        package_root: &FilePath,
+        app_data_parent: &FilePath,
+    ) -> Result<RestoreStagingResult, RestoreStageError> {
+        build_restore_staging_with(
+            RestoreStagingRequest {
+                package_root: package_root.to_path_buf(),
+                app_data_parent: app_data_parent.to_path_buf(),
+            },
+            &SyntheticRestoreCapacityChecker::allowing(),
+            &SyntheticRestoreStageHooks::new(SyntheticRestoreStageHookAction::None),
+        )
+    }
+
+    fn read_staged_restore_state(stage_root: &FilePath) -> PersistedMockState {
+        serde_json::from_slice(&std_fs::read(stage_root.join(STATE_FILE_NAME)).unwrap()).unwrap()
+    }
+
+    fn restore_stage_names(parent: &FilePath) -> Vec<String> {
+        let mut names = std_fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.starts_with("mock-api.restore-stage"))
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    fn assert_no_restore_stage(parent: &FilePath) {
+        assert!(restore_stage_names(parent).is_empty());
+    }
+
+    #[test]
+    fn restore_stage_mode_a_success() {
+        let temp = SyntheticTempDir::new("restore-stage-mode-a-success");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "stage-mode-a-success",
+            BackupExportMode::ModeA,
+            1,
+            1,
+            true,
+            true,
+        );
+        let parent = restore_stage_parent(&temp, "mode-a-success");
+
+        let result = build_synthetic_restore_stage(&fixture.path, &parent).unwrap();
+        let state = read_staged_restore_state(&result.staging_directory);
+
+        assert_eq!(result.mode, BackupManifestMode::StateOnly);
+        assert_eq!(result.provider_count, 1);
+        assert_eq!(result.providers_requiring_api_key, 1);
+        assert_eq!(result.active_file_count, 1);
+        assert_eq!(result.staged_blob_count, 0);
+        assert_eq!(result.unavailable_attachment_count, 1);
+        assert_eq!(state.schema_version, STATE_SCHEMA_VERSION);
+        assert!(result
+            .staging_directory
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(&format!("{RESTORE_STAGE_FINAL_DIR_PREFIX}.")));
+        assert!(restore_stage_directory_entries(
+            &result
+                .staging_directory
+                .join(FILES_DIR_NAME)
+                .join(FILE_BLOBS_DIR_NAME)
+        )
+        .unwrap()
+        .is_empty());
+        assert!(
+            restore_stage_directory_entries(&result.staging_directory.join(SECRETS_DIR_NAME))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn restore_stage_mode_a_does_not_read_package_blobs() {
+        let temp = SyntheticTempDir::new("restore-stage-mode-a-no-blobs");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "stage-mode-a-no-blobs",
+            BackupExportMode::ModeA,
+            1,
+            0,
+            false,
+            true,
+        );
+        std_fs::remove_dir_all(&fixture.source_blob_root).unwrap();
+        let parent = restore_stage_parent(&temp, "mode-a-no-blobs");
+
+        let result = build_synthetic_restore_stage(&fixture.path, &parent).unwrap();
+
+        assert_eq!(result.staged_blob_count, 0);
+        assert_eq!(result.unavailable_attachment_count, 1);
+    }
+
+    #[test]
+    fn restore_stage_mode_a_preserves_attachment_metadata() {
+        let temp = SyntheticTempDir::new("restore-stage-mode-a-attachment");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "stage-mode-a-attachment",
+            BackupExportMode::ModeA,
+            1,
+            0,
+            false,
+            true,
+        );
+        let parent = restore_stage_parent(&temp, "mode-a-attachment");
+
+        let result = build_synthetic_restore_stage(&fixture.path, &parent).unwrap();
+        let state = read_staged_restore_state(&result.staging_directory);
+
+        assert_eq!(state.files.len(), 1);
+        assert!(state.conversations.values().any(|conversation| {
+            conversation.messages.iter().any(|node| {
+                node.messages.iter().any(|message| {
+                    message
+                        .parts
+                        .iter()
+                        .any(|part| part.get("type").and_then(Value::as_str) == Some("image"))
+                })
+            })
+        }));
+    }
+
+    #[test]
+    fn restore_stage_mode_b_success() {
+        let temp = SyntheticTempDir::new("restore-stage-mode-b-success");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "stage-mode-b-success",
+            BackupExportMode::ModeB,
+            2,
+            1,
+            true,
+            true,
+        );
+        let parent = restore_stage_parent(&temp, "mode-b-success");
+
+        let result = build_synthetic_restore_stage(&fixture.path, &parent).unwrap();
+        let state = read_staged_restore_state(&result.staging_directory);
+        let blob_entries = restore_stage_directory_entries(
+            &result
+                .staging_directory
+                .join(FILES_DIR_NAME)
+                .join(FILE_BLOBS_DIR_NAME),
+        )
+        .unwrap();
+
+        assert_eq!(result.mode, BackupManifestMode::FullLocalData);
+        assert_eq!(result.staged_blob_count, 2);
+        assert_eq!(result.unavailable_attachment_count, 0);
+        assert_eq!(blob_entries.len(), 2);
+        assert!(state
+            .files
+            .iter()
+            .filter(|file| file.deleted_at.is_none())
+            .all(|file| blob_entries.contains_key(&file.storage_key)));
+        assert!(state
+            .files
+            .iter()
+            .filter(|file| file.deleted_at.is_some())
+            .all(|file| !blob_entries.contains_key(&file.storage_key)));
+        validate_staged_mock_api_directory(
+            &result.staging_directory,
+            BackupManifestMode::FullLocalData,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn restore_stage_mode_b_unreferenced_active_included() {
+        let temp = SyntheticTempDir::new("restore-stage-mode-b-unreferenced");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "stage-mode-b-unreferenced",
+            BackupExportMode::ModeB,
+            1,
+            0,
+            false,
+            false,
+        );
+        let parent = restore_stage_parent(&temp, "mode-b-unreferenced");
+
+        let result = build_synthetic_restore_stage(&fixture.path, &parent).unwrap();
+
+        assert_eq!(result.staged_blob_count, 1);
+    }
+
+    #[test]
+    fn restore_stage_mode_b_missing_blob_fails() {
+        let temp = SyntheticTempDir::new("restore-stage-mode-b-missing");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "stage-mode-b-missing",
+            BackupExportMode::ModeB,
+            1,
+            0,
+            false,
+            false,
+        );
+        std_fs::remove_file(fixture.path.join("blobs/file-100.blob")).unwrap();
+        let parent = restore_stage_parent(&temp, "mode-b-missing");
+
+        assert_eq!(
+            build_synthetic_restore_stage(&fixture.path, &parent).unwrap_err(),
+            RestoreStageError::PackageInvalid
+        );
+        assert_no_restore_stage(&parent);
+    }
+
+    #[test]
+    fn restore_stage_mode_b_copy_failure_cleans_temp() {
+        let temp = SyntheticTempDir::new("restore-stage-mode-b-copy-failure");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "stage-mode-b-copy-failure",
+            BackupExportMode::ModeB,
+            1,
+            0,
+            false,
+            false,
+        );
+        let parent = restore_stage_parent(&temp, "mode-b-copy-failure");
+
+        let error = build_restore_staging_with(
+            RestoreStagingRequest {
+                package_root: fixture.path,
+                app_data_parent: parent.clone(),
+            },
+            &SyntheticRestoreCapacityChecker::allowing(),
+            &SyntheticRestoreStageHooks::new(SyntheticRestoreStageHookAction::FailBlobCopy),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, RestoreStageError::BlobCopyFailed);
+        assert_no_restore_stage(&parent);
+    }
+
+    #[test]
+    fn restore_stage_mode_b_hash_mismatch_fails() {
+        let temp = SyntheticTempDir::new("restore-stage-mode-b-hash-mismatch");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "stage-mode-b-hash-mismatch",
+            BackupExportMode::ModeB,
+            1,
+            0,
+            false,
+            false,
+        );
+        let parent = restore_stage_parent(&temp, "mode-b-hash-mismatch");
+
+        let error = build_restore_staging_with(
+            RestoreStagingRequest {
+                package_root: fixture.path,
+                app_data_parent: parent.clone(),
+            },
+            &SyntheticRestoreCapacityChecker::allowing(),
+            &SyntheticRestoreStageHooks::new(SyntheticRestoreStageHookAction::TamperSourceBlob),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, RestoreStageError::BlobHashMismatch);
+        assert_no_restore_stage(&parent);
+    }
+
+    #[test]
+    fn restore_staging_fresh_provider_refs_generated_each_attempt() {
+        let temp = SyntheticTempDir::new("restore-staging-fresh-provider-refs");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "staging-fresh-provider-refs",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            true,
+            false,
+        );
+        let parent = restore_stage_parent(&temp, "fresh-provider-refs");
+
+        let first = build_synthetic_restore_stage(&fixture.path, &parent).unwrap();
+        let second = build_synthetic_restore_stage(&fixture.path, &parent).unwrap();
+        let first_state = read_staged_restore_state(&first.staging_directory);
+        let second_state = read_staged_restore_state(&second.staging_directory);
+        let source_ref = read_backup_state(&fixture.path).providers[0]
+            .secret_ref
+            .clone();
+
+        assert_ne!(first.operation_id, second.operation_id);
+        assert_ne!(
+            first_state.providers[0].secret_ref,
+            second_state.providers[0].secret_ref
+        );
+        assert_ne!(first_state.providers[0].secret_ref, source_ref);
+        assert!(!first_state.providers[0]
+            .secret_ref
+            .contains(RESTORE_PLANNED_SECRET_REF_MARKER));
+        assert!(!restore_value_has_true_field(
+            &first_state.settings,
+            "hasSecret"
+        ));
+    }
+
+    #[test]
+    fn restore_staging_fresh_storage_keys_generated_each_attempt() {
+        let temp = SyntheticTempDir::new("restore-staging-fresh-storage-keys");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "staging-fresh-storage-keys",
+            BackupExportMode::ModeB,
+            1,
+            1,
+            false,
+            false,
+        );
+        let parent = restore_stage_parent(&temp, "fresh-storage-keys");
+
+        let first = build_synthetic_restore_stage(&fixture.path, &parent).unwrap();
+        let second = build_synthetic_restore_stage(&fixture.path, &parent).unwrap();
+        let first_state = read_staged_restore_state(&first.staging_directory);
+        let second_state = read_staged_restore_state(&second.staging_directory);
+        let source_keys = read_backup_state(&fixture.path)
+            .files
+            .into_iter()
+            .map(|file| file.storage_key)
+            .collect::<HashSet<_>>();
+
+        assert!(first_state.files.iter().all(|file| {
+            file.storage_key.starts_with("restore-blob-")
+                && !source_keys.contains(&file.storage_key)
+                && !file
+                    .storage_key
+                    .contains(RESTORE_PLANNED_STORAGE_KEY_PREFIX)
+        }));
+        assert!(first_state
+            .files
+            .iter()
+            .zip(&second_state.files)
+            .all(|(first, second)| first.storage_key != second.storage_key));
+    }
+
+    #[test]
+    fn restore_staging_preserves_ids_and_normalizes_runtime_state() {
+        let temp = SyntheticTempDir::new("restore-staging-preserves-ids");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "staging-preserves-ids",
+            BackupExportMode::ModeB,
+            2,
+            1,
+            true,
+            true,
+        );
+        let source = read_backup_state(&fixture.path);
+        let parent = restore_stage_parent(&temp, "preserves-ids");
+
+        let result = build_synthetic_restore_stage(&fixture.path, &parent).unwrap();
+        let staged = read_staged_restore_state(&result.staging_directory);
+
+        assert_eq!(staged.id_seq, source.id_seq);
+        assert_eq!(
+            staged.files.iter().map(|file| file.id).collect::<Vec<_>>(),
+            source.files.iter().map(|file| file.id).collect::<Vec<_>>()
+        );
+        assert!(staged
+            .conversations
+            .values()
+            .all(|conversation| !conversation.is_generating));
+    }
+
+    #[test]
+    fn restore_staging_old_dry_run_is_not_reused() {
+        let temp = SyntheticTempDir::new("restore-staging-no-dry-run-reuse");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "staging-no-dry-run-reuse",
+            BackupExportMode::ModeB,
+            1,
+            0,
+            false,
+            false,
+        );
+        restore_package_dry_run(&fixture.path).unwrap();
+        std_fs::write(fixture.path.join("blobs/file-100.blob"), b"tampered").unwrap();
+        let parent = restore_stage_parent(&temp, "no-dry-run-reuse");
+
+        assert_eq!(
+            build_synthetic_restore_stage(&fixture.path, &parent).unwrap_err(),
+            RestoreStageError::PackageInvalid
+        );
+        assert_no_restore_stage(&parent);
+    }
+
+    #[test]
+    fn restore_staging_source_package_unchanged() {
+        let temp = SyntheticTempDir::new("restore-staging-source-unchanged");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "staging-source-unchanged",
+            BackupExportMode::ModeB,
+            2,
+            1,
+            true,
+            true,
+        );
+        let before = restore_package_fingerprint(&fixture.path);
+        let parent = restore_stage_parent(&temp, "source-unchanged");
+
+        build_synthetic_restore_stage(&fixture.path, &parent).unwrap();
+
+        assert_eq!(restore_package_fingerprint(&fixture.path), before);
+    }
+
+    #[test]
+    fn restore_staging_parent_symlink_rejected() {
+        let temp = SyntheticTempDir::new("restore-staging-parent-symlink");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "staging-parent-symlink",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        let real_parent = restore_stage_parent(&temp, "parent-symlink-real");
+        let linked_parent = temp.path.join("restore-stage-parent-symlink-link");
+        if !try_create_restore_directory_symlink(&real_parent, &linked_parent) {
+            return;
+        }
+
+        assert_eq!(
+            build_synthetic_restore_stage(&fixture.path, &linked_parent).unwrap_err(),
+            RestoreStageError::DestinationInvalid
+        );
+        assert_no_restore_stage(&real_parent);
+    }
+
+    #[test]
+    fn restore_staging_name_collision_does_not_overwrite() {
+        let temp = SyntheticTempDir::new("restore-staging-name-collision");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "staging-name-collision",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        let parent = restore_stage_parent(&temp, "name-collision");
+
+        let error = build_restore_staging_with(
+            RestoreStagingRequest {
+                package_root: fixture.path,
+                app_data_parent: parent.clone(),
+            },
+            &SyntheticRestoreCapacityChecker::allowing(),
+            &SyntheticRestoreStageHooks::new(SyntheticRestoreStageHookAction::CreateFinalCollision),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, RestoreStageError::NameCollision);
+        let names = restore_stage_names(&parent);
+        assert_eq!(names.len(), 1);
+        assert!(names[0].starts_with(&format!("{RESTORE_STAGE_FINAL_DIR_PREFIX}.")));
+    }
+
+    #[test]
+    fn restore_staging_unknown_entry_rejected() {
+        let temp = SyntheticTempDir::new("restore-staging-unknown-entry");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "staging-unknown-entry",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        let parent = restore_stage_parent(&temp, "unknown-entry");
+
+        let error = build_restore_staging_with(
+            RestoreStagingRequest {
+                package_root: fixture.path,
+                app_data_parent: parent.clone(),
+            },
+            &SyntheticRestoreCapacityChecker::allowing(),
+            &SyntheticRestoreStageHooks::new(SyntheticRestoreStageHookAction::AddUnknownEntry),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, RestoreStageError::ValidationFailed);
+        assert_no_restore_stage(&parent);
+    }
+
+    #[test]
+    fn restore_staging_nonempty_secrets_rejected() {
+        let temp = SyntheticTempDir::new("restore-staging-secret-entry");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "staging-secret-entry",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            true,
+            false,
+        );
+        let parent = restore_stage_parent(&temp, "secret-entry");
+
+        let error = build_restore_staging_with(
+            RestoreStagingRequest {
+                package_root: fixture.path,
+                app_data_parent: parent.clone(),
+            },
+            &SyntheticRestoreCapacityChecker::allowing(),
+            &SyntheticRestoreStageHooks::new(SyntheticRestoreStageHookAction::AddSecretEntry),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, RestoreStageError::ValidationFailed);
+        assert_no_restore_stage(&parent);
+    }
+
+    #[test]
+    fn restore_staging_package_control_files_not_copied() {
+        let temp = SyntheticTempDir::new("restore-staging-no-controls");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "staging-no-controls",
+            BackupExportMode::ModeB,
+            1,
+            0,
+            false,
+            false,
+        );
+        let parent = restore_stage_parent(&temp, "no-controls");
+
+        let result = build_synthetic_restore_stage(&fixture.path, &parent).unwrap();
+
+        for name in [
+            BACKUP_MANIFEST_FILE_NAME,
+            BACKUP_STATE_FILE_NAME,
+            BACKUP_CHECKSUM_FILE_NAME,
+        ] {
+            assert!(!result.staging_directory.join(name).exists());
+        }
+    }
+
+    #[test]
+    fn restore_staging_state_write_failure_leaves_no_stage() {
+        let temp = SyntheticTempDir::new("restore-staging-state-failure");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "staging-state-failure",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        let parent = restore_stage_parent(&temp, "state-failure");
+
+        let error = build_restore_staging_with(
+            RestoreStagingRequest {
+                package_root: fixture.path,
+                app_data_parent: parent.clone(),
+            },
+            &SyntheticRestoreCapacityChecker::allowing(),
+            &SyntheticRestoreStageHooks::new(SyntheticRestoreStageHookAction::FailStateWrite),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, RestoreStageError::StateWriteFailed);
+        assert_no_restore_stage(&parent);
+    }
+
+    #[test]
+    fn restore_staging_publish_failure_leaves_no_stage() {
+        let temp = SyntheticTempDir::new("restore-staging-publish-failure");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "staging-publish-failure",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        let parent = restore_stage_parent(&temp, "publish-failure");
+
+        let error = build_restore_staging_with(
+            RestoreStagingRequest {
+                package_root: fixture.path,
+                app_data_parent: parent.clone(),
+            },
+            &SyntheticRestoreCapacityChecker::allowing(),
+            &SyntheticRestoreStageHooks::new(SyntheticRestoreStageHookAction::FailPublish),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, RestoreStageError::PublishFailed);
+        assert_no_restore_stage(&parent);
+    }
+
+    #[test]
+    fn restore_staging_final_revalidation_failure_removes_candidate() {
+        let temp = SyntheticTempDir::new("restore-staging-final-revalidation");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "staging-final-revalidation",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        let parent = restore_stage_parent(&temp, "final-revalidation");
+
+        let error = build_restore_staging_with(
+            RestoreStagingRequest {
+                package_root: fixture.path,
+                app_data_parent: parent.clone(),
+            },
+            &SyntheticRestoreCapacityChecker::allowing(),
+            &SyntheticRestoreStageHooks::new(SyntheticRestoreStageHookAction::TamperAfterPublish),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, RestoreStageError::ValidationFailed);
+        assert_no_restore_stage(&parent);
+    }
+
+    #[test]
+    fn restore_staging_existing_unrelated_stage_preserved() {
+        let temp = SyntheticTempDir::new("restore-staging-unrelated-preserved");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "staging-unrelated-preserved",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        let parent = restore_stage_parent(&temp, "unrelated-preserved");
+        let unrelated = parent.join("mock-api.restore-stage.unrelated");
+        std_fs::create_dir(&unrelated).unwrap();
+        std_fs::write(unrelated.join("marker"), b"synthetic marker").unwrap();
+
+        build_synthetic_restore_stage(&fixture.path, &parent).unwrap();
+
+        assert_eq!(
+            std_fs::read(unrelated.join("marker")).unwrap(),
+            b"synthetic marker"
+        );
+    }
+
+    #[test]
+    fn restore_staging_concurrent_builds_use_unique_directories() {
+        let temp = SyntheticTempDir::new("restore-staging-concurrent");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "staging-concurrent",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        let parent = restore_stage_parent(&temp, "concurrent");
+        let package = fixture.path.clone();
+        let first_parent = parent.clone();
+        let second_parent = parent.clone();
+
+        let (first, second) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| build_synthetic_restore_stage(&package, &first_parent));
+            let second = scope.spawn(|| build_synthetic_restore_stage(&package, &second_parent));
+            (
+                first.join().unwrap().unwrap(),
+                second.join().unwrap().unwrap(),
+            )
+        });
+
+        assert_ne!(first.operation_id, second.operation_id);
+        assert_ne!(first.staging_directory, second.staging_directory);
+        assert!(first.staging_directory.is_dir());
+        assert!(second.staging_directory.is_dir());
+    }
+
+    #[test]
+    fn restore_stage_capacity_insufficient_fails_before_create() {
+        let temp = SyntheticTempDir::new("restore-stage-capacity-insufficient");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "stage-capacity-insufficient",
+            BackupExportMode::ModeB,
+            1,
+            0,
+            false,
+            false,
+        );
+        let parent = restore_stage_parent(&temp, "capacity-insufficient");
+        let checker = SyntheticRestoreCapacityChecker::with_available(0);
+
+        let error = build_restore_staging_with(
+            RestoreStagingRequest {
+                package_root: fixture.path,
+                app_data_parent: parent.clone(),
+            },
+            &checker,
+            &SyntheticRestoreStageHooks::new(SyntheticRestoreStageHookAction::None),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, RestoreStageError::CapacityInsufficient);
+        assert!(checker.requested.load(Ordering::Relaxed) > 0);
+        assert_no_restore_stage(&parent);
+    }
+
+    #[test]
+    fn restore_stage_capacity_exact_boundary_succeeds() {
+        let temp = SyntheticTempDir::new("restore-stage-capacity-exact");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "stage-capacity-exact",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        let validated = validate_restore_package(&fixture.path).unwrap();
+        let operation_id = "1700000000000-1234-1";
+        let (state, plan) = normalize_restore_state_for_stage(&validated, operation_id).unwrap();
+        let bytes = serde_json::to_vec_pretty(&state).unwrap();
+        let required = restore_stage_required_capacity(&bytes, &plan).unwrap();
+        let checker = SyntheticRestoreCapacityChecker::with_available(required);
+
+        assert_eq!(checker.ensure_capacity(&temp.path, required), Ok(()));
+        assert_eq!(checker.requested.load(Ordering::Relaxed), required);
+    }
+
+    #[test]
+    fn restore_stage_capacity_check_failure_is_fail_closed() {
+        let temp = SyntheticTempDir::new("restore-stage-capacity-failure");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "stage-capacity-failure",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        let parent = restore_stage_parent(&temp, "capacity-failure");
+
+        let error = build_restore_staging_with(
+            RestoreStagingRequest {
+                package_root: fixture.path,
+                app_data_parent: parent.clone(),
+            },
+            &SyntheticRestoreCapacityChecker::failing(),
+            &SyntheticRestoreStageHooks::new(SyntheticRestoreStageHookAction::None),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, RestoreStageError::CapacityInsufficient);
+        assert_no_restore_stage(&parent);
+    }
+
+    #[test]
+    fn restore_staging_current_mock_api_unchanged() {
+        let temp = SyntheticTempDir::new("restore-staging-current-unchanged");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "staging-current-unchanged",
+            BackupExportMode::ModeB,
+            1,
+            0,
+            true,
+            true,
+        );
+        let parent = restore_stage_parent(&temp, "current-unchanged");
+        let current = parent.join(PERSIST_DIR_NAME);
+        std_fs::create_dir(&current).unwrap();
+        std_fs::write(
+            current.join(STATE_FILE_NAME),
+            b"synthetic current state bytes",
+        )
+        .unwrap();
+        std_fs::create_dir(current.join(SECRETS_DIR_NAME)).unwrap();
+        std_fs::write(
+            current.join(SECRETS_DIR_NAME).join("opaque.bin"),
+            b"synthetic opaque bytes",
+        )
+        .unwrap();
+        let before = restore_package_fingerprint(&current);
+
+        build_synthetic_restore_stage(&fixture.path, &parent).unwrap();
+
+        assert_eq!(restore_package_fingerprint(&current), before);
+        assert!(!parent.join("restore-journal.json").exists());
+        assert!(std_fs::read_dir(&parent).unwrap().all(|entry| {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            !name.starts_with("mock-api.pre-restore.")
+                && !name.starts_with("mock-api.failed-restore.")
+        }));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn restore_staging_system_capacity_mode_a_success() {
+        let temp = SyntheticTempDir::new("restore-staging-system-capacity");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "staging-system-capacity",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        let parent = restore_stage_parent(&temp, "system-capacity");
+
+        let result = build_restore_staging(RestoreStagingRequest {
+            package_root: fixture.path,
+            app_data_parent: parent,
+        })
+        .await
+        .unwrap();
+
+        assert!(result.staging_directory.is_dir());
+    }
+
+    #[test]
+    fn restore_staging_operation_id_is_controlled_ascii() {
+        let temp = SyntheticTempDir::new("restore-staging-operation-id");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "staging-operation-id",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        let parent = restore_stage_parent(&temp, "operation-id");
+
+        let result = build_synthetic_restore_stage(&fixture.path, &parent).unwrap();
+
+        assert!(!result.operation_id.is_empty());
+        assert!(result
+            .operation_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'-'));
+        assert!(!result.operation_id.contains("restore"));
+    }
+
+    #[test]
+    fn restore_staging_temp_and_final_share_controlled_parent() {
+        let temp = SyntheticTempDir::new("restore-staging-controlled-parent");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "staging-controlled-parent",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        let parent = restore_stage_parent(&temp, "controlled-parent");
+        let canonical_parent = std_fs::canonicalize(&parent).unwrap();
+
+        let result = build_synthetic_restore_stage(&fixture.path, &parent).unwrap();
+
+        assert_eq!(
+            result.staging_directory.parent(),
+            Some(canonical_parent.as_path())
+        );
+        assert!(restore_stage_names(&parent)
+            .iter()
+            .all(|name| !name.starts_with(&format!("{RESTORE_STAGE_TEMP_DIR_PREFIX}."))));
+    }
+
+    #[test]
+    fn restore_staging_state_atomic_temp_is_absent_after_success() {
+        let temp = SyntheticTempDir::new("restore-staging-state-temp-absent");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "staging-state-temp-absent",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        let parent = restore_stage_parent(&temp, "state-temp-absent");
+
+        let result = build_synthetic_restore_stage(&fixture.path, &parent).unwrap();
+        let names = restore_stage_directory_entries(&result.staging_directory).unwrap();
+
+        assert!(names.contains_key(STATE_FILE_NAME));
+        assert!(names
+            .keys()
+            .all(|name| !name.starts_with(STATE_TMP_FILE_PREFIX)));
+    }
+
+    #[test]
+    fn restore_staging_staged_blob_tamper_fails_validation() {
+        let temp = SyntheticTempDir::new("restore-staging-staged-blob-tamper");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "staging-staged-blob-tamper",
+            BackupExportMode::ModeB,
+            1,
+            0,
+            false,
+            false,
+        );
+        let parent = restore_stage_parent(&temp, "staged-blob-tamper");
+
+        let error = build_restore_staging_with(
+            RestoreStagingRequest {
+                package_root: fixture.path,
+                app_data_parent: parent.clone(),
+            },
+            &SyntheticRestoreCapacityChecker::allowing(),
+            &SyntheticRestoreStageHooks::new(SyntheticRestoreStageHookAction::TamperStagedBlob),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, RestoreStageError::ValidationFailed);
+        assert_no_restore_stage(&parent);
+    }
+
+    #[test]
+    fn restore_staging_staged_blob_symlink_rejected() {
+        let temp = SyntheticTempDir::new("restore-staging-staged-blob-symlink");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "staging-staged-blob-symlink",
+            BackupExportMode::ModeB,
+            1,
+            0,
+            false,
+            false,
+        );
+        let parent = restore_stage_parent(&temp, "staged-blob-symlink");
+        let result = build_synthetic_restore_stage(&fixture.path, &parent).unwrap();
+        let blob_root = result
+            .staging_directory
+            .join(FILES_DIR_NAME)
+            .join(FILE_BLOBS_DIR_NAME);
+        let blob = std_fs::read_dir(&blob_root)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let external = temp.path.join("synthetic-external-blob");
+        std_fs::write(&external, b"synthetic external bytes").unwrap();
+        std_fs::remove_file(&blob).unwrap();
+        if !try_create_restore_file_symlink(&external, &blob) {
+            return;
+        }
+
+        assert!(matches!(
+            validate_staged_mock_api_directory(
+                &result.staging_directory,
+                BackupManifestMode::FullLocalData,
+            ),
+            Err(RestoreStageError::ValidationFailed)
+        ));
+    }
+
+    #[test]
+    fn restore_staging_destination_file_rejected() {
+        let temp = SyntheticTempDir::new("restore-staging-destination-file");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "staging-destination-file",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        let destination = temp.path.join("synthetic-destination-file");
+        std_fs::write(&destination, b"synthetic").unwrap();
+
+        assert_eq!(
+            build_synthetic_restore_stage(&fixture.path, &destination).unwrap_err(),
+            RestoreStageError::DestinationInvalid
+        );
+    }
+
+    #[test]
+    fn restore_staging_extra_blob_rejected_independently() {
+        let temp = SyntheticTempDir::new("restore-staging-extra-blob");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "staging-extra-blob",
+            BackupExportMode::ModeB,
+            1,
+            0,
+            false,
+            false,
+        );
+        let parent = restore_stage_parent(&temp, "extra-blob");
+        let result = build_synthetic_restore_stage(&fixture.path, &parent).unwrap();
+        std_fs::write(
+            result
+                .staging_directory
+                .join(FILES_DIR_NAME)
+                .join(FILE_BLOBS_DIR_NAME)
+                .join("restore-blob-extra"),
+            b"synthetic extra blob",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            validate_staged_mock_api_directory(
+                &result.staging_directory,
+                BackupManifestMode::FullLocalData,
+            ),
+            Err(RestoreStageError::ValidationFailed)
+        ));
+    }
+
+    #[test]
+    fn restore_staging_provider_refs_unique_and_settings_synced() {
+        let temp = SyntheticTempDir::new("restore-staging-provider-sync");
+        let mut state = synthetic_provider_state();
+        let mut second = state.providers[0].clone();
+        second.id = "desktop-provider-9001".to_string();
+        second.models[0].id = "desktop-model-9002".to_string();
+        second.secret_ref = secret_ref_for_provider(&second.id);
+        state.providers.push(second);
+        state.id_seq = 10_000;
+        sync_settings_with_desktop_providers(&mut state.settings, &state.providers);
+        let state = sanitize_and_validate_portable_backup_snapshot(state).unwrap();
+        let package = create_unpublished_backup_package(
+            &temp,
+            "staging-provider-sync",
+            BackupExportMode::ModeA,
+            &state,
+            None,
+        );
+        let parent = restore_stage_parent(&temp, "provider-sync");
+
+        let result = build_synthetic_restore_stage(&package, &parent).unwrap();
+        let staged = read_staged_restore_state(&result.staging_directory);
+        let refs = staged
+            .providers
+            .iter()
+            .map(|provider| provider.secret_ref.as_str())
+            .collect::<HashSet<_>>();
+
+        assert_eq!(refs.len(), 2);
+        assert!(staged.providers.iter().all(|provider| {
+            staged.settings["providers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|settings_provider| {
+                    settings_provider["id"] == provider.id
+                        && settings_provider["secretRef"] == provider.secret_ref
+                })
+        }));
+    }
+
+    #[test]
+    fn restore_staging_storage_keys_unique_and_relative_paths_controlled() {
+        let temp = SyntheticTempDir::new("restore-staging-key-paths");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "staging-key-paths",
+            BackupExportMode::ModeB,
+            3,
+            2,
+            false,
+            false,
+        );
+        let parent = restore_stage_parent(&temp, "key-paths");
+
+        let result = build_synthetic_restore_stage(&fixture.path, &parent).unwrap();
+        let state = read_staged_restore_state(&result.staging_directory);
+        let keys = state
+            .files
+            .iter()
+            .map(|file| file.storage_key.as_str())
+            .collect::<HashSet<_>>();
+
+        assert_eq!(keys.len(), state.files.len());
+        assert!(state.files.iter().all(|file| {
+            file.relative_path
+                == format!(
+                    "{FILES_DIR_NAME}/{FILE_BLOBS_DIR_NAME}/{}",
+                    file.storage_key
+                )
+        }));
+    }
+
+    #[test]
+    fn restore_staging_mode_b_persists_verified_blob_hashes() {
+        let temp = SyntheticTempDir::new("restore-staging-verified-hashes");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "staging-verified-hashes",
+            BackupExportMode::ModeB,
+            2,
+            0,
+            false,
+            false,
+        );
+        let parent = restore_stage_parent(&temp, "verified-hashes");
+
+        let result = build_synthetic_restore_stage(&fixture.path, &parent).unwrap();
+        let state = read_staged_restore_state(&result.staging_directory);
+        let blob_root = result
+            .staging_directory
+            .join(FILES_DIR_NAME)
+            .join(FILE_BLOBS_DIR_NAME);
+
+        assert!(state.files.iter().all(|file| {
+            let (hash, size) = sha256_file(&blob_root.join(&file.storage_key)).unwrap();
+            file.sha256.as_deref() == Some(hash.as_str()) && file.size_bytes == size
+        }));
+    }
+
+    #[test]
+    fn restore_staging_top_level_layout_is_exact() {
+        let temp = SyntheticTempDir::new("restore-staging-layout-exact");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "staging-layout-exact",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        let parent = restore_stage_parent(&temp, "layout-exact");
+
+        let result = build_synthetic_restore_stage(&fixture.path, &parent).unwrap();
+        let names = restore_stage_directory_entries(&result.staging_directory)
+            .unwrap()
+            .into_keys()
+            .collect::<HashSet<_>>();
+
+        assert_eq!(
+            names,
+            HashSet::from([
+                STATE_FILE_NAME.to_string(),
+                FILES_DIR_NAME.to_string(),
+                SECRETS_DIR_NAME.to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn restore_staging_provider_stage_has_empty_secrets_directory() {
+        let temp = SyntheticTempDir::new("restore-staging-empty-secrets");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "staging-empty-secrets",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            true,
+            false,
+        );
+        let parent = restore_stage_parent(&temp, "empty-secrets");
+
+        let result = build_synthetic_restore_stage(&fixture.path, &parent).unwrap();
+
+        assert!(
+            restore_stage_directory_entries(&result.staging_directory.join(SECRETS_DIR_NAME))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn restore_staging_invalid_package_skips_capacity_check() {
+        let temp = SyntheticTempDir::new("restore-staging-invalid-before-capacity");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "staging-invalid-before-capacity",
+            BackupExportMode::ModeB,
+            1,
+            0,
+            false,
+            false,
+        );
+        std_fs::remove_file(fixture.path.join("blobs/file-100.blob")).unwrap();
+        let parent = restore_stage_parent(&temp, "invalid-before-capacity");
+        let checker = SyntheticRestoreCapacityChecker::allowing();
+
+        let error = build_restore_staging_with(
+            RestoreStagingRequest {
+                package_root: fixture.path,
+                app_data_parent: parent,
+            },
+            &checker,
+            &SyntheticRestoreStageHooks::new(SyntheticRestoreStageHookAction::None),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, RestoreStageError::PackageInvalid);
+        assert_eq!(checker.requested.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn restore_staging_creates_no_journal_or_rollback_directories() {
+        let temp = SyntheticTempDir::new("restore-staging-no-commit-artifacts");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "staging-no-commit-artifacts",
+            BackupExportMode::ModeB,
+            1,
+            0,
+            false,
+            false,
+        );
+        let parent = restore_stage_parent(&temp, "no-commit-artifacts");
+
+        build_synthetic_restore_stage(&fixture.path, &parent).unwrap();
+
+        assert!(!parent.join("restore-journal.json").exists());
+        assert!(std_fs::read_dir(&parent).unwrap().all(|entry| {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            !name.starts_with("mock-api.pre-restore.")
+                && !name.starts_with("mock-api.failed-restore.")
+        }));
+    }
+
+    #[test]
+    fn restore_staging_final_name_contains_operation_id() {
+        let temp = SyntheticTempDir::new("restore-staging-name-operation-id");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "staging-name-operation-id",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        let parent = restore_stage_parent(&temp, "name-operation-id");
+
+        let result = build_synthetic_restore_stage(&fixture.path, &parent).unwrap();
+        let name = result
+            .staging_directory
+            .file_name()
+            .unwrap()
+            .to_string_lossy();
+
+        assert_eq!(
+            name,
+            format!("{RESTORE_STAGE_FINAL_DIR_PREFIX}.{}", result.operation_id)
+        );
+    }
+
+    #[test]
+    fn restore_staging_mode_a_tombstoned_metadata_creates_no_blob() {
+        let temp = SyntheticTempDir::new("restore-staging-mode-a-tombstone");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "staging-mode-a-tombstone",
+            BackupExportMode::ModeA,
+            1,
+            1,
+            false,
+            true,
+        );
+        let parent = restore_stage_parent(&temp, "mode-a-tombstone");
+
+        let result = build_synthetic_restore_stage(&fixture.path, &parent).unwrap();
+        let state = read_staged_restore_state(&result.staging_directory);
+
+        assert_eq!(state.files.len(), 2);
+        assert_eq!(result.staged_blob_count, 0);
+        assert!(restore_stage_directory_entries(
+            &result
+                .staging_directory
+                .join(FILES_DIR_NAME)
+                .join(FILE_BLOBS_DIR_NAME)
+        )
+        .unwrap()
+        .is_empty());
+    }
+
+    #[test]
+    fn restore_staging_wrong_mode_fails_independent_validation() {
+        let temp = SyntheticTempDir::new("restore-staging-wrong-mode");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "staging-wrong-mode",
+            BackupExportMode::ModeA,
+            1,
+            0,
+            false,
+            true,
+        );
+        let parent = restore_stage_parent(&temp, "wrong-mode");
+        let result = build_synthetic_restore_stage(&fixture.path, &parent).unwrap();
+
+        assert!(matches!(
+            validate_staged_mock_api_directory(
+                &result.staging_directory,
+                BackupManifestMode::FullLocalData,
+            ),
+            Err(RestoreStageError::ValidationFailed)
+        ));
+    }
+
+    #[test]
+    fn restore_staging_safe_errors_contain_no_local_values() {
+        let temp = SyntheticTempDir::new("restore-staging-safe-errors");
+        let local_value = temp.path.to_string_lossy();
+        let messages = [
+            RestoreStageError::PackageInvalid,
+            RestoreStageError::DestinationInvalid,
+            RestoreStageError::NameCollision,
+            RestoreStageError::CapacityInsufficient,
+            RestoreStageError::CreateFailed,
+            RestoreStageError::StateWriteFailed,
+            RestoreStageError::BlobCopyFailed,
+            RestoreStageError::BlobHashMismatch,
+            RestoreStageError::ValidationFailed,
+            RestoreStageError::PublishFailed,
+            RestoreStageError::SecretAccessForbidden,
+        ]
+        .map(|error| error.to_string());
+
+        assert!(messages.iter().all(|message| {
+            !message.contains(local_value.as_ref())
+                && !message.contains("storageKey")
+                && !message.contains("secretRef")
+                && !message.contains("api-key")
+        }));
     }
 }

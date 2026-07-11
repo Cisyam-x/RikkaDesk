@@ -279,6 +279,21 @@ P2-B verification must cover:
 
 P2-B does not create a pre-restore backup, install blobs, replace state, rollback, expose an API/UI, migrate schemas, restore API keys, support Mode C/ZIP/merge, or resume streaming. P2-C must add mandatory pre-restore backup and complete revalidation before any actual restore transaction.
 
+Phase 12 P2-C1 adds an internal offline candidate staging builder. Actual restore remains unavailable.
+
+- Re-run full format v1 package/tree/state/checksum/blob validation for every staging call; never reuse a dry-run report.
+- Confirm the stage uses a generated ASCII operation ID and same-parent temp/final names, does not overwrite another stage, and leaves no temp stage after success or handled failure.
+- Confirm every Provider and managed file receives a fresh per-attempt controlled reference/key, Provider `hasSecret` remains false, and the empty staged `secrets/` directory contains no blob.
+- Mode A must retain attachment parts/metadata, create no staged blob, and report active attachments unavailable.
+- Mode B must stream-copy exactly all active package blobs, including unreferenced active files, exclude tombstoned/unknown blobs, and recheck source plus staged size/SHA256.
+- Confirm staged state uses unique-temp/write/flush/sync/rename and leaves no state temp.
+- Confirm strict independent stage validation rejects unknown/control entries, nonempty secrets, extra/missing/tampered blobs, unsafe keys/paths, symlinks, and reparse points.
+- Confirm capacity insufficient/check failure occurs before stage creation and fails closed.
+- Confirm current `mock-api` contents remain byte-for-byte unchanged and no rollback snapshot, failed-restore directory, journal, SecretStore access, SSE, revision, or live commit occurs.
+- Run `restore_stage`, `restore_staging`, `restore_stage_mode_a`, `restore_stage_mode_b`, `restore_stage_capacity`, `restore_dry_run`, `backup_`, and the complete Rust suite. P2-C1 adds 46 dedicated synthetic tests.
+
+P2-C1 has no restore HTTP API, Tauri command, UI, folder picker, current-data switch, rollback, journal, Mode C, ZIP, merge, schema migration, SecretStore restoration, or orphan reconciliation. P2-C2 must implement the mandatory local rollback snapshot and journaled directory commit/rollback before actual restore can be exposed.
+
 It may contain:
 
 - settings
