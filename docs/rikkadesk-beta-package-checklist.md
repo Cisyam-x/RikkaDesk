@@ -194,7 +194,7 @@ Phase 10 upgrades local desktop state to `schemaVersion: 5` with managed file me
 
 Phase 12 P1-A serializes local state saves, uses unique same-directory temp files, flushes and syncs each complete temp file, and replaces the primary state without deleting it first. Packaging verification should run the synthetic `state_persist` tests and confirm save failures return a non-success response. P1-A does not yet add backup/restore, migration backup, future-schema protection, or in-memory rollback after a failed save.
 
-Phase 12 P1-B initializes defaults only when the primary state is missing. Other read failures stop startup. Malformed state is preserved byte-for-byte in a unique corrupt backup and requires explicit recovery; a backup failure cannot fall through to default state. Future schemas stop startup without being marked corrupt, and schemas 1-5 receive a durable original-byte backup before migration. Strict P1-A stale temp files remain ignored and preserved. Recovery UI and P1-C4 streaming transaction safety are still pending.
+Phase 12 P1-B initializes defaults only when the primary state is missing. Other read failures stop startup. Malformed state is preserved byte-for-byte in a unique corrupt backup and requires explicit recovery; a backup failure cannot fall through to default state. Future schemas stop startup without being marked corrupt, and schemas 1-5 receive a durable original-byte backup before migration. Strict P1-A stale temp files remain ignored and preserved. Recovery UI remains pending; P1-C4 streaming transaction safety is now complete.
 
 Phase 12 P1-C1 stages pure settings and conversation mutations, persists the staged snapshot through the P1-A atomic writer, and commits live state only after persistence succeeds. Covered operations are assistant selection, current assistant model, favorites, title, pin/unpin, conversation delete, text message edit, and message delete. Missing conversation detail/stream GETs now return a virtual DTO without creating persisted state. Run the synthetic `staged_transaction`, `mutation_transaction`, `transaction_failure`, and `get_does_not_mutate` test groups and confirm success events occur only after commit.
 
@@ -227,7 +227,22 @@ P1-C3 verification must cover:
 - Safe errors and fixed warnings containing no blob bytes, storage key, original file name, absolute path, state JSON, or user message.
 - The synthetic `file_transaction`, `blob_compensation`, `file_delete`, and `file_reference` groups plus the complete Rust suite. Never use real app data or real user files.
 
-P1-C1/P1-C2/P1-C3 do not make every mutation class or cross-resource crash window atomic. Send/regenerate/stop/streaming finalization remains P1-C4, so Backup Mode A/B packaging is still blocked. Do not claim that SecretStore and JSON state are fully atomic across process crashes: an unreferenced encrypted orphan can remain between new-secret prepare and state commit or between state commit and old-secret cleanup. Managed blob publication and physical deletion also retain crash-only orphan windows, and automatic orphan reconciliation/GC is not implemented.
+Phase 12 P1-C4 commits the initial user turn before any provider/mock task, keeps generation state and deltas runtime-only, and commits the final assistant append/replace through the staged-state helper before terminal success. Regenerate retains the old reply until atomic replacement. Stop discards transient partial text. Generation tokens prevent stale finish/delete races, and restart retains the durable user turn without resuming the stream.
+
+P1-C4 verification must cover:
+
+- Initial persistence failure: safe HTTP failure, no active generation, no provider/mock start, no generation-start/delta/terminal success, and unchanged live/disk/revision.
+- Final persistence failure for provider and mock paths: no assistant in live/disk, no revision increase, fixed persistence failure, and no `finished`.
+- Transient deltas: UI events may show progress, while live persisted conversations and `state.v1.json` contain no partial assistant reply.
+- Regenerate success atomically replaces the old reply; provider, persistence, edited-target, and deleted-target failures preserve current durable content.
+- Stop/finish race emits exactly one of `finished`, `stopped`, or `failed`; the discard-partial stop policy leaves only prior durable content.
+- Same-conversation send/regenerate conflict, different-conversation concurrency, stale generation rejection, and conversation delete without background recreation.
+- Category A and file/provider transaction concurrency during stream/final commit without lost updates or deadlock.
+- Restart drops active runtime generation and transient text while retaining the durable user message.
+- Synthetic loopback provider wait permits a concurrent Category A transaction, proving no persisted/component/mutation/file/Provider lock spans network wait.
+- Run `streaming_transaction`, `generation_registry`, `stream_event_order`, `regenerate_transaction`, and `stop_transaction` plus `transaction_failure`, `staged_transaction`, and the complete Rust suite. P1-C4 adds 32 synthetic tests.
+
+P1-C1/P1-C2/P1-C3/P1-C4 complete the handled runtime mutation gate for Mode A/B backup package work. Do not claim that state and network are atomic, streaming resumes across restart, or every delta is durable. Do not claim that SecretStore and JSON state are fully atomic across process crashes: an unreferenced encrypted orphan can remain between new-secret prepare and state commit or between state commit and old-secret cleanup. Managed blob publication and physical deletion also retain crash-only orphan windows, and automatic orphan reconciliation/GC is not implemented.
 
 It may contain:
 

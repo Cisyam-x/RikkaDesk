@@ -15,7 +15,7 @@ P0 is documentation only. It does not implement backup or restore APIs, add UI, 
 - Windows artifacts: unsigned private beta.
 - GitHub Release: No.
 - Real-provider image input: not enabled by default.
-- Runtime mutation hardening: P1-C1 pure state, P1-C2 Provider/SecretStore, and P1-C3 managed file/blob handled-failure semantics completed; P1-C4 streaming remains pending.
+- Runtime mutation hardening: P1-C1 pure state, P1-C2 Provider/SecretStore, P1-C3 managed file/blob handled-failure semantics, and P1-C4 streaming lifecycle semantics are completed.
 
 ## P0 Decisions
 
@@ -41,9 +41,9 @@ Implemented behavior:
 - On non-Windows platforms, the same-directory rename path is used without a pre-delete.
 - Serialization, temp create/write/flush/sync, and replacement failures preserve the previous primary state and best-effort remove only the temp file created by that save.
 - State mutation handlers await the persistence result and return a safe HTTP 5xx response on failure instead of reporting success.
-- Streaming completion cannot return an HTTP response, so persistence failure is recorded only as a fixed operation context and failure stage. No state content, message, provider config, secret, or local path is logged.
+- Streaming completion cannot return an HTTP response, so P1-C4 emits a fixed safe `failed` terminal after a final persistence failure. It does not emit `finished`, and no state content, message, provider config, secret, local path, request body, or delta is logged.
 
-P1-C1 removes this live-ahead-of-disk behavior for the pure settings and conversation mutations listed below. P1-C2 extends staged state commits to Provider metadata and coordinates them with copy-on-write SecretStore operations. P1-C3 now coordinates managed blob publication/deletion with staged file metadata. Streaming paths remain transitional and can still leave one live component ahead of disk after a failed save; P1-C4 owns those remaining rules.
+P1-C1 removes live-ahead-of-disk behavior for the pure settings and conversation mutations listed below. P1-C2 extends staged state commits to Provider metadata and coordinates them with copy-on-write SecretStore operations. P1-C3 coordinates managed blob publication/deletion with staged file metadata. P1-C4 commits the user before provider/mock work, keeps deltas transient, and stages the final assistant append/replace before any terminal success event.
 
 P1-A does not claim complete power-loss protection, a transactional boundary between state and managed blobs, backup/restore support, or complete corruption recovery.
 
@@ -84,6 +84,26 @@ Implemented behavior:
 - Message/conversation deletion does not automatically remove attachment blobs. Automatic orphan discovery, reconciliation, and GC remain deferred.
 
 P1-C3 still does not make JSON state and blob storage crash-atomic. A process crash after final blob publication but before metadata commit can leave an unreferenced blob. A crash after durable tombstone commit but before physical deletion can leave an inaccessible physical blob. These residuals are inputs to the later reconciliation design, not evidence that backup/restore is implemented.
+
+## P1-C4 Implementation Status
+
+Phase 12 P1-C4 hardens send, regenerate, stop, mock fallback, provider streaming, and background finalization without changing schema v6, Provider import/export v4, provider protocols, or backup formats.
+
+Implemented behavior:
+
+- Initial conversation creation and the user message are one staged transaction. Persistence failure returns a safe HTTP failure, leaves live/disk/revision unchanged, registers no surviving generation, emits no start/success event, and starts no provider/mock task.
+- Active generations are runtime-only and contain a monotonic generation ID, operation, phase, and cancellation handle. They do not persist prompts, deltas, request bodies, secrets, or provider responses.
+- One conversation accepts at most one generation. Different conversations can stream concurrently. Token ownership prevents stale tasks from committing or deleting a newer registry entry.
+- Provider/mock configuration is resolved only after the durable user commit and without holding persisted component, commit-barrier, mutation, file, or Provider transaction locks across network waits.
+- Streaming text is task-local. `delta` and compatibility snapshots are explicitly transient; live persisted conversations and `state.v1.json` contain no partial assistant reply.
+- Provider/mock completion stages the final assistant append, persists it, commits live, then emits the committed snapshot and `finished`. Final persistence failure retains only the durable user turn, emits fixed `failed: persistence`, and never emits `finished`.
+- Regenerate keeps the old assistant reply until a final staged transaction atomically replaces it. Provider failure, persistence failure, or a changed/deleted source/target preserves user edits and prevents stale overwrite.
+- Stop uses the discard-partial policy. It cancels stream reads, drops transient text, persists the stopped durable state, and emits exactly one `stopped`; persistence failure emits `failed` instead.
+- Conversation delete commits first, cancels/removes the matching runtime token, and prevents an old finalizer from recreating the conversation. Category A mutations during a stream are retained by the final staged snapshot.
+- Runtime restart intentionally drops active generations and transient assistant text. The durable user turn remains; stream resume and automatic request retry are not implemented.
+- P1-C4 adds 32 synthetic transaction, registry, event-order, regenerate, stop, restart, and loopback-network tests. No real app data, encrypted secret blob, API key, user file, or real provider is used.
+
+P1-C4 does not make state and an in-flight network request atomic, persist every delta, resume streams across restart, retry provider requests, implement backup/restore, or eliminate the documented SecretStore/blob crash-only orphan windows.
 
 ## P0 Persistence Baseline (Before P1-A)
 
@@ -458,7 +478,7 @@ Current conclusion: state and blob consistency risk is high. Mode B/C backup mus
 | Corrupt backup failure still permits reset | Critical | Abort reset if original cannot be preserved. |
 | Future schema treated as corrupt | High | Non-destructive compatibility stop. |
 | Migration has no pre-migration backup | High | Verified backup before any destructive migration save. |
-| Streaming deltas not durably persisted | Medium | Define checkpoint policy and clear interrupted generating state on recovery. |
+| Streaming deltas not durably persisted | Low/accepted | P1-C4 marks deltas transient, persists no placeholder/partial reply, and retains only the durable user turn across restart. |
 | State/blob snapshot mismatch | High | Quiescent snapshot, manifest, checksums, validation, transaction/rollback. |
 | Orphan/missing blobs are not reconciled | Medium | Generate restore report; defer deletion until explicit cleanup approval. |
 | DPAPI blobs assumed portable | High | Exclude by default; mark same-machine mode non-portable and opt-in. |
@@ -785,13 +805,15 @@ The complete call-site inventory, lock order, external-side-effect matrix, compe
 - Message/conversation deletion intentionally does not auto-GC attachments. Reconciliation remains part of the later P6 safety work.
 - Added 22 synthetic file transaction, compensation, delete, reference, concurrency, and safe-error tests; no real app data or user files are read.
 
-### P1-C4: Background Streaming Transaction Safety (Pending)
+### P1-C4: Background Streaming Transaction Safety (Completed)
 
-- Commit initial send/placeholder before network start.
-- Keep provider waits outside transaction locks.
-- Add generation tokens, transient delta semantics, final/failure staged commits, retry visibility, and post-commit SSE ordering.
+- Commits the initial user turn before provider/mock startup and uses no durable assistant placeholder.
+- Keeps provider waits and stream reads outside transaction/component/commit/file/Provider locks.
+- Uses runtime generation tokens, cancellation, transient delta semantics, final/failure staged commits, stale target checks, and post-commit terminal SSE ordering.
+- Defines stop as discard-partial, makes terminal events mutually exclusive, and prevents old tasks from recreating deleted conversations.
+- Adds 32 synthetic tests, including blocked loopback SSE with a concurrent Category A transaction.
 
-Mode A/B backup packaging remains blocked until P1-C4 passes its synthetic safety tests. P1-C1, P1-C2, and P1-C3 are complete.
+The runtime mutation gate through P1-C4 is complete. Mode A/B backup package work may begin, subject to the documented SecretStore/blob process-crash residuals and package-level validation requirements.
 
 ### P2: Portable Metadata/Full Backup Package
 
@@ -880,24 +902,24 @@ Acceptance:
 
 ## Phase 12 Status And Remaining Blockers
 
-Current P1-A/P1-B/P1-C1/P1-C2/P1-C3 status:
+Current P1-A/P1-B/P1-C1/P1-C2/P1-C3/P1-C4 status:
 
 - Atomic replacement state write exists: Yes for the P1-A single-file commit path; no pre-delete remains.
 - Corrupt backup is fail-closed: Yes after P1-B; the primary is retained and no default is written.
 - Direct primary-state removal in ordinary saves exists: No.
 - Persistence save mutex exists: Yes.
-- Persistence errors reach mutation handlers: Yes; background completion logs a safe stage-only error.
+- Persistence errors reach mutation handlers: Yes; background completion emits a fixed safe `failed` terminal and no `finished` success.
 - Pure settings/conversation persistence failure leaves live state unchanged: Yes after P1-C1.
 - Provider/SecretStore handled-failure compensation exists: Yes after P1-C2; process-crash encrypted orphan reconciliation remains pending.
 - Managed file/blob handled-failure compensation exists: Yes after P1-C3; process-crash orphan reconciliation and automatic GC remain pending.
-- All mutation classes have rollback/compensation: No; background streaming remains pending.
+- Streaming handled-failure transaction semantics exist: Yes after P1-C4; initial/final stages are fail-closed and deltas are transient.
 - Silent automatic reset after read/parse/schema failure exists: No.
 - Future schema is fail-closed: Yes; it is not treated as corrupt or migrated.
 - Schema 1-5 pre-migration backup exists: Yes.
 - Automatic non-NotFound reset exists: No.
-- Runtime mutation consistency risk exists: Reduced for Category A, Provider/SecretStore, and managed file/blob operations; still present in P1-C4 streaming scope.
+- Runtime mutation consistency risk exists: Reduced through P1-C4 for Category A, Provider/SecretStore, managed file/blob, and streaming handled-failure paths. State/network are not one atomic transaction and active streams do not resume after restart.
 - State/blob consistency risk exists: Handled failures are compensated/tombstoned after P1-C3, but crash-only orphan windows and restore reconciliation remain.
 - DPAPI secret blobs are portable across machines/users: No.
 - A formal backup/restore package currently exists: No.
 
-Recommended next step: Phase 12 P1-C4 background streaming transaction safety. Mode A/B packaging, managed blob restore, reconciliation, and backup/restore UI remain deferred until P1-C4 establishes the remaining runtime boundary.
+Recommended next step: Mode A/B backup package work. Managed blob restore, reconciliation, and backup/restore UI remain separate later phases, and package design must retain the documented SecretStore/blob crash-only residuals.

@@ -8,7 +8,7 @@ use std::{
     path::{Path as FilePath, PathBuf},
     ptr,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -35,7 +35,7 @@ use serde_json::{json, Map, Value};
 use tokio::{
     fs,
     net::TcpListener,
-    sync::{broadcast, Mutex, RwLock},
+    sync::{broadcast, Mutex, Notify, RwLock},
 };
 use tower_http::cors::{Any, CorsLayer};
 #[cfg(windows)]
@@ -1621,6 +1621,119 @@ struct SsePayload {
     data: Value,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GenerationOperation {
+    Send,
+    Regenerate,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GenerationPhase {
+    Reserved,
+    Running,
+    Finalizing,
+    Stopping,
+}
+
+struct GenerationCancellation {
+    cancelled: AtomicBool,
+    notify: Notify,
+}
+
+impl GenerationCancellation {
+    fn new() -> Self {
+        Self {
+            cancelled: AtomicBool::new(false),
+            notify: Notify::new(),
+        }
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    async fn cancelled(&self) {
+        while !self.is_cancelled() {
+            self.notify.notified().await;
+        }
+    }
+}
+
+#[derive(Clone)]
+struct GenerationHandle {
+    generation_id: u64,
+    cancellation: Arc<GenerationCancellation>,
+}
+
+#[derive(Clone)]
+struct ActiveGeneration {
+    handle: GenerationHandle,
+    operation: GenerationOperation,
+    phase: GenerationPhase,
+}
+
+#[derive(Clone)]
+struct MessageRevision {
+    message_id: String,
+    fingerprint: u64,
+}
+
+#[derive(Clone)]
+enum GenerationCommitTarget {
+    Append {
+        anchor: MessageRevision,
+    },
+    Replace {
+        anchor: MessageRevision,
+        target: MessageRevision,
+    },
+}
+
+#[derive(Clone)]
+struct GenerationCommitPlan {
+    target: GenerationCommitTarget,
+}
+
+struct InitialSendCommit {
+    conversation: ConversationDto,
+    plan: GenerationCommitPlan,
+}
+
+struct RegenerationPreparation {
+    conversation: ConversationDto,
+    request_conversation: ConversationDto,
+    plan: GenerationCommitPlan,
+    last_user_has_non_text_parts: bool,
+}
+
+enum GenerationStreamOutcome {
+    Completed(String),
+    CancelledOrStale,
+}
+
+enum ParsedOpenAiStreamLine {
+    Ignore,
+    Delta(String),
+    Done,
+}
+
+#[derive(Debug)]
+enum BeginGenerationError {
+    Conflict,
+}
+
+enum StopGenerationRequest {
+    Owner(GenerationHandle),
+    AlreadyStopping,
+    Finalizing,
+    NotFound,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ConversationListDto {
@@ -1759,17 +1872,19 @@ struct MockApiState {
     http_client: reqwest::Client,
     provider_secret_transaction_mutex: Mutex<()>,
     file_blob_transaction_mutex: Mutex<()>,
+    generation_transition_mutex: Mutex<()>,
     mutation_transaction_mutex: Mutex<()>,
     commit_barrier: RwLock<()>,
     settings: RwLock<Value>,
     conversations: RwLock<HashMap<String, ConversationDto>>,
     providers: RwLock<Vec<DesktopProviderConfig>>,
     files: RwLock<Vec<ManagedFileMetadata>>,
-    generating_flags: RwLock<HashSet<String>>,
+    active_generations: Mutex<HashMap<String, ActiveGeneration>>,
     conversation_txs: RwLock<HashMap<String, broadcast::Sender<SsePayload>>>,
     settings_tx: broadcast::Sender<SsePayload>,
     list_tx: broadcast::Sender<SsePayload>,
     seq: AtomicU64,
+    generation_seq: AtomicU64,
     secret_seq: AtomicU64,
     id_seq: AtomicU64,
     revision: AtomicU64,
@@ -1796,6 +1911,9 @@ impl MockApiState {
         blob_file_ops: Arc<dyn ManagedBlobFileOps>,
     ) -> Self {
         sync_settings_with_desktop_providers(&mut persisted.settings, &persisted.providers);
+        for conversation in persisted.conversations.values_mut() {
+            conversation.is_generating = false;
+        }
         let initial_id_seq = persisted
             .id_seq
             .max(max_persisted_id_seq(&persisted.conversations))
@@ -1815,17 +1933,19 @@ impl MockApiState {
                 .unwrap_or_else(|_| reqwest::Client::new()),
             provider_secret_transaction_mutex: Mutex::new(()),
             file_blob_transaction_mutex: Mutex::new(()),
+            generation_transition_mutex: Mutex::new(()),
             mutation_transaction_mutex: Mutex::new(()),
             commit_barrier: RwLock::new(()),
             settings: RwLock::new(persisted.settings),
             conversations: RwLock::new(persisted.conversations),
             providers: RwLock::new(persisted.providers),
             files: RwLock::new(persisted.files),
-            generating_flags: RwLock::new(HashSet::new()),
+            active_generations: Mutex::new(HashMap::new()),
             conversation_txs: RwLock::new(HashMap::new()),
             settings_tx,
             list_tx,
             seq: AtomicU64::new(1),
+            generation_seq: AtomicU64::new(1),
             secret_seq: AtomicU64::new(1),
             id_seq: AtomicU64::new(initial_id_seq),
             revision: AtomicU64::new(0),
@@ -1834,11 +1954,6 @@ impl MockApiState {
 
     fn next_seq(&self) -> u64 {
         self.seq.fetch_add(1, Ordering::Relaxed) + 1
-    }
-
-    fn next_id(&self, prefix: &str) -> String {
-        let id = self.id_seq.fetch_add(1, Ordering::Relaxed) + 1;
-        format!("{prefix}-{id}")
     }
 
     fn next_provider_secret_ref(&self, provider_id: &str) -> String {
@@ -2127,17 +2242,10 @@ async fn persisted_snapshot_from_live(state: &MockApiState) -> PersistedMockStat
     }
 }
 
+#[cfg(test)]
 async fn persist_live_state_while_mutation_locked(state: &MockApiState) -> PersistenceResult<()> {
     let persisted = persisted_snapshot_from_live(state).await;
     state.persistence.save(&persisted).await
-}
-
-async fn persist_live_state_for_request_while_mutation_locked(
-    state: &MockApiState,
-) -> Result<(), Response> {
-    persist_live_state_while_mutation_locked(state)
-        .await
-        .map_err(|error| persistence_error_response("request", &error))
 }
 
 #[allow(dead_code)]
@@ -2146,6 +2254,7 @@ enum PureStateMutationScope {
     Settings,
     Conversations,
     SettingsAndConversations,
+    ConversationGeneration,
     ProviderMetadata,
     FileMetadata,
 }
@@ -2220,6 +2329,20 @@ fn validate_pure_state_transaction(
             ));
         }
         validate_file_metadata_transaction(staged)?;
+    } else if matches!(scope, PureStateMutationScope::ConversationGeneration) {
+        if staged.id_seq < before.id_seq {
+            return Err(StateMutationError::Validation(
+                "Generation mutation lowered the ID high-water mark",
+            ));
+        }
+        if staged.settings != before.settings
+            || staged.providers != before.providers
+            || staged.files != before.files
+        {
+            return Err(StateMutationError::Validation(
+                "Generation mutation crossed a protected component boundary",
+            ));
+        }
     } else {
         if staged.id_seq != before.id_seq {
             return Err(StateMutationError::Validation(
@@ -2941,13 +3064,18 @@ async fn conversations_paged(
     let offset = query.offset.unwrap_or(0);
     let limit = query.limit.unwrap_or(30).clamp(1, 100);
     let keyword = query.query.unwrap_or_default().trim().to_lowercase();
+    let active_ids = active_generation_conversation_ids(&state).await;
     let conversations = state.conversations.read().await;
     let mut items: Vec<_> = conversations
         .values()
         .filter(|conversation| {
             keyword.is_empty() || conversation.title.to_lowercase().contains(&keyword)
         })
-        .map(ConversationDto::to_list_item)
+        .map(|conversation| {
+            let mut item = conversation.to_list_item();
+            item.is_generating = active_ids.contains(&conversation.id);
+            item
+        })
         .collect();
 
     items.sort_by(|left, right| {
@@ -3053,132 +3181,100 @@ async fn send_message(
     let now = now_millis();
     let assistant_id = current_assistant_id(&state).await;
     let model_id = current_model_id(&state, &assistant_id).await;
-    let created_at = now_iso();
     let user_text = first_text_part(&payload.parts);
     let user_has_non_text_parts = has_non_text_parts(&payload.parts);
-    let managed_file_ids = managed_file_ids_from_parts(&payload.parts);
     let request_parts = payload.parts.clone();
     let capture_intent = is_capture_local_image_intent(&payload);
-
-    let mutation_guard = state.mutation_transaction_mutex.lock().await;
-    if !managed_file_ids.is_empty() {
-        let files = state.files.read().await;
-        if managed_file_ids.iter().any(|file_id| {
-            !files
-                .iter()
-                .any(|file| file.id == *file_id && file.deleted_at.is_none())
-        }) {
-            return bad_request_response("Attachment is unavailable");
+    let transition_guard = state.generation_transition_mutex.lock().await;
+    let handle = match begin_generation(&state, &id, GenerationOperation::Send).await {
+        Ok(handle) => handle,
+        Err(BeginGenerationError::Conflict) => {
+            return conflict_response("A generation is already active for this conversation")
         }
-    }
-    let updated_after_user_message = {
-        let _commit_guard = state.commit_barrier.write().await;
-        let mut conversations = state.conversations.write().await;
-        let conversation = conversations
-            .entry(id.clone())
-            .or_insert_with(|| empty_conversation(id.clone(), assistant_id.clone(), now));
-
-        if conversation.messages.is_empty() {
-            if let Some(title) = title_from_text(user_text.as_deref()) {
-                conversation.title = title;
-            }
-        }
-
-        conversation.mode_injection_ids = payload.mode_injection_ids;
-        conversation.lorebook_ids = payload.lorebook_ids;
-        conversation.messages.push(MessageNodeDto {
-            id: state.next_id("node"),
-            messages: vec![MessageDto {
-                id: state.next_id("msg"),
-                role: "USER".to_string(),
-                parts: payload.parts,
-                annotations: None,
-                created_at: created_at.clone(),
-                finished_at: Some(created_at.clone()),
-                model_id: None,
-                usage: None,
-                translation: None,
-            }],
-            select_index: 0,
-        });
-
-        conversation.update_at = now_millis();
-        conversation.is_generating = true;
-        conversation.clone()
     };
-
-    if let Err(response) = persist_live_state_for_request_while_mutation_locked(&state).await {
-        return response;
+    let initial = match commit_initial_user_message(
+        &state,
+        id.clone(),
+        assistant_id.clone(),
+        payload.parts,
+        payload.mode_injection_ids,
+        payload.lorebook_ids,
+        now,
+    )
+    .await
+    {
+        Ok(initial) => initial,
+        Err(error) => {
+            remove_generation_if_current(&state, &id, &handle).await;
+            return state_mutation_error_response("send initial message", error);
+        }
+    };
+    if !activate_generation(&state, &id, &handle).await {
+        remove_generation_if_current(&state, &id, &handle).await;
+        return internal_error_response("Generation could not be started");
     }
-    state.revision.fetch_add(1, Ordering::Release);
-    drop(mutation_guard);
-    broadcast_conversation_snapshot(&state, &updated_after_user_message).await;
+    broadcast_conversation_snapshot(&state, &initial.conversation).await;
     broadcast_list_invalidate(&state).await;
+    broadcast_generation_start(&state, &id, &handle).await;
+    drop(transition_guard);
 
     if user_has_non_text_parts {
         if capture_intent {
-            match start_local_image_capture_prototype(
+            match prepare_local_image_capture_prototype(
                 &state,
-                &id,
-                &assistant_id,
                 &model_id,
                 user_text.clone(),
                 &request_parts,
-                now,
             )
             .await
             {
-                Ok(true) => return Json(json!({ "status": "accepted" })).into_response(),
-                Ok(false) => {}
-                Err(LocalImageCaptureStartError::User(error)) => {
-                    if let Err(error) =
-                        append_assistant_reply(&state, &id, &assistant_id, &model_id, error, now)
-                            .await
-                    {
-                        return persistence_error_response("append capture reply", &error);
-                    }
+                Ok(Some((config, messages))) => {
+                    spawn_openai_vision_capture_generation(
+                        state.clone(),
+                        id,
+                        handle,
+                        initial.plan,
+                        model_id,
+                        config,
+                        messages,
+                    );
                     return Json(json!({ "status": "accepted" })).into_response();
                 }
-                Err(LocalImageCaptureStartError::Persistence(error)) => {
-                    return persistence_error_response("start image capture", &error);
+                Ok(None) => {}
+                Err(LocalImageCaptureStartError::User(error)) => {
+                    spawn_local_reply_generation(
+                        state.clone(),
+                        id,
+                        handle,
+                        initial.plan,
+                        model_id,
+                        error,
+                    );
+                    return Json(json!({ "status": "accepted" })).into_response();
+                }
+                Err(LocalImageCaptureStartError::Config) => {
+                    fail_running_generation(&state, &id, &handle, "configuration").await;
+                    return Json(json!({ "status": "accepted" })).into_response();
                 }
             }
         }
 
-        if let Err(error) = append_assistant_reply(
-            &state,
-            &id,
-            &assistant_id,
-            &model_id,
+        spawn_local_reply_generation(
+            state.clone(),
+            id,
+            handle,
+            initial.plan,
+            model_id,
             LOCAL_ATTACHMENT_REPLY_TEXT.to_string(),
-            now,
-        )
-        .await
-        {
-            return persistence_error_response("append attachment reply", &error);
-        }
+        );
         return Json(json!({ "status": "accepted" })).into_response();
     }
 
     let real_chat_config = if user_text.is_some() {
         match resolve_openai_chat_config(&state, &model_id).await {
             Ok(config) => config,
-            Err(error) => {
-                if let Err(persistence_error) = append_assistant_reply(
-                    &state,
-                    &id,
-                    &assistant_id,
-                    &model_id,
-                    format!("Real provider request failed: {error}"),
-                    now,
-                )
-                .await
-                {
-                    return persistence_error_response(
-                        "append provider error reply",
-                        &persistence_error,
-                    );
-                }
+            Err(_) => {
+                fail_running_generation(&state, &id, &handle, "configuration").await;
                 return Json(json!({ "status": "accepted" })).into_response();
             }
         }
@@ -3192,40 +3288,39 @@ async fn send_message(
         } else {
             MOCK_REPLY_TEXT.to_string()
         };
-        if let Err(error) =
-            append_assistant_reply(&state, &id, &assistant_id, &model_id, reply_text, now).await
-        {
-            return persistence_error_response("append mock reply", &error);
-        }
+        spawn_local_reply_generation(
+            state.clone(),
+            id,
+            handle,
+            initial.plan,
+            model_id,
+            reply_text,
+        );
         return Json(json!({ "status": "accepted" })).into_response();
     };
 
-    let messages = openai_messages_from_conversation(&updated_after_user_message);
+    let messages = openai_messages_from_conversation(&initial.conversation);
     if messages.is_empty() {
-        if let Err(error) = append_assistant_reply(
-            &state,
-            &id,
-            &assistant_id,
-            &model_id,
+        spawn_local_reply_generation(
+            state.clone(),
+            id,
+            handle,
+            initial.plan,
+            model_id,
             "Phase 3E currently supports text-only chat.".to_string(),
-            now,
-        )
-        .await
-        {
-            return persistence_error_response("append text-only reply", &error);
-        }
+        );
         return Json(json!({ "status": "accepted" })).into_response();
     }
 
-    let assistant_message_id =
-        match append_empty_streaming_assistant_reply(&state, &id, &assistant_id, &model_id, now)
-            .await
-        {
-            Ok(message_id) => message_id,
-            Err(error) => return persistence_error_response("start streaming reply", &error),
-        };
-    start_generation(&state, &id).await;
-    spawn_openai_stream_generation(state.clone(), id, assistant_message_id, config, messages);
+    spawn_openai_stream_generation(
+        state.clone(),
+        id,
+        handle,
+        initial.plan,
+        model_id,
+        config,
+        messages,
+    );
 
     Json(json!({ "status": "accepted" })).into_response()
 }
@@ -3237,7 +3332,7 @@ fn is_capture_local_image_intent(payload: &SendMessageRequest) -> bool {
 
 enum LocalImageCaptureStartError {
     User(String),
-    Persistence(PersistenceError),
+    Config,
 }
 
 impl From<String> for LocalImageCaptureStartError {
@@ -3246,23 +3341,21 @@ impl From<String> for LocalImageCaptureStartError {
     }
 }
 
-async fn start_local_image_capture_prototype(
+async fn prepare_local_image_capture_prototype(
     state: &Arc<MockApiState>,
-    conversation_id: &str,
-    assistant_id: &str,
     model_id: &str,
     user_text: Option<String>,
     parts: &[Value],
-    now: u64,
-) -> Result<bool, LocalImageCaptureStartError> {
+) -> Result<Option<(OpenAiChatConfig, Vec<OpenAiCompatibleChatMessage>)>, LocalImageCaptureStartError>
+{
     let image_file_ids = provider_bound_image_file_ids(parts)?;
     let Some(file_id) = image_file_ids.first().copied() else {
-        return Ok(false);
+        return Ok(None);
     };
 
     let config = resolve_openai_chat_config(state, model_id)
         .await
-        .map_err(|_| LOCAL_IMAGE_CAPTURE_CONFIG_REQUIRED_TEXT.to_string())?
+        .map_err(|_| LocalImageCaptureStartError::Config)?
         .ok_or_else(|| LOCAL_IMAGE_CAPTURE_CONFIG_REQUIRED_TEXT.to_string())?;
 
     if !is_loopback_provider_base_url(&config.base_url) {
@@ -3282,50 +3375,48 @@ async fn start_local_image_capture_prototype(
 
     let image = managed_file_for_provider_image_input(state, file_id).await?;
     let messages = openai_vision_messages_for_current_turn(user_text, image)?;
-    let assistant_message_id =
-        append_empty_streaming_assistant_reply(state, conversation_id, assistant_id, model_id, now)
-            .await
-            .map_err(LocalImageCaptureStartError::Persistence)?;
-    start_generation(state, conversation_id).await;
-    spawn_openai_vision_capture_generation(
-        state.clone(),
-        conversation_id.to_string(),
-        assistant_message_id,
-        config,
-        messages,
-    );
-
-    Ok(true)
+    Ok(Some((config, messages)))
 }
 
 async fn stop_conversation(
     State(state): State<Arc<MockApiState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    stop_generation(&state, &id).await;
-
-    let mutation_guard = state.mutation_transaction_mutex.lock().await;
-    let maybe_updated = {
-        let _commit_guard = state.commit_barrier.write().await;
-        let mut conversations = state.conversations.write().await;
-        conversations.get_mut(&id).map(|conversation| {
-            conversation.is_generating = false;
-            conversation.update_at = now_millis();
-            conversation.clone()
-        })
+    let transition_guard = state.generation_transition_mutex.lock().await;
+    let handle = match request_generation_stop(&state, &id).await {
+        StopGenerationRequest::Owner(handle) => handle,
+        StopGenerationRequest::AlreadyStopping => {
+            return Json(json!({ "status": "stopping" })).into_response()
+        }
+        StopGenerationRequest::Finalizing => {
+            return conflict_response("Generation is already finalizing")
+        }
+        StopGenerationRequest::NotFound => return not_found_response("No active generation"),
     };
 
-    if let Some(conversation) = maybe_updated {
-        if let Err(response) = persist_live_state_for_request_while_mutation_locked(&state).await {
-            return response;
+    let result = commit_stopped_generation(&state, id.clone()).await;
+    let removed = remove_generation_if_current(&state, &id, &handle).await;
+
+    let updated = match result {
+        Ok(updated) => updated,
+        Err(error) => {
+            if removed {
+                broadcast_current_conversation_snapshot(&state, &id).await;
+                broadcast_list_invalidate(&state).await;
+                broadcast_generation_terminal(&state, &id, &handle, "failed", Some("persistence"))
+                    .await;
+            }
+            drop(transition_guard);
+            return state_mutation_error_response("stop generation", error);
         }
-        state.revision.fetch_add(1, Ordering::Release);
-        drop(mutation_guard);
-        broadcast_conversation_snapshot(&state, &conversation).await;
+    };
+
+    if removed {
+        broadcast_conversation_snapshot(&state, &updated).await;
         broadcast_list_invalidate(&state).await;
-    } else {
-        drop(mutation_guard);
+        broadcast_generation_terminal(&state, &id, &handle, "stopped", None).await;
     }
+    drop(transition_guard);
 
     Json(json!({ "status": "stopped" })).into_response()
 }
@@ -3396,6 +3487,7 @@ async fn delete_conversation(
     State(state): State<Arc<MockApiState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    let transition_guard = state.generation_transition_mutex.lock().await;
     if let Err(error) = transact_persisted_state(&state, PureStateMutationScope::Conversations, {
         let id = id.clone();
         move |staged| {
@@ -3411,8 +3503,13 @@ async fn delete_conversation(
         return state_mutation_error_response("delete conversation", error);
     }
 
-    stop_generation(&state, &id).await;
+    let cancelled = take_generation_after_conversation_delete(&state, &id).await;
+    if let Some(handle) = cancelled {
+        broadcast_generation_terminal(&state, &id, &handle, "failed", Some("conversation-deleted"))
+            .await;
+    }
     state.conversation_txs.write().await.remove(&id);
+    drop(transition_guard);
     broadcast_list_invalidate(&state).await;
 
     Json(json!({ "status": "deleted" })).into_response()
@@ -3514,156 +3611,86 @@ async fn regenerate_message(
     Path(id): Path<String>,
     Json(payload): Json<RegenerateRequest>,
 ) -> impl IntoResponse {
-    let now = now_millis();
     let assistant_id = current_assistant_id(&state).await;
     let model_id = current_model_id(&state, &assistant_id).await;
-
-    let mutation_guard = state.mutation_transaction_mutex.lock().await;
-    let (prepared, last_user_has_non_text_parts) = {
-        let _commit_guard = state.commit_barrier.write().await;
-        let mut conversations = state.conversations.write().await;
-        let Some(conversation) = conversations.get_mut(&id) else {
-            return not_found_response("Conversation not found");
-        };
-
-        let Some(target_index) =
-            find_regeneratable_node_index(conversation, payload.message_id.as_deref())
-        else {
-            return bad_request_response(
-                "Phase 6A currently supports regenerating only the latest text turn.",
-            );
-        };
-
-        let Some(target_message) = selected_message(&conversation.messages[target_index]) else {
-            return bad_request_response(
-                "Phase 6A currently supports regenerating only the latest text turn.",
-            );
-        };
-
-        match target_message.role.as_str() {
-            "ASSISTANT" => {
-                conversation.messages.truncate(target_index);
-            }
-            "USER" => {
-                conversation.messages.truncate(target_index + 1);
-            }
-            _ => {
-                return bad_request_response(
-                    "Only user and assistant text messages can be regenerated.",
-                );
-            }
+    let transition_guard = state.generation_transition_mutex.lock().await;
+    let handle = match begin_generation(&state, &id, GenerationOperation::Regenerate).await {
+        Ok(handle) => handle,
+        Err(BeginGenerationError::Conflict) => {
+            return conflict_response("A generation is already active for this conversation")
         }
-
-        let Some(last_user_message) = conversation
-            .messages
-            .iter()
-            .rev()
-            .filter_map(selected_message)
-            .find(|message| message.role == "USER")
-        else {
-            return bad_request_response("No user text message is available to regenerate from.");
-        };
-
-        let last_user_has_non_text_parts = has_non_text_parts(&last_user_message.parts);
-        if !last_user_has_non_text_parts && text_from_parts(&last_user_message.parts).is_none() {
-            return bad_request_response(
-                "Phase 6A currently supports regenerating text-only chat.",
-            );
-        }
-
-        conversation.update_at = now_millis();
-        conversation.is_generating = true;
-        (conversation.clone(), last_user_has_non_text_parts)
     };
-
-    if let Err(response) = persist_live_state_for_request_while_mutation_locked(&state).await {
-        return response;
+    let prepared =
+        match prepare_regeneration_transaction(&state, id.clone(), payload.message_id).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                remove_generation_if_current(&state, &id, &handle).await;
+                return state_mutation_error_response("prepare regeneration", error);
+            }
+        };
+    if !activate_generation(&state, &id, &handle).await {
+        remove_generation_if_current(&state, &id, &handle).await;
+        return internal_error_response("Generation could not be started");
     }
-    state.revision.fetch_add(1, Ordering::Release);
-    drop(mutation_guard);
-    broadcast_conversation_snapshot(&state, &prepared).await;
+    broadcast_conversation_snapshot(&state, &prepared.conversation).await;
     broadcast_list_invalidate(&state).await;
+    broadcast_generation_start(&state, &id, &handle).await;
+    drop(transition_guard);
 
-    if last_user_has_non_text_parts {
-        if let Err(error) = append_assistant_reply(
-            &state,
-            &id,
-            &assistant_id,
-            &model_id,
+    if prepared.last_user_has_non_text_parts {
+        spawn_local_reply_generation(
+            state.clone(),
+            id,
+            handle,
+            prepared.plan,
+            model_id,
             LOCAL_ATTACHMENT_REPLY_TEXT.to_string(),
-            now,
-        )
-        .await
-        {
-            return persistence_error_response("append attachment reply", &error);
-        }
+        );
         return Json(json!({ "status": "accepted" })).into_response();
     }
 
     let real_chat_config = match resolve_openai_chat_config(&state, &model_id).await {
         Ok(config) => config,
-        Err(error) => {
-            if let Err(persistence_error) = append_assistant_reply(
-                &state,
-                &id,
-                &assistant_id,
-                &model_id,
-                format!("Real provider request failed: {error}"),
-                now,
-            )
-            .await
-            {
-                return persistence_error_response(
-                    "append provider error reply",
-                    &persistence_error,
-                );
-            }
+        Err(_) => {
+            fail_running_generation(&state, &id, &handle, "configuration").await;
             return Json(json!({ "status": "accepted" })).into_response();
         }
     };
 
     let Some(config) = real_chat_config else {
-        if let Err(error) = append_assistant_reply(
-            &state,
-            &id,
-            &assistant_id,
-            &model_id,
+        spawn_local_reply_generation(
+            state.clone(),
+            id,
+            handle,
+            prepared.plan,
+            model_id,
             MOCK_REPLY_TEXT.to_string(),
-            now,
-        )
-        .await
-        {
-            return persistence_error_response("append mock reply", &error);
-        }
+        );
         return Json(json!({ "status": "accepted" })).into_response();
     };
 
-    let messages = openai_messages_from_conversation(&prepared);
+    let messages = openai_messages_from_conversation(&prepared.request_conversation);
     if messages.is_empty() {
-        if let Err(error) = append_assistant_reply(
-            &state,
-            &id,
-            &assistant_id,
-            &model_id,
+        spawn_local_reply_generation(
+            state.clone(),
+            id,
+            handle,
+            prepared.plan,
+            model_id,
             "Phase 6A currently supports regenerating text-only chat.".to_string(),
-            now,
-        )
-        .await
-        {
-            return persistence_error_response("append text-only reply", &error);
-        }
+        );
         return Json(json!({ "status": "accepted" })).into_response();
     }
 
-    let assistant_message_id =
-        match append_empty_streaming_assistant_reply(&state, &id, &assistant_id, &model_id, now)
-            .await
-        {
-            Ok(message_id) => message_id,
-            Err(error) => return persistence_error_response("start streaming reply", &error),
-        };
-    start_generation(&state, &id).await;
-    spawn_openai_stream_generation(state.clone(), id, assistant_message_id, config, messages);
+    spawn_openai_stream_generation(
+        state.clone(),
+        id,
+        handle,
+        prepared.plan,
+        model_id,
+        config,
+        messages,
+    );
 
     Json(json!({ "status": "accepted" })).into_response()
 }
@@ -4705,189 +4732,708 @@ fn field_is_too_long(value: &str, max_chars: usize) -> bool {
     value.chars().count() > max_chars
 }
 
-async fn append_assistant_reply(
+async fn begin_generation(
     state: &Arc<MockApiState>,
     conversation_id: &str,
-    assistant_id: &str,
-    model_id: &str,
-    reply_text: String,
-    now: u64,
-) -> PersistenceResult<()> {
-    let mutation_guard = state.mutation_transaction_mutex.lock().await;
-    let updated = {
-        let _commit_guard = state.commit_barrier.write().await;
-        let mut conversations = state.conversations.write().await;
-        let conversation = conversations
-            .entry(conversation_id.to_string())
-            .or_insert_with(|| {
-                empty_conversation(conversation_id.to_string(), assistant_id.to_string(), now)
-            });
-
-        let reply_time = now_iso();
-        conversation.messages.push(MessageNodeDto {
-            id: state.next_id("node"),
-            messages: vec![MessageDto {
-                id: state.next_id("msg"),
-                role: "ASSISTANT".to_string(),
-                parts: vec![json!({
-                    "type": "text",
-                    "text": reply_text,
-                })],
-                annotations: None,
-                created_at: reply_time.clone(),
-                finished_at: Some(reply_time),
-                model_id: Some(model_id.to_string()),
-                usage: None,
-                translation: None,
-            }],
-            select_index: 0,
-        });
-
-        conversation.update_at = now_millis();
-        conversation.is_generating = false;
-        conversation.clone()
-    };
-
-    persist_live_state_while_mutation_locked(state).await?;
-    state.revision.fetch_add(1, Ordering::Release);
-    drop(mutation_guard);
-    broadcast_conversation_snapshot(state, &updated).await;
-    broadcast_list_invalidate(state).await;
-    Ok(())
-}
-
-async fn append_empty_streaming_assistant_reply(
-    state: &Arc<MockApiState>,
-    conversation_id: &str,
-    assistant_id: &str,
-    model_id: &str,
-    now: u64,
-) -> PersistenceResult<String> {
-    let message_id = state.next_id("msg");
-    let mutation_guard = state.mutation_transaction_mutex.lock().await;
-    let updated = {
-        let _commit_guard = state.commit_barrier.write().await;
-        let mut conversations = state.conversations.write().await;
-        let conversation = conversations
-            .entry(conversation_id.to_string())
-            .or_insert_with(|| {
-                empty_conversation(conversation_id.to_string(), assistant_id.to_string(), now)
-            });
-
-        let reply_time = now_iso();
-        conversation.messages.push(MessageNodeDto {
-            id: state.next_id("node"),
-            messages: vec![MessageDto {
-                id: message_id.clone(),
-                role: "ASSISTANT".to_string(),
-                parts: vec![json!({
-                    "type": "text",
-                    "text": "",
-                })],
-                annotations: None,
-                created_at: reply_time,
-                finished_at: None,
-                model_id: Some(model_id.to_string()),
-                usage: None,
-                translation: None,
-            }],
-            select_index: 0,
-        });
-
-        conversation.update_at = now_millis();
-        conversation.is_generating = true;
-        conversation.clone()
-    };
-
-    persist_live_state_while_mutation_locked(state).await?;
-    state.revision.fetch_add(1, Ordering::Release);
-    drop(mutation_guard);
-    broadcast_conversation_snapshot(state, &updated).await;
-    broadcast_list_invalidate(state).await;
-    Ok(message_id)
-}
-
-async fn append_text_to_assistant_message(
-    state: &Arc<MockApiState>,
-    conversation_id: &str,
-    assistant_message_id: &str,
-    text: &str,
-) {
-    if text.is_empty() {
-        return;
+    operation: GenerationOperation,
+) -> Result<GenerationHandle, BeginGenerationError> {
+    let mut generations = state.active_generations.lock().await;
+    if generations.contains_key(conversation_id) {
+        return Err(BeginGenerationError::Conflict);
     }
 
-    let mutation_guard = state.mutation_transaction_mutex.lock().await;
-    let updated = {
-        let _commit_guard = state.commit_barrier.write().await;
-        let mut conversations = state.conversations.write().await;
-        let Some(conversation) = conversations.get_mut(conversation_id) else {
-            return;
-        };
-        let Some(message) = find_message_mut(conversation, assistant_message_id) else {
-            return;
-        };
-
-        append_text_part(&mut message.parts, text);
-        conversation.update_at = now_millis();
-        conversation.clone()
+    let generation_id = state.generation_seq.fetch_add(1, Ordering::Relaxed) + 1;
+    let handle = GenerationHandle {
+        generation_id,
+        cancellation: Arc::new(GenerationCancellation::new()),
     };
-
-    drop(mutation_guard);
-    broadcast_conversation_snapshot(state, &updated).await;
+    generations.insert(
+        conversation_id.to_string(),
+        ActiveGeneration {
+            handle: handle.clone(),
+            operation,
+            phase: GenerationPhase::Reserved,
+        },
+    );
+    Ok(handle)
 }
 
-async fn finish_streaming_assistant_reply(
+async fn activate_generation(
     state: &Arc<MockApiState>,
     conversation_id: &str,
-    assistant_message_id: &str,
-) -> PersistenceResult<()> {
-    stop_generation(state, conversation_id).await;
+    handle: &GenerationHandle,
+) -> bool {
+    let mut generations = state.active_generations.lock().await;
+    let Some(active) = generations.get_mut(conversation_id) else {
+        return false;
+    };
+    if active.handle.generation_id != handle.generation_id
+        || active.phase != GenerationPhase::Reserved
+    {
+        return false;
+    }
+    active.phase = GenerationPhase::Running;
+    true
+}
 
-    let mutation_guard = state.mutation_transaction_mutex.lock().await;
-    let updated = {
-        let _commit_guard = state.commit_barrier.write().await;
-        let mut conversations = state.conversations.write().await;
-        let Some(conversation) = conversations.get_mut(conversation_id) else {
-            return Ok(());
-        };
-        if let Some(message) = find_message_mut(conversation, assistant_message_id) {
-            if text_from_parts(&message.parts).is_none() {
-                append_text_part(&mut message.parts, "Generation stopped.");
-            }
-            message.finished_at = Some(now_iso());
+async fn is_generation_running(
+    state: &Arc<MockApiState>,
+    conversation_id: &str,
+    handle: &GenerationHandle,
+) -> bool {
+    if handle.cancellation.is_cancelled() {
+        return false;
+    }
+    state
+        .active_generations
+        .lock()
+        .await
+        .get(conversation_id)
+        .is_some_and(|active| {
+            active.handle.generation_id == handle.generation_id
+                && active.phase == GenerationPhase::Running
+        })
+}
+
+async fn has_active_generation(state: &Arc<MockApiState>, conversation_id: &str) -> bool {
+    state
+        .active_generations
+        .lock()
+        .await
+        .contains_key(conversation_id)
+}
+
+async fn active_generation_conversation_ids(state: &Arc<MockApiState>) -> HashSet<String> {
+    state
+        .active_generations
+        .lock()
+        .await
+        .keys()
+        .cloned()
+        .collect()
+}
+
+async fn claim_generation_for_finalization(
+    state: &Arc<MockApiState>,
+    conversation_id: &str,
+    handle: &GenerationHandle,
+) -> bool {
+    let mut generations = state.active_generations.lock().await;
+    let Some(active) = generations.get_mut(conversation_id) else {
+        return false;
+    };
+    if active.handle.generation_id != handle.generation_id
+        || active.phase != GenerationPhase::Running
+        || handle.cancellation.is_cancelled()
+    {
+        return false;
+    }
+    active.phase = GenerationPhase::Finalizing;
+    true
+}
+
+async fn remove_generation_if_current(
+    state: &Arc<MockApiState>,
+    conversation_id: &str,
+    handle: &GenerationHandle,
+) -> bool {
+    let mut generations = state.active_generations.lock().await;
+    let is_current = generations
+        .get(conversation_id)
+        .is_some_and(|active| active.handle.generation_id == handle.generation_id);
+    if is_current {
+        generations.remove(conversation_id);
+    }
+    is_current
+}
+
+async fn remove_running_generation_if_current(
+    state: &Arc<MockApiState>,
+    conversation_id: &str,
+    handle: &GenerationHandle,
+) -> bool {
+    let mut generations = state.active_generations.lock().await;
+    let removable = generations.get(conversation_id).is_some_and(|active| {
+        active.handle.generation_id == handle.generation_id
+            && matches!(
+                active.phase,
+                GenerationPhase::Reserved | GenerationPhase::Running
+            )
+    });
+    if removable {
+        generations.remove(conversation_id);
+    }
+    removable
+}
+
+async fn request_generation_stop(
+    state: &Arc<MockApiState>,
+    conversation_id: &str,
+) -> StopGenerationRequest {
+    let mut generations = state.active_generations.lock().await;
+    let Some(active) = generations.get_mut(conversation_id) else {
+        return StopGenerationRequest::NotFound;
+    };
+    match active.phase {
+        GenerationPhase::Reserved | GenerationPhase::Running => {
+            active.phase = GenerationPhase::Stopping;
+            active.handle.cancellation.cancel();
+            StopGenerationRequest::Owner(active.handle.clone())
         }
-        conversation.update_at = now_millis();
-        conversation.is_generating = false;
-        conversation.clone()
+        GenerationPhase::Stopping => StopGenerationRequest::AlreadyStopping,
+        GenerationPhase::Finalizing => StopGenerationRequest::Finalizing,
+    }
+}
+
+async fn take_generation_after_conversation_delete(
+    state: &Arc<MockApiState>,
+    conversation_id: &str,
+) -> Option<GenerationHandle> {
+    let active = state
+        .active_generations
+        .lock()
+        .await
+        .remove(conversation_id)?;
+    active.handle.cancellation.cancel();
+    Some(active.handle)
+}
+
+fn message_revision(message: &MessageDto) -> MessageRevision {
+    MessageRevision {
+        message_id: message.id.clone(),
+        fingerprint: message_fingerprint(message),
+    }
+}
+
+fn message_fingerprint(message: &MessageDto) -> u64 {
+    let bytes = serde_json::to_vec(message).unwrap_or_default();
+    bytes
+        .into_iter()
+        .fold(0xcbf29ce484222325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+        })
+}
+
+fn message_matches_revision(message: &MessageDto, revision: &MessageRevision) -> bool {
+    message.id == revision.message_id && message_fingerprint(message) == revision.fingerprint
+}
+
+async fn commit_initial_user_message(
+    state: &Arc<MockApiState>,
+    conversation_id: String,
+    assistant_id: String,
+    parts: Vec<Value>,
+    mode_injection_ids: Option<Vec<String>>,
+    lorebook_ids: Option<Vec<String>>,
+    now: u64,
+) -> Result<InitialSendCommit, StateMutationError> {
+    let managed_file_ids = managed_file_ids_from_parts(&parts);
+    let user_text = first_text_part(&parts);
+    let created_at = now_iso();
+    transact_persisted_state(
+        state,
+        PureStateMutationScope::ConversationGeneration,
+        move |staged| {
+            if managed_file_ids.iter().any(|file_id| {
+                !staged
+                    .files
+                    .iter()
+                    .any(|file| file.id == *file_id && file.deleted_at.is_none())
+            }) {
+                return Err(StateMutationError::BadRequest("Attachment is unavailable"));
+            }
+
+            let node_id = next_staged_id(staged, "node");
+            let message_id = next_staged_id(staged, "msg");
+            let conversation = staged
+                .conversations
+                .entry(conversation_id.clone())
+                .or_insert_with(|| {
+                    empty_conversation(conversation_id.clone(), assistant_id.clone(), now)
+                });
+
+            if conversation.messages.is_empty() {
+                if let Some(title) = title_from_text(user_text.as_deref()) {
+                    conversation.title = title;
+                }
+            }
+            conversation.mode_injection_ids = mode_injection_ids;
+            conversation.lorebook_ids = lorebook_ids;
+            let message = MessageDto {
+                id: message_id,
+                role: "USER".to_string(),
+                parts,
+                annotations: None,
+                created_at: created_at.clone(),
+                finished_at: Some(created_at.clone()),
+                model_id: None,
+                usage: None,
+                translation: None,
+            };
+            let anchor = message_revision(&message);
+            conversation.messages.push(MessageNodeDto {
+                id: node_id,
+                messages: vec![message],
+                select_index: 0,
+            });
+            conversation.update_at = now_millis();
+            conversation.is_generating = false;
+
+            Ok(InitialSendCommit {
+                conversation: conversation.clone(),
+                plan: GenerationCommitPlan {
+                    target: GenerationCommitTarget::Append { anchor },
+                },
+            })
+        },
+    )
+    .await
+}
+
+async fn prepare_regeneration_transaction(
+    state: &Arc<MockApiState>,
+    conversation_id: String,
+    requested_message_id: Option<String>,
+) -> Result<RegenerationPreparation, StateMutationError> {
+    transact_persisted_state(
+        state,
+        PureStateMutationScope::ConversationGeneration,
+        move |staged| {
+            let Some(conversation) = staged.conversations.get(&conversation_id) else {
+                return Err(StateMutationError::NotFound("Conversation not found"));
+            };
+            build_regeneration_preparation(conversation, requested_message_id.as_deref())
+        },
+    )
+    .await
+}
+
+fn build_regeneration_preparation(
+    conversation: &ConversationDto,
+    requested_message_id: Option<&str>,
+) -> Result<RegenerationPreparation, StateMutationError> {
+    let Some(target_index) = find_regeneratable_node_index(conversation, requested_message_id)
+    else {
+        return Err(StateMutationError::BadRequest(
+            "Phase 6A currently supports regenerating only the latest text turn.",
+        ));
+    };
+    let Some(target_message) = selected_message(&conversation.messages[target_index]) else {
+        return Err(StateMutationError::BadRequest(
+            "Phase 6A currently supports regenerating only the latest text turn.",
+        ));
     };
 
-    persist_live_state_while_mutation_locked(state).await?;
-    state.revision.fetch_add(1, Ordering::Release);
-    drop(mutation_guard);
-    broadcast_conversation_snapshot(state, &updated).await;
-    broadcast_list_invalidate(state).await;
-    Ok(())
+    let (anchor, replacement, request_end) = match target_message.role.as_str() {
+        "ASSISTANT" => {
+            let Some(anchor) = conversation.messages[..target_index]
+                .iter()
+                .rev()
+                .filter_map(selected_message)
+                .find(|message| message.role == "USER")
+            else {
+                return Err(StateMutationError::BadRequest(
+                    "No user text message is available to regenerate from.",
+                ));
+            };
+            (
+                message_revision(anchor),
+                Some(message_revision(target_message)),
+                target_index,
+            )
+        }
+        "USER" => {
+            let replacement = conversation
+                .messages
+                .get(target_index + 1)
+                .and_then(selected_message)
+                .filter(|message| message.role == "ASSISTANT")
+                .map(message_revision);
+            (
+                message_revision(target_message),
+                replacement,
+                target_index + 1,
+            )
+        }
+        _ => {
+            return Err(StateMutationError::BadRequest(
+                "Only user and assistant text messages can be regenerated.",
+            ));
+        }
+    };
+
+    let Some(anchor_message) = find_message(conversation, &anchor.message_id) else {
+        return Err(StateMutationError::BadRequest(
+            "No user text message is available to regenerate from.",
+        ));
+    };
+    let last_user_has_non_text_parts = has_non_text_parts(&anchor_message.parts);
+    if !last_user_has_non_text_parts && text_from_parts(&anchor_message.parts).is_none() {
+        return Err(StateMutationError::BadRequest(
+            "Phase 6A currently supports regenerating text-only chat.",
+        ));
+    }
+
+    let mut request_conversation = conversation.clone();
+    request_conversation.messages.truncate(request_end);
+    request_conversation.is_generating = false;
+    let target = replacement.map_or_else(
+        || GenerationCommitTarget::Append {
+            anchor: anchor.clone(),
+        },
+        |target| GenerationCommitTarget::Replace {
+            anchor: anchor.clone(),
+            target,
+        },
+    );
+
+    Ok(RegenerationPreparation {
+        conversation: conversation.clone(),
+        request_conversation,
+        plan: GenerationCommitPlan { target },
+        last_user_has_non_text_parts,
+    })
 }
 
-async fn start_generation(state: &Arc<MockApiState>, conversation_id: &str) {
-    state
-        .generating_flags
-        .write()
+async fn commit_final_assistant_message(
+    state: &Arc<MockApiState>,
+    conversation_id: String,
+    plan: GenerationCommitPlan,
+    model_id: String,
+    reply_text: String,
+) -> Result<ConversationDto, StateMutationError> {
+    transact_persisted_state(
+        state,
+        PureStateMutationScope::ConversationGeneration,
+        move |staged| {
+            let Some(conversation) = staged.conversations.get(&conversation_id) else {
+                return Err(StateMutationError::NotFound("Conversation not found"));
+            };
+            let (anchor, target) = match &plan.target {
+                GenerationCommitTarget::Append { anchor } => (anchor, None),
+                GenerationCommitTarget::Replace { anchor, target } => (anchor, Some(target)),
+            };
+            let Some(anchor_message) = find_message(conversation, &anchor.message_id) else {
+                return Err(StateMutationError::Conflict(
+                    "Generation source message changed",
+                ));
+            };
+            if !message_matches_revision(anchor_message, anchor) {
+                return Err(StateMutationError::Conflict(
+                    "Generation source message changed",
+                ));
+            }
+            if let Some(target) = target {
+                let Some(target_message) = find_message(conversation, &target.message_id) else {
+                    return Err(StateMutationError::Conflict("Regeneration target changed"));
+                };
+                if !message_matches_revision(target_message, target) {
+                    return Err(StateMutationError::Conflict("Regeneration target changed"));
+                }
+            }
+
+            let append_ids =
+                matches!(plan.target, GenerationCommitTarget::Append { .. }).then(|| {
+                    (
+                        next_staged_id(staged, "node"),
+                        next_staged_id(staged, "msg"),
+                    )
+                });
+            let reply_time = now_iso();
+            let conversation = staged
+                .conversations
+                .get_mut(&conversation_id)
+                .ok_or(StateMutationError::NotFound("Conversation not found"))?;
+
+            match &plan.target {
+                GenerationCommitTarget::Append { .. } => {
+                    let Some((node_id, message_id)) = append_ids else {
+                        return Err(StateMutationError::Validation(
+                            "Generation append IDs are unavailable",
+                        ));
+                    };
+                    conversation.messages.push(MessageNodeDto {
+                        id: node_id,
+                        messages: vec![MessageDto {
+                            id: message_id,
+                            role: "ASSISTANT".to_string(),
+                            parts: vec![json!({ "type": "text", "text": reply_text })],
+                            annotations: None,
+                            created_at: reply_time.clone(),
+                            finished_at: Some(reply_time.clone()),
+                            model_id: Some(model_id),
+                            usage: None,
+                            translation: None,
+                        }],
+                        select_index: 0,
+                    });
+                }
+                GenerationCommitTarget::Replace { target, .. } => {
+                    let Some(message) = find_message_mut(conversation, &target.message_id) else {
+                        return Err(StateMutationError::Conflict("Regeneration target changed"));
+                    };
+                    message.role = "ASSISTANT".to_string();
+                    message.parts = vec![json!({ "type": "text", "text": reply_text })];
+                    message.annotations = None;
+                    message.created_at = reply_time.clone();
+                    message.finished_at = Some(reply_time.clone());
+                    message.model_id = Some(model_id);
+                    message.usage = None;
+                    message.translation = None;
+                }
+            }
+
+            conversation.update_at = now_millis();
+            conversation.is_generating = false;
+            Ok(conversation.clone())
+        },
+    )
+    .await
+}
+
+async fn commit_stopped_generation(
+    state: &Arc<MockApiState>,
+    conversation_id: String,
+) -> Result<ConversationDto, StateMutationError> {
+    transact_persisted_state(
+        state,
+        PureStateMutationScope::Conversations,
+        move |staged| {
+            let Some(conversation) = staged.conversations.get_mut(&conversation_id) else {
+                return Err(StateMutationError::NotFound("Conversation not found"));
+            };
+            conversation.is_generating = false;
+            conversation.update_at = now_millis();
+            Ok(conversation.clone())
+        },
+    )
+    .await
+}
+
+async fn finalize_generation_with_text(
+    state: &Arc<MockApiState>,
+    conversation_id: &str,
+    handle: &GenerationHandle,
+    plan: GenerationCommitPlan,
+    model_id: String,
+    reply_text: String,
+) -> Result<bool, StateMutationError> {
+    let transition_guard = state.generation_transition_mutex.lock().await;
+    if !claim_generation_for_finalization(state, conversation_id, handle).await {
+        return Ok(false);
+    }
+    let result = commit_final_assistant_message(
+        state,
+        conversation_id.to_string(),
+        plan,
+        model_id,
+        reply_text,
+    )
+    .await;
+    let removed = remove_generation_if_current(state, conversation_id, handle).await;
+
+    match result {
+        Ok(updated) => {
+            if removed {
+                broadcast_conversation_snapshot(state, &updated).await;
+                broadcast_list_invalidate(state).await;
+                broadcast_generation_terminal(state, conversation_id, handle, "finished", None)
+                    .await;
+            }
+            drop(transition_guard);
+            Ok(removed)
+        }
+        Err(error) => {
+            if removed {
+                broadcast_current_conversation_snapshot(state, conversation_id).await;
+                broadcast_list_invalidate(state).await;
+                let reason = if matches!(error, StateMutationError::Persistence(_)) {
+                    "persistence"
+                } else {
+                    "stale"
+                };
+                broadcast_generation_terminal(
+                    state,
+                    conversation_id,
+                    handle,
+                    "failed",
+                    Some(reason),
+                )
+                .await;
+            }
+            drop(transition_guard);
+            Err(error)
+        }
+    }
+}
+
+async fn fail_running_generation(
+    state: &Arc<MockApiState>,
+    conversation_id: &str,
+    handle: &GenerationHandle,
+    reason: &'static str,
+) -> bool {
+    let transition_guard = state.generation_transition_mutex.lock().await;
+    let removed = remove_running_generation_if_current(state, conversation_id, handle).await;
+    if removed {
+        broadcast_current_conversation_snapshot(state, conversation_id).await;
+        broadcast_list_invalidate(state).await;
+        broadcast_generation_terminal(state, conversation_id, handle, "failed", Some(reason)).await;
+    }
+    drop(transition_guard);
+    removed
+}
+
+async fn broadcast_generation_start(
+    state: &Arc<MockApiState>,
+    conversation_id: &str,
+    handle: &GenerationHandle,
+) {
+    let operation = state
+        .active_generations
+        .lock()
         .await
-        .insert(conversation_id.to_string());
+        .get(conversation_id)
+        .filter(|active| active.handle.generation_id == handle.generation_id)
+        .map(|active| match active.operation {
+            GenerationOperation::Send => "send",
+            GenerationOperation::Regenerate => "regenerate",
+        })
+        .unwrap_or("generation");
+    let sender = conversation_sender(state, conversation_id).await;
+    let _ = sender.send(SsePayload {
+        event: "generation-start".to_string(),
+        data: json!({
+            "type": "generation-start",
+            "generationId": handle.generation_id,
+            "operation": operation,
+        }),
+    });
 }
 
-async fn stop_generation(state: &Arc<MockApiState>, conversation_id: &str) {
-    state.generating_flags.write().await.remove(conversation_id);
+async fn broadcast_generation_delta(
+    state: &Arc<MockApiState>,
+    conversation_id: &str,
+    handle: &GenerationHandle,
+    plan: &GenerationCommitPlan,
+    model_id: &str,
+    delta: &str,
+    accumulated: &str,
+) {
+    let sender = conversation_sender(state, conversation_id).await;
+    let _ = sender.send(SsePayload {
+        event: "delta".to_string(),
+        data: json!({
+            "type": "delta",
+            "generationId": handle.generation_id,
+            "text": delta,
+            "transient": true,
+        }),
+    });
+    broadcast_transient_generation_snapshot(
+        state,
+        conversation_id,
+        handle,
+        plan,
+        model_id,
+        accumulated,
+    )
+    .await;
 }
 
-async fn is_generation_active(state: &Arc<MockApiState>, conversation_id: &str) -> bool {
-    state
-        .generating_flags
-        .read()
-        .await
-        .contains(conversation_id)
+async fn broadcast_generation_terminal(
+    state: &Arc<MockApiState>,
+    conversation_id: &str,
+    handle: &GenerationHandle,
+    terminal: &'static str,
+    reason: Option<&'static str>,
+) {
+    let sender = conversation_sender(state, conversation_id).await;
+    let mut data = json!({
+        "type": terminal,
+        "generationId": handle.generation_id,
+    });
+    if let Some(reason) = reason {
+        data["reason"] = json!(reason);
+    }
+    let _ = sender.send(SsePayload {
+        event: terminal.to_string(),
+        data,
+    });
+}
+
+async fn broadcast_current_conversation_snapshot(state: &Arc<MockApiState>, conversation_id: &str) {
+    let conversation = {
+        let _commit_guard = state.commit_barrier.read().await;
+        state
+            .conversations
+            .read()
+            .await
+            .get(conversation_id)
+            .cloned()
+    };
+    if let Some(conversation) = conversation {
+        broadcast_conversation_snapshot(state, &conversation).await;
+    }
+}
+
+async fn broadcast_transient_generation_snapshot(
+    state: &Arc<MockApiState>,
+    conversation_id: &str,
+    handle: &GenerationHandle,
+    plan: &GenerationCommitPlan,
+    model_id: &str,
+    accumulated: &str,
+) {
+    let mut conversation = {
+        let _commit_guard = state.commit_barrier.read().await;
+        state
+            .conversations
+            .read()
+            .await
+            .get(conversation_id)
+            .cloned()
+    };
+    let Some(ref mut conversation) = conversation else {
+        return;
+    };
+    conversation.is_generating = true;
+    let runtime_time = now_iso();
+    match &plan.target {
+        GenerationCommitTarget::Append { .. } => {
+            conversation.messages.push(MessageNodeDto {
+                id: format!("runtime-node-{}", handle.generation_id),
+                messages: vec![MessageDto {
+                    id: format!("runtime-message-{}", handle.generation_id),
+                    role: "ASSISTANT".to_string(),
+                    parts: vec![json!({ "type": "text", "text": accumulated })],
+                    annotations: None,
+                    created_at: runtime_time,
+                    finished_at: None,
+                    model_id: Some(model_id.to_string()),
+                    usage: None,
+                    translation: None,
+                }],
+                select_index: 0,
+            });
+        }
+        GenerationCommitTarget::Replace { target, .. } => {
+            let Some(message) = find_message_mut(conversation, &target.message_id) else {
+                return;
+            };
+            message.parts = vec![json!({ "type": "text", "text": accumulated })];
+            message.finished_at = None;
+            message.model_id = Some(model_id.to_string());
+        }
+    }
+    let sender = conversation_sender(state, conversation_id).await;
+    let mut data = conversation_snapshot_payload(state, conversation);
+    data["transient"] = json!(true);
+    data["generationId"] = json!(handle.generation_id);
+    let _ = sender.send(SsePayload {
+        event: "snapshot".to_string(),
+        data,
+    });
 }
 
 async fn resolve_openai_chat_config(
@@ -5256,38 +5802,63 @@ async fn test_openai_compatible_chat_connection(
     Ok(())
 }
 
+fn spawn_local_reply_generation(
+    state: Arc<MockApiState>,
+    conversation_id: String,
+    handle: GenerationHandle,
+    plan: GenerationCommitPlan,
+    model_id: String,
+    reply_text: String,
+) {
+    tokio::spawn(async move {
+        let _ = finalize_generation_with_text(
+            &state,
+            &conversation_id,
+            &handle,
+            plan,
+            model_id,
+            reply_text,
+        )
+        .await;
+    });
+}
+
 fn spawn_openai_stream_generation(
     state: Arc<MockApiState>,
     conversation_id: String,
-    assistant_message_id: String,
+    handle: GenerationHandle,
+    plan: GenerationCommitPlan,
+    model_id: String,
     config: OpenAiChatConfig,
     messages: Vec<OpenAiChatMessage>,
 ) {
     tokio::spawn(async move {
-        let stream_result = stream_openai_compatible_chat(
+        match stream_openai_compatible_chat(
             &state,
             &conversation_id,
-            &assistant_message_id,
+            &handle,
+            &plan,
+            &model_id,
             &config,
             messages,
         )
-        .await;
-
-        if let Err(error) = stream_result {
-            let error_text = format!("Real provider request failed: {error}");
-            append_text_to_assistant_message(
-                &state,
-                &conversation_id,
-                &assistant_message_id,
-                &error_text,
-            )
-            .await;
-        }
-
-        if let Err(error) =
-            finish_streaming_assistant_reply(&state, &conversation_id, &assistant_message_id).await
+        .await
         {
-            log_persistence_error("finish text stream", &error);
+            Ok(GenerationStreamOutcome::Completed(reply_text)) if !reply_text.is_empty() => {
+                let _ = finalize_generation_with_text(
+                    &state,
+                    &conversation_id,
+                    &handle,
+                    plan,
+                    model_id,
+                    reply_text,
+                )
+                .await;
+            }
+            Ok(GenerationStreamOutcome::Completed(_)) | Err(_) => {
+                fail_running_generation(&state, &conversation_id, &handle, "provider").await;
+            }
+            Ok(GenerationStreamOutcome::CancelledOrStale) => {}
         }
     });
 }
@@ -5295,34 +5866,39 @@ fn spawn_openai_stream_generation(
 fn spawn_openai_vision_capture_generation(
     state: Arc<MockApiState>,
     conversation_id: String,
-    assistant_message_id: String,
+    handle: GenerationHandle,
+    plan: GenerationCommitPlan,
+    model_id: String,
     config: OpenAiChatConfig,
     messages: Vec<OpenAiCompatibleChatMessage>,
 ) {
     tokio::spawn(async move {
-        let stream_result = stream_openai_compatible_vision_capture(
+        match stream_openai_compatible_vision_capture(
             &state,
             &conversation_id,
-            &assistant_message_id,
+            &handle,
+            &plan,
+            &model_id,
             &config,
             messages,
         )
-        .await;
-
-        if let Err(error) = stream_result {
-            append_text_to_assistant_message(
-                &state,
-                &conversation_id,
-                &assistant_message_id,
-                &error,
-            )
-            .await;
-        }
-
-        if let Err(error) =
-            finish_streaming_assistant_reply(&state, &conversation_id, &assistant_message_id).await
+        .await
         {
-            log_persistence_error("finish image capture stream", &error);
+            Ok(GenerationStreamOutcome::Completed(reply_text)) if !reply_text.is_empty() => {
+                let _ = finalize_generation_with_text(
+                    &state,
+                    &conversation_id,
+                    &handle,
+                    plan,
+                    model_id,
+                    reply_text,
+                )
+                .await;
+            }
+            Ok(GenerationStreamOutcome::Completed(_)) | Err(_) => {
+                fail_running_generation(&state, &conversation_id, &handle, "provider").await;
+            }
+            Ok(GenerationStreamOutcome::CancelledOrStale) => {}
         }
     });
 }
@@ -5330,10 +5906,15 @@ fn spawn_openai_vision_capture_generation(
 async fn stream_openai_compatible_chat(
     state: &Arc<MockApiState>,
     conversation_id: &str,
-    assistant_message_id: &str,
+    handle: &GenerationHandle,
+    plan: &GenerationCommitPlan,
+    model_id: &str,
     config: &OpenAiChatConfig,
     messages: Vec<OpenAiChatMessage>,
-) -> Result<(), String> {
+) -> Result<GenerationStreamOutcome, String> {
+    if !is_generation_running(state, conversation_id, handle).await {
+        return Ok(GenerationStreamOutcome::CancelledOrStale);
+    }
     let body =
         build_openai_chat_request_body(config, messages, true, OpenAiRequestKind::StreamingChat)?;
 
@@ -5341,51 +5922,87 @@ async fn stream_openai_compatible_chat(
         .http_client
         .post(openai_chat_completions_url(&config.base_url));
     let request = apply_openai_custom_headers(request, &config.custom_headers)?;
-    let mut response = request
-        .bearer_auth(&config.api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(safe_reqwest_error)?;
+    let request = request.bearer_auth(&config.api_key).json(&body);
+    let mut response = tokio::select! {
+        result = request.send() => result.map_err(safe_reqwest_error)?,
+        _ = handle.cancellation.cancelled() => {
+            return Ok(GenerationStreamOutcome::CancelledOrStale);
+        }
+    };
 
     let status = response.status();
     if !status.is_success() {
-        return Err(format!(
-            "{} {}",
-            status.as_u16(),
-            status.canonical_reason().unwrap_or("HTTP error")
-        ));
+        return Err(safe_http_status_error(status));
     }
 
     let mut buffer = String::new();
-    while let Some(chunk) = response.chunk().await.map_err(safe_reqwest_error)? {
-        if !is_generation_active(state, conversation_id).await {
-            return Ok(());
+    let mut buffered_reply = String::new();
+    loop {
+        if !is_generation_running(state, conversation_id, handle).await {
+            return Ok(GenerationStreamOutcome::CancelledOrStale);
         }
-
+        let chunk = tokio::select! {
+            result = response.chunk() => result.map_err(safe_reqwest_error)?,
+            _ = handle.cancellation.cancelled() => {
+                return Ok(GenerationStreamOutcome::CancelledOrStale);
+            }
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
         buffer.push_str(&String::from_utf8_lossy(&chunk));
         while let Some(line_end) = buffer.find('\n') {
             let line = buffer[..line_end].trim_end_matches('\r').to_string();
             buffer.drain(..=line_end);
-            if handle_openai_stream_line(state, conversation_id, assistant_message_id, &line)
-                .await?
-            {
-                return Ok(());
-            }
-            if !is_generation_active(state, conversation_id).await {
-                return Ok(());
+            match parse_openai_stream_line(&line)? {
+                ParsedOpenAiStreamLine::Ignore => {}
+                ParsedOpenAiStreamLine::Done => {
+                    return Ok(GenerationStreamOutcome::Completed(buffered_reply));
+                }
+                ParsedOpenAiStreamLine::Delta(delta) => {
+                    if !is_generation_running(state, conversation_id, handle).await {
+                        return Ok(GenerationStreamOutcome::CancelledOrStale);
+                    }
+                    buffered_reply.push_str(&delta);
+                    broadcast_generation_delta(
+                        state,
+                        conversation_id,
+                        handle,
+                        plan,
+                        model_id,
+                        &delta,
+                        &buffered_reply,
+                    )
+                    .await;
+                }
             }
         }
     }
 
-    if !buffer.trim().is_empty()
-        && handle_openai_stream_line(state, conversation_id, assistant_message_id, &buffer).await?
-    {
-        return Ok(());
+    if !buffer.trim().is_empty() {
+        match parse_openai_stream_line(&buffer)? {
+            ParsedOpenAiStreamLine::Ignore => {}
+            ParsedOpenAiStreamLine::Done => {
+                return Ok(GenerationStreamOutcome::Completed(buffered_reply));
+            }
+            ParsedOpenAiStreamLine::Delta(delta) => {
+                buffered_reply.push_str(&delta);
+                broadcast_generation_delta(
+                    state,
+                    conversation_id,
+                    handle,
+                    plan,
+                    model_id,
+                    &delta,
+                    &buffered_reply,
+                )
+                .await;
+            }
+        }
     }
 
-    if !is_generation_active(state, conversation_id).await {
-        Ok(())
+    if !is_generation_running(state, conversation_id, handle).await {
+        Ok(GenerationStreamOutcome::CancelledOrStale)
     } else {
         Err("stream ended before DONE".to_string())
     }
@@ -5394,10 +6011,15 @@ async fn stream_openai_compatible_chat(
 async fn stream_openai_compatible_vision_capture(
     state: &Arc<MockApiState>,
     conversation_id: &str,
-    assistant_message_id: &str,
+    handle: &GenerationHandle,
+    plan: &GenerationCommitPlan,
+    model_id: &str,
     config: &OpenAiChatConfig,
     messages: Vec<OpenAiCompatibleChatMessage>,
-) -> Result<(), String> {
+) -> Result<GenerationStreamOutcome, String> {
+    if !is_generation_running(state, conversation_id, handle).await {
+        return Ok(GenerationStreamOutcome::CancelledOrStale);
+    }
     let body = build_openai_vision_chat_request_body(
         config,
         messages,
@@ -5409,12 +6031,13 @@ async fn stream_openai_compatible_vision_capture(
         .http_client
         .post(openai_chat_completions_url(&config.base_url));
     let request = apply_openai_custom_headers(request, &config.custom_headers)?;
-    let mut response = request
-        .bearer_auth(&config.api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(safe_reqwest_error)?;
+    let request = request.bearer_auth(&config.api_key).json(&body);
+    let mut response = tokio::select! {
+        result = request.send() => result.map_err(safe_reqwest_error)?,
+        _ = handle.cancellation.cancelled() => {
+            return Ok(GenerationStreamOutcome::CancelledOrStale);
+        }
+    };
 
     let status = response.status();
     if !status.is_success() {
@@ -5422,73 +6045,106 @@ async fn stream_openai_compatible_vision_capture(
     }
 
     let mut buffer = String::new();
-    while let Some(chunk) = response.chunk().await.map_err(safe_reqwest_error)? {
-        if !is_generation_active(state, conversation_id).await {
-            return Ok(());
+    let mut buffered_reply = String::new();
+    loop {
+        if !is_generation_running(state, conversation_id, handle).await {
+            return Ok(GenerationStreamOutcome::CancelledOrStale);
         }
-
+        let chunk = tokio::select! {
+            result = response.chunk() => result.map_err(safe_reqwest_error)?,
+            _ = handle.cancellation.cancelled() => {
+                return Ok(GenerationStreamOutcome::CancelledOrStale);
+            }
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
         buffer.push_str(&String::from_utf8_lossy(&chunk));
         while let Some(line_end) = buffer.find('\n') {
             let line = buffer[..line_end].trim_end_matches('\r').to_string();
             buffer.drain(..=line_end);
-            if handle_openai_stream_line(state, conversation_id, assistant_message_id, &line)
-                .await?
-            {
-                return Ok(());
-            }
-            if !is_generation_active(state, conversation_id).await {
-                return Ok(());
+            match parse_openai_stream_line(&line)? {
+                ParsedOpenAiStreamLine::Ignore => {}
+                ParsedOpenAiStreamLine::Done => {
+                    return Ok(GenerationStreamOutcome::Completed(buffered_reply));
+                }
+                ParsedOpenAiStreamLine::Delta(delta) => {
+                    if !is_generation_running(state, conversation_id, handle).await {
+                        return Ok(GenerationStreamOutcome::CancelledOrStale);
+                    }
+                    buffered_reply.push_str(&delta);
+                    broadcast_generation_delta(
+                        state,
+                        conversation_id,
+                        handle,
+                        plan,
+                        model_id,
+                        &delta,
+                        &buffered_reply,
+                    )
+                    .await;
+                }
             }
         }
     }
 
-    if !buffer.trim().is_empty()
-        && handle_openai_stream_line(state, conversation_id, assistant_message_id, &buffer).await?
-    {
-        return Ok(());
+    if !buffer.trim().is_empty() {
+        match parse_openai_stream_line(&buffer)? {
+            ParsedOpenAiStreamLine::Ignore => {}
+            ParsedOpenAiStreamLine::Done => {
+                return Ok(GenerationStreamOutcome::Completed(buffered_reply));
+            }
+            ParsedOpenAiStreamLine::Delta(delta) => {
+                buffered_reply.push_str(&delta);
+                broadcast_generation_delta(
+                    state,
+                    conversation_id,
+                    handle,
+                    plan,
+                    model_id,
+                    &delta,
+                    &buffered_reply,
+                )
+                .await;
+            }
+        }
     }
 
-    if !is_generation_active(state, conversation_id).await {
-        Ok(())
+    if !is_generation_running(state, conversation_id, handle).await {
+        Ok(GenerationStreamOutcome::CancelledOrStale)
     } else {
         Err("stream ended before DONE".to_string())
     }
 }
 
-async fn handle_openai_stream_line(
-    state: &Arc<MockApiState>,
-    conversation_id: &str,
-    assistant_message_id: &str,
-    line: &str,
-) -> Result<bool, String> {
+fn parse_openai_stream_line(line: &str) -> Result<ParsedOpenAiStreamLine, String> {
     let line = line.trim();
     if line.is_empty() || line.starts_with(':') {
-        return Ok(false);
+        return Ok(ParsedOpenAiStreamLine::Ignore);
     }
 
     let Some(data) = line.strip_prefix("data:") else {
-        return Ok(false);
+        return Ok(ParsedOpenAiStreamLine::Ignore);
     };
     let data = data.trim();
     if data == "[DONE]" {
-        return Ok(true);
+        return Ok(ParsedOpenAiStreamLine::Done);
     }
 
     let chunk = serde_json::from_str::<OpenAiChatStreamResponse>(data)
         .map_err(|_| "stream returned invalid JSON".to_string())?;
+    let mut delta = String::new();
     for choice in chunk.choices {
         if let Some(content) = choice.delta.content {
-            append_text_to_assistant_message(
-                state,
-                conversation_id,
-                assistant_message_id,
-                &content,
-            )
-            .await;
+            delta.push_str(&content);
         }
     }
 
-    Ok(false)
+    if delta.is_empty() {
+        Ok(ParsedOpenAiStreamLine::Ignore)
+    } else {
+        Ok(ParsedOpenAiStreamLine::Delta(delta))
+    }
 }
 
 fn openai_chat_completions_url(base_url: &str) -> String {
@@ -6136,18 +6792,26 @@ fn internal_error_response(message: impl Into<String>) -> Response {
 }
 
 async fn conversation_or_virtual_for_read(state: &Arc<MockApiState>, id: &str) -> ConversationDto {
-    let _commit_guard = state.commit_barrier.read().await;
-    let assistant_id = state
-        .settings
-        .read()
-        .await
-        .get("assistantId")
-        .and_then(Value::as_str)
-        .unwrap_or(MOCK_ASSISTANT_ID)
-        .to_string();
-    let conversation = state.conversations.read().await.get(id).cloned();
-
-    conversation.unwrap_or_else(|| empty_conversation(id.to_string(), assistant_id, now_millis()))
+    let mut conversation = {
+        let _commit_guard = state.commit_barrier.read().await;
+        let assistant_id = state
+            .settings
+            .read()
+            .await
+            .get("assistantId")
+            .and_then(Value::as_str)
+            .unwrap_or(MOCK_ASSISTANT_ID)
+            .to_string();
+        state
+            .conversations
+            .read()
+            .await
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| empty_conversation(id.to_string(), assistant_id, now_millis()))
+    };
+    conversation.is_generating = has_active_generation(state, id).await;
+    conversation
 }
 
 async fn conversation_sender(state: &Arc<MockApiState>, id: &str) -> broadcast::Sender<SsePayload> {
@@ -6185,8 +6849,10 @@ async fn broadcast_conversation_snapshot(
     state: &Arc<MockApiState>,
     conversation: &ConversationDto,
 ) {
+    let mut conversation = conversation.clone();
+    conversation.is_generating = has_active_generation(state, &conversation.id).await;
     let sender = conversation_sender(state, &conversation.id).await;
-    let data = conversation_snapshot_payload(state, conversation);
+    let data = conversation_snapshot_payload(state, &conversation);
     let _ = sender.send(SsePayload {
         event: "snapshot".to_string(),
         data,
@@ -7030,6 +7696,14 @@ fn find_message_mut<'a>(
     None
 }
 
+fn find_message<'a>(conversation: &'a ConversationDto, message_id: &str) -> Option<&'a MessageDto> {
+    conversation
+        .messages
+        .iter()
+        .flat_map(|node| node.messages.iter())
+        .find(|message| message.id == message_id)
+}
+
 fn selected_message(node: &MessageNodeDto) -> Option<&MessageDto> {
     node.messages
         .get(node.select_index)
@@ -7061,25 +7735,6 @@ fn find_regeneratable_node_index(
     }
 
     None
-}
-
-fn append_text_part(parts: &mut Vec<Value>, text: &str) {
-    if let Some(part) = parts
-        .iter_mut()
-        .find(|part| part.get("type").and_then(Value::as_str) == Some("text"))
-    {
-        let existing = part
-            .get("text")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        part["text"] = json!(format!("{existing}{text}"));
-    } else {
-        parts.push(json!({
-            "type": "text",
-            "text": text,
-        }));
-    }
 }
 
 fn title_from_text(text: Option<&str>) -> Option<String> {
@@ -7242,6 +7897,61 @@ mod tests {
         fn replace(&self, replacement: &FilePath, target: &FilePath) -> io::Result<()> {
             if self.stage == TestFailureStage::Replace {
                 return Err(self.failure());
+            }
+            RealStateFileOps.replace(replacement, target)
+        }
+
+        fn remove_file(&self, path: &FilePath) -> io::Result<()> {
+            RealStateFileOps.remove_file(path)
+        }
+    }
+
+    struct FailOnReplaceCallStateFileOps {
+        fail_on: u64,
+        replace_calls: AtomicU64,
+    }
+
+    impl FailOnReplaceCallStateFileOps {
+        fn new(fail_on: u64) -> Self {
+            Self {
+                fail_on,
+                replace_calls: AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl StateFileOps for FailOnReplaceCallStateFileOps {
+        fn read(&self, path: &FilePath) -> io::Result<Vec<u8>> {
+            RealStateFileOps.read(path)
+        }
+
+        fn create_dir_all(&self, path: &FilePath) -> io::Result<()> {
+            RealStateFileOps.create_dir_all(path)
+        }
+
+        fn create_temp(&self, path: &FilePath) -> io::Result<std_fs::File> {
+            RealStateFileOps.create_temp(path)
+        }
+
+        fn write_all(&self, file: &mut std_fs::File, data: &[u8]) -> io::Result<()> {
+            RealStateFileOps.write_all(file, data)
+        }
+
+        fn flush(&self, file: &mut std_fs::File) -> io::Result<()> {
+            RealStateFileOps.flush(file)
+        }
+
+        fn sync_all(&self, file: &std_fs::File) -> io::Result<()> {
+            RealStateFileOps.sync_all(file)
+        }
+
+        fn replace(&self, replacement: &FilePath, target: &FilePath) -> io::Result<()> {
+            let call = self.replace_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call == self.fail_on {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "synthetic nth persistence failure",
+                ));
             }
             RealStateFileOps.replace(replacement, target)
         }
@@ -7645,6 +8355,26 @@ mod tests {
         ))
     }
 
+    async fn transaction_test_state_failing_on_replace(
+        temp: &SyntheticTempDir,
+        persisted: PersistedMockState,
+        fail_on: u64,
+    ) -> Arc<MockApiState> {
+        test_persistence(temp)
+            .save(&persisted)
+            .await
+            .expect("synthetic initial state should save");
+        let persistence = MockPersistence::new_with_file_ops(
+            temp.path.clone(),
+            Arc::new(FailOnReplaceCallStateFileOps::new(fail_on)),
+        );
+        Arc::new(MockApiState::new(
+            persistence,
+            Arc::new(TestSecretStore),
+            persisted,
+        ))
+    }
+
     async fn live_conversation(state: &MockApiState, id: &str) -> ConversationDto {
         state
             .conversations
@@ -7657,6 +8387,174 @@ mod tests {
 
     fn disk_conversation(temp: &SyntheticTempDir, id: &str) -> Value {
         read_test_state(&test_persistence(temp))["conversations"][id].clone()
+    }
+
+    async fn append_synthetic_assistant_transaction(
+        state: &Arc<MockApiState>,
+        conversation_id: &str,
+        text: &str,
+    ) -> Result<(), StateMutationError> {
+        let conversation_id = conversation_id.to_string();
+        let text = text.to_string();
+        transact_persisted_state(
+            state,
+            PureStateMutationScope::ConversationGeneration,
+            move |staged| {
+                let node_id = next_staged_id(staged, "node");
+                let message_id = next_staged_id(staged, "msg");
+                let timestamp = now_iso();
+                let conversation = staged
+                    .conversations
+                    .get_mut(&conversation_id)
+                    .ok_or(StateMutationError::NotFound("Conversation not found"))?;
+                conversation.messages.push(MessageNodeDto {
+                    id: node_id,
+                    messages: vec![MessageDto {
+                        id: message_id,
+                        role: "ASSISTANT".to_string(),
+                        parts: vec![json!({ "type": "text", "text": text })],
+                        annotations: None,
+                        created_at: timestamp.clone(),
+                        finished_at: Some(timestamp),
+                        model_id: Some(MOCK_MODEL_ID.to_string()),
+                        usage: None,
+                        translation: None,
+                    }],
+                    select_index: 0,
+                });
+                conversation.update_at = now_millis();
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    fn synthetic_text_parts(text: &str) -> Vec<Value> {
+        vec![json!({ "type": "text", "text": text })]
+    }
+
+    fn synthetic_text_conversation(
+        conversation_id: &str,
+        user_text: &str,
+        assistant_text: &str,
+    ) -> ConversationDto {
+        let timestamp = "2026-01-01T00:00:00Z".to_string();
+        ConversationDto {
+            id: conversation_id.to_string(),
+            assistant_id: MOCK_ASSISTANT_ID.to_string(),
+            title: "Synthetic transaction chat".to_string(),
+            messages: vec![
+                MessageNodeDto {
+                    id: format!("{conversation_id}-user-node"),
+                    messages: vec![MessageDto {
+                        id: format!("{conversation_id}-user-message"),
+                        role: "USER".to_string(),
+                        parts: synthetic_text_parts(user_text),
+                        annotations: None,
+                        created_at: timestamp.clone(),
+                        finished_at: Some(timestamp.clone()),
+                        model_id: None,
+                        usage: None,
+                        translation: None,
+                    }],
+                    select_index: 0,
+                },
+                MessageNodeDto {
+                    id: format!("{conversation_id}-assistant-node"),
+                    messages: vec![MessageDto {
+                        id: format!("{conversation_id}-assistant-message"),
+                        role: "ASSISTANT".to_string(),
+                        parts: synthetic_text_parts(assistant_text),
+                        annotations: None,
+                        created_at: timestamp.clone(),
+                        finished_at: Some(timestamp),
+                        model_id: Some(MOCK_MODEL_ID.to_string()),
+                        usage: None,
+                        translation: None,
+                    }],
+                    select_index: 0,
+                },
+            ],
+            truncate_index: -1,
+            chat_suggestions: Vec::new(),
+            is_pinned: false,
+            custom_system_prompt: None,
+            mode_injection_ids: Some(Vec::new()),
+            lorebook_ids: Some(Vec::new()),
+            create_at: 1,
+            update_at: 1,
+            is_generating: false,
+        }
+    }
+
+    async fn start_synthetic_generation(
+        state: &Arc<MockApiState>,
+        conversation_id: &str,
+        operation: GenerationOperation,
+    ) -> (GenerationHandle, GenerationCommitPlan) {
+        let transition_guard = state.generation_transition_mutex.lock().await;
+        let handle = match begin_generation(state, conversation_id, operation).await {
+            Ok(handle) => handle,
+            Err(BeginGenerationError::Conflict) => panic!("synthetic generation should reserve"),
+        };
+        let plan = match operation {
+            GenerationOperation::Send => {
+                commit_initial_user_message(
+                    state,
+                    conversation_id.to_string(),
+                    MOCK_ASSISTANT_ID.to_string(),
+                    synthetic_text_parts("synthetic user turn"),
+                    None,
+                    None,
+                    10,
+                )
+                .await
+                .expect("synthetic initial user should persist")
+                .plan
+            }
+            GenerationOperation::Regenerate => {
+                prepare_regeneration_transaction(state, conversation_id.to_string(), None)
+                    .await
+                    .expect("synthetic regeneration should prepare")
+                    .plan
+            }
+        };
+        assert!(activate_generation(state, conversation_id, &handle).await);
+        broadcast_current_conversation_snapshot(state, conversation_id).await;
+        broadcast_generation_start(state, conversation_id, &handle).await;
+        drop(transition_guard);
+        (handle, plan)
+    }
+
+    async fn subscribe_generation_events(
+        state: &Arc<MockApiState>,
+        conversation_id: &str,
+    ) -> broadcast::Receiver<SsePayload> {
+        conversation_sender(state, conversation_id)
+            .await
+            .subscribe()
+    }
+
+    fn drain_event_names(receiver: &mut broadcast::Receiver<SsePayload>) -> Vec<String> {
+        let mut events = Vec::new();
+        loop {
+            match receiver.try_recv() {
+                Ok(payload) => events.push(payload.event),
+                Err(broadcast::error::TryRecvError::Empty)
+                | Err(broadcast::error::TryRecvError::Closed) => break,
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+            }
+        }
+        events
+    }
+
+    fn selected_texts(conversation: &ConversationDto) -> Vec<String> {
+        conversation
+            .messages
+            .iter()
+            .filter_map(selected_message)
+            .filter_map(|message| text_from_parts(&message.parts))
+            .collect()
     }
 
     fn synthetic_desktop_provider() -> DesktopProviderConfig {
@@ -9142,13 +10040,10 @@ mod tests {
         let legacy_start = start.clone();
         let legacy = tokio::spawn(async move {
             legacy_start.wait().await;
-            append_assistant_reply(
+            append_synthetic_assistant_transaction(
                 &legacy_state,
                 MOCK_WELCOME_CONVERSATION_ID,
-                MOCK_ASSISTANT_ID,
-                MOCK_MODEL_ID,
-                "synthetic background reply".to_string(),
-                now_millis(),
+                "synthetic background reply",
             )
             .await
         });
@@ -9214,13 +10109,10 @@ mod tests {
             });
             let legacy_state = state.clone();
             let legacy = tokio::spawn(async move {
-                append_assistant_reply(
+                append_synthetic_assistant_transaction(
                     &legacy_state,
                     MOCK_WELCOME_CONVERSATION_ID,
-                    MOCK_ASSISTANT_ID,
-                    MOCK_MODEL_ID,
-                    "synthetic no-deadlock reply".to_string(),
-                    now_millis(),
+                    "synthetic no-deadlock reply",
                 )
                 .await
             });
@@ -10878,5 +11770,1002 @@ mod tests {
         assert_eq!(base64_encode_for_data_url(b"fo"), "Zm8=");
         assert_eq!(base64_encode_for_data_url(b"foo"), "Zm9v");
         assert_eq!(base64_encode_for_data_url(b"hello"), "aGVsbG8=");
+    }
+
+    #[tokio::test]
+    async fn streaming_transaction_initial_send_success() {
+        let temp = SyntheticTempDir::new("stream-initial-success");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let initial = commit_initial_user_message(
+            &state,
+            "stream-initial-success".to_string(),
+            MOCK_ASSISTANT_ID.to_string(),
+            synthetic_text_parts("synthetic initial turn"),
+            None,
+            None,
+            10,
+        )
+        .await
+        .expect("initial user message should persist");
+
+        assert_eq!(initial.conversation.messages.len(), 1);
+        assert_eq!(
+            live_conversation(&state, "stream-initial-success")
+                .await
+                .messages
+                .len(),
+            1
+        );
+        assert_eq!(
+            disk_conversation(&temp, "stream-initial-success")["messages"]
+                .as_array()
+                .expect("disk messages should be an array")
+                .len(),
+            1
+        );
+        assert_eq!(state.revision.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn streaming_transaction_initial_persistence_failure_has_no_start() {
+        let temp = SyntheticTempDir::new("stream-initial-failure");
+        let state = transaction_test_state(
+            &temp,
+            default_persisted_state(),
+            Some(TestFailureStage::Replace),
+        )
+        .await;
+        let id = "stream-initial-failure".to_string();
+        let mut events = subscribe_generation_events(&state, &id).await;
+        let response = send_message(
+            State(state.clone()),
+            Path(id.clone()),
+            Json(SendMessageRequest {
+                parts: synthetic_text_parts("synthetic rejected turn"),
+                mode_injection_ids: None,
+                lorebook_ids: None,
+                image_input_confirmed: None,
+                image_input_mode: None,
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!state.conversations.read().await.contains_key(&id));
+        assert!(!has_active_generation(&state, &id).await);
+        assert!(drain_event_names(&mut events).is_empty());
+        assert_eq!(state.revision.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn streaming_transaction_virtual_first_post_is_single_durable_commit() {
+        let temp = SyntheticTempDir::new("stream-virtual-first");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let id = "stream-virtual-first";
+        assert!(!state.conversations.read().await.contains_key(id));
+
+        let initial = commit_initial_user_message(
+            &state,
+            id.to_string(),
+            MOCK_ASSISTANT_ID.to_string(),
+            synthetic_text_parts("synthetic virtual first turn"),
+            None,
+            None,
+            10,
+        )
+        .await
+        .expect("virtual conversation should become durable");
+
+        let message = selected_message(&initial.conversation.messages[0])
+            .expect("initial message should exist");
+        assert!(message.id.starts_with("msg-"));
+        assert_eq!(initial.conversation.messages.len(), 1);
+        assert!(!disk_conversation(&temp, id).is_null());
+        assert_eq!(state.revision.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn streaming_transaction_deltas_are_transient() {
+        let temp = SyntheticTempDir::new("stream-transient-delta");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let id = "stream-transient-delta";
+        let mut events = subscribe_generation_events(&state, id).await;
+        let (handle, plan) =
+            start_synthetic_generation(&state, id, GenerationOperation::Send).await;
+
+        broadcast_generation_delta(
+            &state,
+            id,
+            &handle,
+            &plan,
+            MOCK_MODEL_ID,
+            "synthetic delta",
+            "synthetic delta",
+        )
+        .await;
+
+        assert_eq!(live_conversation(&state, id).await.messages.len(), 1);
+        assert_eq!(
+            disk_conversation(&temp, id)["messages"]
+                .as_array()
+                .expect("disk messages should be an array")
+                .len(),
+            1
+        );
+        let names = drain_event_names(&mut events);
+        assert!(names.iter().any(|event| event == "delta"));
+        assert!(names.iter().filter(|event| *event == "snapshot").count() >= 2);
+    }
+
+    #[tokio::test]
+    async fn streaming_transaction_final_commit_success() {
+        let temp = SyntheticTempDir::new("stream-final-success");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let id = "stream-final-success";
+        let (handle, plan) =
+            start_synthetic_generation(&state, id, GenerationOperation::Send).await;
+
+        assert!(finalize_generation_with_text(
+            &state,
+            id,
+            &handle,
+            plan,
+            MOCK_MODEL_ID.to_string(),
+            "synthetic final reply".to_string(),
+        )
+        .await
+        .expect("final assistant should persist"));
+
+        let live = live_conversation(&state, id).await;
+        assert_eq!(
+            selected_texts(&live).last(),
+            Some(&"synthetic final reply".to_string())
+        );
+        assert_eq!(
+            disk_conversation(&temp, id)["messages"]
+                .as_array()
+                .expect("disk messages should be an array")
+                .len(),
+            2
+        );
+        assert!(!has_active_generation(&state, id).await);
+    }
+
+    #[tokio::test]
+    async fn streaming_transaction_final_persistence_failure_preserves_user_only() {
+        let temp = SyntheticTempDir::new("stream-final-failure");
+        let state =
+            transaction_test_state_failing_on_replace(&temp, default_persisted_state(), 2).await;
+        let id = "stream-final-failure";
+        let mut events = subscribe_generation_events(&state, id).await;
+        let (handle, plan) =
+            start_synthetic_generation(&state, id, GenerationOperation::Send).await;
+        let revision_after_user = state.revision.load(Ordering::Acquire);
+
+        let result = finalize_generation_with_text(
+            &state,
+            id,
+            &handle,
+            plan,
+            MOCK_MODEL_ID.to_string(),
+            "synthetic rejected final".to_string(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(StateMutationError::Persistence(_))));
+        assert_eq!(live_conversation(&state, id).await.messages.len(), 1);
+        assert_eq!(
+            disk_conversation(&temp, id)["messages"]
+                .as_array()
+                .expect("disk messages should be an array")
+                .len(),
+            1
+        );
+        assert_eq!(state.revision.load(Ordering::Acquire), revision_after_user);
+        let names = drain_event_names(&mut events);
+        assert!(names.iter().any(|event| event == "failed"));
+        assert!(!names.iter().any(|event| event == "finished"));
+    }
+
+    #[tokio::test]
+    async fn streaming_transaction_final_commit_without_sse_subscriber() {
+        let temp = SyntheticTempDir::new("stream-no-subscriber");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let id = "stream-no-subscriber";
+        let (handle, plan) =
+            start_synthetic_generation(&state, id, GenerationOperation::Send).await;
+
+        assert!(finalize_generation_with_text(
+            &state,
+            id,
+            &handle,
+            plan,
+            MOCK_MODEL_ID.to_string(),
+            "synthetic durable without subscriber".to_string(),
+        )
+        .await
+        .expect("SSE absence must not block persistence"));
+        assert_eq!(live_conversation(&state, id).await.messages.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn streaming_transaction_mock_final_persistence_failure_is_safe() {
+        let temp = SyntheticTempDir::new("stream-mock-final-failure");
+        let state =
+            transaction_test_state_failing_on_replace(&temp, default_persisted_state(), 2).await;
+        let id = "stream-mock-final-failure";
+        let mut events = subscribe_generation_events(&state, id).await;
+        let (handle, plan) =
+            start_synthetic_generation(&state, id, GenerationOperation::Send).await;
+
+        let result = finalize_generation_with_text(
+            &state,
+            id,
+            &handle,
+            plan,
+            MOCK_MODEL_ID.to_string(),
+            MOCK_REPLY_TEXT.to_string(),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(live_conversation(&state, id).await.messages.len(), 1);
+        let names = drain_event_names(&mut events);
+        assert_eq!(names.iter().filter(|event| *event == "failed").count(), 1);
+        assert_eq!(names.iter().filter(|event| *event == "finished").count(), 0);
+    }
+
+    #[tokio::test]
+    async fn generation_registry_configuration_failure_cleans_up() {
+        let temp = SyntheticTempDir::new("generation-config-failure");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let id = "generation-config-failure";
+        let (handle, _) = start_synthetic_generation(&state, id, GenerationOperation::Send).await;
+
+        assert!(fail_running_generation(&state, id, &handle, "configuration").await);
+        assert!(!has_active_generation(&state, id).await);
+        assert_eq!(live_conversation(&state, id).await.messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn generation_registry_provider_failure_cleans_up() {
+        let temp = SyntheticTempDir::new("generation-provider-failure");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let id = "generation-provider-failure";
+        let (handle, _) = start_synthetic_generation(&state, id, GenerationOperation::Send).await;
+
+        assert!(fail_running_generation(&state, id, &handle, "provider").await);
+        assert!(!has_active_generation(&state, id).await);
+        assert_eq!(
+            disk_conversation(&temp, id)["messages"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_transaction_malformed_stream_is_safe_failure() {
+        let temp = SyntheticTempDir::new("stream-malformed");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let id = "stream-malformed";
+        let (handle, _) = start_synthetic_generation(&state, id, GenerationOperation::Send).await;
+
+        assert!(parse_openai_stream_line("data: {not-json}").is_err());
+        assert!(fail_running_generation(&state, id, &handle, "provider").await);
+        assert_eq!(live_conversation(&state, id).await.messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn regenerate_transaction_success_atomically_replaces_old_reply() {
+        let temp = SyntheticTempDir::new("regenerate-success");
+        let id = "regenerate-success";
+        let mut persisted = default_persisted_state();
+        persisted.conversations.insert(
+            id.to_string(),
+            synthetic_text_conversation(id, "synthetic question", "synthetic old reply"),
+        );
+        let state = transaction_test_state(&temp, persisted, None).await;
+        let (handle, plan) =
+            start_synthetic_generation(&state, id, GenerationOperation::Regenerate).await;
+
+        assert_eq!(
+            selected_texts(&live_conversation(&state, id).await).last(),
+            Some(&"synthetic old reply".to_string())
+        );
+        assert!(finalize_generation_with_text(
+            &state,
+            id,
+            &handle,
+            plan,
+            MOCK_MODEL_ID.to_string(),
+            "synthetic regenerated reply".to_string(),
+        )
+        .await
+        .expect("regenerated reply should persist"));
+
+        let live = live_conversation(&state, id).await;
+        assert_eq!(live.messages.len(), 2);
+        assert_eq!(
+            selected_texts(&live).last(),
+            Some(&"synthetic regenerated reply".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn regenerate_transaction_provider_failure_preserves_old_reply() {
+        let temp = SyntheticTempDir::new("regenerate-provider-failure");
+        let id = "regenerate-provider-failure";
+        let mut persisted = default_persisted_state();
+        persisted.conversations.insert(
+            id.to_string(),
+            synthetic_text_conversation(id, "synthetic question", "synthetic old reply"),
+        );
+        let state = transaction_test_state(&temp, persisted, None).await;
+        let (handle, _) =
+            start_synthetic_generation(&state, id, GenerationOperation::Regenerate).await;
+
+        assert!(fail_running_generation(&state, id, &handle, "provider").await);
+        assert_eq!(
+            selected_texts(&live_conversation(&state, id).await).last(),
+            Some(&"synthetic old reply".to_string())
+        );
+        assert_eq!(
+            disk_conversation(&temp, id)["messages"][1]["messages"][0]["parts"][0]["text"],
+            json!("synthetic old reply")
+        );
+    }
+
+    #[tokio::test]
+    async fn regenerate_transaction_final_persistence_failure_preserves_old_reply() {
+        let temp = SyntheticTempDir::new("regenerate-final-failure");
+        let id = "regenerate-final-failure";
+        let mut persisted = default_persisted_state();
+        persisted.conversations.insert(
+            id.to_string(),
+            synthetic_text_conversation(id, "synthetic question", "synthetic old reply"),
+        );
+        let state = transaction_test_state_failing_on_replace(&temp, persisted, 2).await;
+        let mut events = subscribe_generation_events(&state, id).await;
+        let (handle, plan) =
+            start_synthetic_generation(&state, id, GenerationOperation::Regenerate).await;
+
+        assert!(finalize_generation_with_text(
+            &state,
+            id,
+            &handle,
+            plan,
+            MOCK_MODEL_ID.to_string(),
+            "synthetic rejected regeneration".to_string(),
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            selected_texts(&live_conversation(&state, id).await).last(),
+            Some(&"synthetic old reply".to_string())
+        );
+        let names = drain_event_names(&mut events);
+        assert!(names.iter().any(|event| event == "failed"));
+        assert!(!names.iter().any(|event| event == "finished"));
+    }
+
+    #[tokio::test]
+    async fn regenerate_transaction_edited_target_rejects_stale_finalizer() {
+        let temp = SyntheticTempDir::new("regenerate-edited-target");
+        let id = "regenerate-edited-target";
+        let mut persisted = default_persisted_state();
+        persisted.conversations.insert(
+            id.to_string(),
+            synthetic_text_conversation(id, "synthetic question", "synthetic old reply"),
+        );
+        let state = transaction_test_state(&temp, persisted, None).await;
+        let (handle, plan) =
+            start_synthetic_generation(&state, id, GenerationOperation::Regenerate).await;
+        let target_id = format!("{id}-assistant-message");
+        transact_persisted_state(
+            &state,
+            PureStateMutationScope::Conversations,
+            move |staged| {
+                let conversation = staged.conversations.get_mut(id).unwrap();
+                find_message_mut(conversation, &target_id).unwrap().parts =
+                    synthetic_text_parts("synthetic user-edited reply");
+                Ok(())
+            },
+        )
+        .await
+        .expect("synthetic edit should persist");
+
+        let result = finalize_generation_with_text(
+            &state,
+            id,
+            &handle,
+            plan,
+            MOCK_MODEL_ID.to_string(),
+            "synthetic stale regeneration".to_string(),
+        )
+        .await;
+        assert!(matches!(result, Err(StateMutationError::Conflict(_))));
+        assert_eq!(
+            selected_texts(&live_conversation(&state, id).await).last(),
+            Some(&"synthetic user-edited reply".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_transaction_active_stream_discards_transient_reply() {
+        let temp = SyntheticTempDir::new("stop-active");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let id = "stop-active";
+        let mut events = subscribe_generation_events(&state, id).await;
+        let _ = start_synthetic_generation(&state, id, GenerationOperation::Send).await;
+
+        let response = stop_conversation(State(state.clone()), Path(id.to_string()))
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(live_conversation(&state, id).await.messages.len(), 1);
+        assert!(!has_active_generation(&state, id).await);
+        let names = drain_event_names(&mut events);
+        assert_eq!(names.iter().filter(|event| *event == "stopped").count(), 1);
+        assert_eq!(names.iter().filter(|event| *event == "finished").count(), 0);
+    }
+
+    #[tokio::test]
+    async fn stop_transaction_finish_race_has_one_terminal() {
+        let temp = SyntheticTempDir::new("stop-finish-race");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let id = "stop-finish-race";
+        let mut events = subscribe_generation_events(&state, id).await;
+        let (handle, plan) =
+            start_synthetic_generation(&state, id, GenerationOperation::Send).await;
+        let finish_state = state.clone();
+        let finish_handle = handle.clone();
+        let finish = tokio::spawn(async move {
+            finalize_generation_with_text(
+                &finish_state,
+                id,
+                &finish_handle,
+                plan,
+                MOCK_MODEL_ID.to_string(),
+                "synthetic race reply".to_string(),
+            )
+            .await
+        });
+        let stop_state = state.clone();
+        let stop = tokio::spawn(async move {
+            stop_conversation(State(stop_state), Path(id.to_string()))
+                .await
+                .into_response()
+                .status()
+        });
+
+        let _ = finish.await.expect("finish task should complete");
+        let stop_status = stop.await.expect("stop task should complete");
+        assert!(matches!(
+            stop_status,
+            StatusCode::OK | StatusCode::NOT_FOUND | StatusCode::CONFLICT
+        ));
+        let names = drain_event_names(&mut events);
+        let terminals = names
+            .iter()
+            .filter(|event| matches!(event.as_str(), "finished" | "stopped" | "failed"))
+            .count();
+        assert_eq!(terminals, 1);
+        assert!(live_conversation(&state, id).await.messages.len() <= 2);
+    }
+
+    #[tokio::test]
+    async fn stop_transaction_nonexistent_generation_is_safe_not_found() {
+        let temp = SyntheticTempDir::new("stop-missing");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let revision = state.revision.load(Ordering::Acquire);
+
+        let response = stop_conversation(
+            State(state.clone()),
+            Path(MOCK_WELCOME_CONVERSATION_ID.to_string()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(state.revision.load(Ordering::Acquire), revision);
+    }
+
+    #[tokio::test]
+    async fn stop_transaction_persistence_failure_has_failed_not_stopped() {
+        let temp = SyntheticTempDir::new("stop-persistence-failure");
+        let state =
+            transaction_test_state_failing_on_replace(&temp, default_persisted_state(), 2).await;
+        let id = "stop-persistence-failure";
+        let mut events = subscribe_generation_events(&state, id).await;
+        let _ = start_synthetic_generation(&state, id, GenerationOperation::Send).await;
+
+        let response = stop_conversation(State(state.clone()), Path(id.to_string()))
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!has_active_generation(&state, id).await);
+        assert_eq!(live_conversation(&state, id).await.messages.len(), 1);
+        let names = drain_event_names(&mut events);
+        assert_eq!(names.iter().filter(|event| *event == "failed").count(), 1);
+        assert_eq!(names.iter().filter(|event| *event == "stopped").count(), 0);
+    }
+
+    #[tokio::test]
+    async fn generation_registry_concurrent_send_same_conversation_conflicts() {
+        let temp = SyntheticTempDir::new("generation-same-conflict");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let id = "generation-same-conflict";
+        let first = begin_generation(&state, id, GenerationOperation::Send)
+            .await
+            .expect("first generation should reserve");
+
+        assert!(matches!(
+            begin_generation(&state, id, GenerationOperation::Send).await,
+            Err(BeginGenerationError::Conflict)
+        ));
+        assert!(remove_generation_if_current(&state, id, &first).await);
+    }
+
+    #[tokio::test]
+    async fn streaming_transaction_two_conversations_finalize_independently() {
+        let temp = SyntheticTempDir::new("stream-two-conversations");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let first_id = "stream-two-first";
+        let second_id = "stream-two-second";
+        let (first_handle, first_plan) =
+            start_synthetic_generation(&state, first_id, GenerationOperation::Send).await;
+        let (second_handle, second_plan) =
+            start_synthetic_generation(&state, second_id, GenerationOperation::Send).await;
+
+        let (first, second) = tokio::join!(
+            finalize_generation_with_text(
+                &state,
+                first_id,
+                &first_handle,
+                first_plan,
+                MOCK_MODEL_ID.to_string(),
+                "synthetic first reply".to_string(),
+            ),
+            finalize_generation_with_text(
+                &state,
+                second_id,
+                &second_handle,
+                second_plan,
+                MOCK_MODEL_ID.to_string(),
+                "synthetic second reply".to_string(),
+            )
+        );
+        assert!(first.expect("first final should persist"));
+        assert!(second.expect("second final should persist"));
+        assert_eq!(live_conversation(&state, first_id).await.messages.len(), 2);
+        assert_eq!(live_conversation(&state, second_id).await.messages.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn generation_registry_stale_finish_cannot_remove_new_generation() {
+        let temp = SyntheticTempDir::new("generation-stale-finish");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let id = "generation-stale-finish";
+        let (old_handle, old_plan) =
+            start_synthetic_generation(&state, id, GenerationOperation::Send).await;
+        assert!(remove_generation_if_current(&state, id, &old_handle).await);
+        let new_handle = begin_generation(&state, id, GenerationOperation::Send)
+            .await
+            .expect("new generation should reserve");
+        assert!(activate_generation(&state, id, &new_handle).await);
+
+        assert!(!finalize_generation_with_text(
+            &state,
+            id,
+            &old_handle,
+            old_plan,
+            MOCK_MODEL_ID.to_string(),
+            "synthetic stale reply".to_string(),
+        )
+        .await
+        .expect("stale finalizer should be ignored"));
+        let generations = state.active_generations.lock().await;
+        assert_eq!(
+            generations.get(id).unwrap().handle.generation_id,
+            new_handle.generation_id
+        );
+    }
+
+    #[tokio::test]
+    async fn generation_registry_conversation_delete_cancels_without_recreation() {
+        let temp = SyntheticTempDir::new("generation-delete-conversation");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let id = "generation-delete-conversation";
+        let (handle, plan) =
+            start_synthetic_generation(&state, id, GenerationOperation::Send).await;
+
+        let response = delete_conversation(State(state.clone()), Path(id.to_string()))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(handle.cancellation.is_cancelled());
+        assert!(!finalize_generation_with_text(
+            &state,
+            id,
+            &handle,
+            plan,
+            MOCK_MODEL_ID.to_string(),
+            "synthetic late reply".to_string(),
+        )
+        .await
+        .expect("deleted generation should be stale"));
+        assert!(!state.conversations.read().await.contains_key(id));
+        assert!(disk_conversation(&temp, id).is_null());
+    }
+
+    #[tokio::test]
+    async fn streaming_transaction_category_a_update_survives_final_commit() {
+        let temp = SyntheticTempDir::new("stream-category-a");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let id = "stream-category-a";
+        let (handle, plan) =
+            start_synthetic_generation(&state, id, GenerationOperation::Send).await;
+
+        let response = update_conversation_title(
+            State(state.clone()),
+            Path(id.to_string()),
+            Json(UpdateConversationTitleRequest {
+                title: "synthetic concurrent title".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(finalize_generation_with_text(
+            &state,
+            id,
+            &handle,
+            plan,
+            MOCK_MODEL_ID.to_string(),
+            "synthetic final after title".to_string(),
+        )
+        .await
+        .expect("final should preserve latest title"));
+
+        let live = live_conversation(&state, id).await;
+        assert_eq!(live.title, "synthetic concurrent title");
+        assert_eq!(live.messages.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn streaming_transaction_file_transaction_and_final_do_not_deadlock() {
+        let temp = SyntheticTempDir::new("stream-file-concurrency");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let id = "stream-file-concurrency";
+        let (handle, plan) =
+            start_synthetic_generation(&state, id, GenerationOperation::Send).await;
+        let file_state = state.clone();
+        let file_transaction =
+            tokio::spawn(async move {
+                transact_persisted_state(&file_state, PureStateMutationScope::FileMetadata, |_| {
+                    Ok(())
+                })
+                .await
+            });
+
+        let final_result = tokio::time::timeout(
+            Duration::from_secs(5),
+            finalize_generation_with_text(
+                &state,
+                id,
+                &handle,
+                plan,
+                MOCK_MODEL_ID.to_string(),
+                "synthetic concurrent final".to_string(),
+            ),
+        )
+        .await
+        .expect("final transaction should not deadlock")
+        .expect("final transaction should persist");
+        assert!(final_result);
+        file_transaction
+            .await
+            .expect("file transaction task should finish")
+            .expect("file transaction should persist");
+    }
+
+    #[tokio::test]
+    async fn stream_event_order_success_is_commit_start_delta_commit_finished() {
+        let temp = SyntheticTempDir::new("event-order-success");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let id = "event-order-success";
+        let mut events = subscribe_generation_events(&state, id).await;
+        let (handle, plan) =
+            start_synthetic_generation(&state, id, GenerationOperation::Send).await;
+        broadcast_generation_delta(
+            &state,
+            id,
+            &handle,
+            &plan,
+            MOCK_MODEL_ID,
+            "synthetic event delta",
+            "synthetic event delta",
+        )
+        .await;
+        assert!(finalize_generation_with_text(
+            &state,
+            id,
+            &handle,
+            plan,
+            MOCK_MODEL_ID.to_string(),
+            "synthetic event final".to_string(),
+        )
+        .await
+        .expect("event-order final should persist"));
+
+        let names = drain_event_names(&mut events);
+        let start = names
+            .iter()
+            .position(|event| event == "generation-start")
+            .unwrap();
+        let delta = names.iter().position(|event| event == "delta").unwrap();
+        let finished = names.iter().position(|event| event == "finished").unwrap();
+        let final_snapshot = names[..finished]
+            .iter()
+            .rposition(|event| event == "snapshot")
+            .unwrap();
+        assert!(start < delta);
+        assert!(delta < final_snapshot);
+        assert!(final_snapshot < finished);
+        assert_eq!(live_conversation(&state, id).await.messages.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn stream_event_order_initial_failure_has_no_generation_events() {
+        let temp = SyntheticTempDir::new("event-order-initial-failure");
+        let state = transaction_test_state(
+            &temp,
+            default_persisted_state(),
+            Some(TestFailureStage::Replace),
+        )
+        .await;
+        let id = "event-order-initial-failure".to_string();
+        let mut events = subscribe_generation_events(&state, &id).await;
+
+        let response = send_message(
+            State(state.clone()),
+            Path(id.clone()),
+            Json(SendMessageRequest {
+                parts: synthetic_text_parts("synthetic initial failure"),
+                mode_injection_ids: None,
+                lorebook_ids: None,
+                image_input_confirmed: None,
+                image_input_mode: None,
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let names = drain_event_names(&mut events);
+        assert!(!names.iter().any(|event| {
+            matches!(
+                event.as_str(),
+                "generation-start" | "delta" | "finished" | "stopped"
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn stream_event_order_final_failure_has_failed_without_finished() {
+        let temp = SyntheticTempDir::new("event-order-final-failure");
+        let state =
+            transaction_test_state_failing_on_replace(&temp, default_persisted_state(), 2).await;
+        let id = "event-order-final-failure";
+        let mut events = subscribe_generation_events(&state, id).await;
+        let (handle, plan) =
+            start_synthetic_generation(&state, id, GenerationOperation::Send).await;
+        let result = finalize_generation_with_text(
+            &state,
+            id,
+            &handle,
+            plan,
+            MOCK_MODEL_ID.to_string(),
+            "synthetic rejected event final".to_string(),
+        )
+        .await;
+
+        assert!(result.is_err());
+        let names = drain_event_names(&mut events);
+        assert_eq!(names.iter().filter(|event| *event == "failed").count(), 1);
+        assert_eq!(names.iter().filter(|event| *event == "finished").count(), 0);
+        assert_eq!(live_conversation(&state, id).await.messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_event_order_exactly_one_terminal_event() {
+        let temp = SyntheticTempDir::new("event-order-one-terminal");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let id = "event-order-one-terminal";
+        let mut events = subscribe_generation_events(&state, id).await;
+        let (handle, plan) =
+            start_synthetic_generation(&state, id, GenerationOperation::Send).await;
+        assert!(finalize_generation_with_text(
+            &state,
+            id,
+            &handle,
+            plan,
+            MOCK_MODEL_ID.to_string(),
+            "synthetic one terminal".to_string(),
+        )
+        .await
+        .expect("final should persist"));
+        assert!(!fail_running_generation(&state, id, &handle, "provider").await);
+
+        let names = drain_event_names(&mut events);
+        assert_eq!(
+            names
+                .iter()
+                .filter(|event| matches!(event.as_str(), "finished" | "stopped" | "failed"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn generation_registry_restart_drops_runtime_and_keeps_durable_user() {
+        let temp = SyntheticTempDir::new("generation-restart");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let id = "generation-restart";
+        let _ = start_synthetic_generation(&state, id, GenerationOperation::Send).await;
+        assert!(has_active_generation(&state, id).await);
+
+        let persisted: PersistedMockState =
+            serde_json::from_value(read_test_state(&test_persistence(&temp)))
+                .expect("synthetic disk state should deserialize");
+        let restarted = Arc::new(MockApiState::new(
+            test_persistence(&temp),
+            Arc::new(TestSecretStore),
+            persisted,
+        ));
+
+        assert!(!has_active_generation(&restarted, id).await);
+        let conversation = live_conversation(&restarted, id).await;
+        assert_eq!(conversation.messages.len(), 1);
+        assert!(!conversation.is_generating);
+    }
+
+    #[tokio::test]
+    async fn streaming_transaction_safe_errors_hide_content_and_paths() {
+        let temp = SyntheticTempDir::new("stream-safe-errors");
+        let state = transaction_test_state(
+            &temp,
+            default_persisted_state(),
+            Some(TestFailureStage::Replace),
+        )
+        .await;
+        let id = "stream-safe-errors".to_string();
+        let synthetic_content = "synthetic-sensitive-message-marker";
+        let response = send_message(
+            State(state),
+            Path(id),
+            Json(SendMessageRequest {
+                parts: synthetic_text_parts(synthetic_content),
+                mode_injection_ids: None,
+                lorebook_ids: None,
+                image_input_confirmed: None,
+                image_input_mode: None,
+            }),
+        )
+        .await
+        .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("safe error body should be readable");
+        let body = String::from_utf8(body.to_vec()).expect("safe error should be UTF-8");
+
+        assert!(!body.contains(synthetic_content));
+        assert!(!body.contains(temp.path.to_string_lossy().as_ref()));
+        assert!(!body.contains(PROVIDER_SECRET_REF_PREFIX));
+        assert!(!body.contains("request body"));
+    }
+
+    #[tokio::test]
+    async fn streaming_transaction_network_wait_holds_no_state_locks() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let temp = SyntheticTempDir::new("stream-network-no-locks");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let id = "stream-network-no-locks";
+        let (handle, plan) =
+            start_synthetic_generation(&state, id, GenerationOperation::Send).await;
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("synthetic loopback listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("synthetic loopback address should exist");
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let release = Arc::new(Notify::new());
+        let server_release = release.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener
+                .accept()
+                .await
+                .expect("synthetic request should connect");
+            let mut buffer = [0_u8; 4096];
+            let read = socket
+                .read(&mut buffer)
+                .await
+                .expect("synthetic request should be readable");
+            assert!(read > 0);
+            let _ = started_tx.send(());
+            server_release.notified().await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"synthetic reply\"}}]}\n\ndata: [DONE]\n\n",
+                )
+                .await
+                .expect("synthetic SSE response should be written");
+        });
+        let config = OpenAiChatConfig {
+            base_url: format!("http://{address}/v1"),
+            model_id: "synthetic-loopback-model".to_string(),
+            api_key: "synthetic-loopback-key".to_string(),
+            custom_headers: Vec::new(),
+            custom_body: None,
+            input_modalities: default_input_modalities(),
+        };
+        let stream_state = state.clone();
+        let stream_handle = handle.clone();
+        let stream_plan = plan.clone();
+        let stream = tokio::spawn(async move {
+            stream_openai_compatible_chat(
+                &stream_state,
+                id,
+                &stream_handle,
+                &stream_plan,
+                MOCK_MODEL_ID,
+                &config,
+                vec![OpenAiChatMessage {
+                    role: "user".to_string(),
+                    content: "synthetic loopback request".to_string(),
+                }],
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("synthetic network request should start")
+            .expect("synthetic start signal should arrive");
+
+        let title_response = tokio::time::timeout(
+            Duration::from_secs(2),
+            update_conversation_title(
+                State(state.clone()),
+                Path(id.to_string()),
+                Json(UpdateConversationTitleRequest {
+                    title: "synthetic title during network".to_string(),
+                }),
+            ),
+        )
+        .await
+        .expect("Category A mutation must not wait for provider network")
+        .into_response();
+        assert_eq!(title_response.status(), StatusCode::OK);
+
+        release.notify_waiters();
+        let outcome = stream
+            .await
+            .expect("synthetic stream task should finish")
+            .expect("synthetic stream should parse");
+        assert!(matches!(outcome, GenerationStreamOutcome::Completed(_)));
+        server
+            .await
+            .expect("synthetic loopback server should finish");
+        assert_eq!(
+            live_conversation(&state, id).await.title,
+            "synthetic title during network"
+        );
     }
 }

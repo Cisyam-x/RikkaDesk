@@ -1,8 +1,8 @@
 # RikkaDesk Phase 12 Mutation Transaction Boundaries
 
-This document began as the Phase 12 P1-C0 audit and design for runtime mutation transactions. It now records the completed P1-C1 pure-state implementation, P1-C2 Provider/SecretStore compensation, and P1-C3 managed file/blob compensation while retaining network and streaming boundaries for P1-C4.
+This document began as the Phase 12 P1-C0 audit and design for runtime mutation transactions. It now records the completed P1-C1 pure-state implementation, P1-C2 Provider/SecretStore compensation, P1-C3 managed file/blob compensation, and P1-C4 background streaming transaction safety.
 
-P1-C1 through P1-C3 change the Rust mock API transaction path only. They do not add backup/restore, read real app data or secret blobs, change `schemaVersion: 6`, change provider import/export version 4, or enable real-provider image input by default.
+P1-C1 through P1-C4 change the Rust mock API transaction path only. They do not add backup/restore, read real app data or secret blobs, change `schemaVersion: 6`, change provider import/export version 4, or enable real-provider image input by default.
 
 ## Current State Model
 
@@ -16,7 +16,9 @@ Persisted data is split across these live fields in `MockApiState`:
 
 Runtime-only data is separate:
 
-- `generating_flags: RwLock<HashSet<String>>`
+- `active_generations: Mutex<HashMap<String, ActiveGeneration>>`
+- `generation_transition_mutex: Mutex<()>`
+- monotonic generation sequence and per-generation cancellation notification
 - `conversation_txs: RwLock<HashMap<String, broadcast::Sender<SsePayload>>>`
 - settings/list broadcast senders
 - SSE `seq: AtomicU64`
@@ -27,7 +29,7 @@ Runtime-only data is separate:
 - managed blob store and file/blob transaction mutex
 - persistence/save mutex and file operations
 
-P1-A serializes writes and atomically replaces the state file. P1-B makes startup and migration fail closed. P1-C1 stages pure settings/conversation mutations, persists the explicit staged snapshot, and commits live state only after persistence succeeds. P1-C2 applies the same state transaction to Provider metadata and coordinates it with copy-on-write SecretStore operations. P1-C3 publishes managed blobs before one staged metadata commit, compensates handled upload failures, and uses durable tombstones before physical deletion. Streaming mutations remain the transitional P1-C4 path.
+P1-A serializes writes and atomically replaces the state file. P1-B makes startup and migration fail closed. P1-C1 stages pure settings/conversation mutations, persists the explicit staged snapshot, and commits live state only after persistence succeeds. P1-C2 applies the same state transaction to Provider metadata and coordinates it with copy-on-write SecretStore operations. P1-C3 publishes managed blobs before one staged metadata commit, compensates handled upload failures, and uses durable tombstones before physical deletion. P1-C4 separates runtime generation state from persisted conversations and commits only initial/final durable message states.
 
 ## P1-C1 Implementation Status
 
@@ -48,7 +50,7 @@ The implementation adds one process-local `mutation_transaction_mutex`, one live
 
 P1-C1 success is published only after disk persistence and the live commit finish. Persistence or validation failure leaves pure live state, disk state, and revision unchanged and emits no success update.
 
-Transitional Category B/D writers use the same mutation mutex and commit barrier for their short live-state write/persist window. This prevents interleaving with a staged commit and prevents an older persistence snapshot from overwriting a newer transaction. P1-C3 now owns the managed file/blob paths; it prevents handled failures from creating active dangling metadata but intentionally does not reconcile crash-only orphans. P1-C4 still owns streaming durability.
+Category B/D writers use the same mutation mutex and commit barrier for short staged state commits. This prevents interleaving and prevents an older persistence snapshot from overwriting a newer transaction. P1-C3 owns managed file/blob handled-failure coordination, while P1-C4 owns initial/final streaming state and runtime generation lifecycle. Crash-only orphan reconciliation remains deferred.
 
 ## P1-C2 Implementation Status
 
@@ -94,19 +96,19 @@ State and blob storage are not one crash-atomic resource. A process crash betwee
 | Current assistant model | settings and assistant model field | Yes | settings SSE | P1-C1 discards failed stage; live/disk/revision remain old | Implemented staged transaction | A |
 | Favorite models | settings | Yes | settings SSE | P1-C1 discards failed stage; live/disk/revision remain old | Implemented staged transaction | A |
 | Conversation detail/stream missing-ID read | None in persisted state | No | Runtime-only stream sender | Returns a virtual DTO without inserting or saving | Implemented pure GET | Read |
-| Send user message | conversations, title/mode/lorebook/generating state, `id_seq` | Yes before provider work | conversation/list SSE, then local reply or provider task | User turn remains live if initial save fails; provider is not started | Stage initial turn; do not rollback live | B |
-| Stop conversation | conversations plus runtime generation flag | Yes | Stops runtime processing before save; conversation/list SSE after save | Live/runtime stop remains if save fails | Needs staged state plus generation token ordering | B |
+| Send user message | conversations, title/mode/lorebook, `id_seq`; runtime generation registry | Yes before provider work | committed snapshot/start, then local reply or provider task | Failed stage leaves live/disk/revision unchanged; reservation is removed; no task/event | Implemented initial staged transaction | B |
+| Stop conversation | conversations timestamp plus runtime generation registry | Yes | Cancels stream reads; discards transient partial; terminal after commit | Failed stage leaves durable content unchanged and emits `failed`, not `stopped` | Implemented token-owned stop transaction | B |
 | Conversation title | conversations | Yes | conversation/list SSE | P1-C1 leaves live/disk old on failure | Implemented staged transaction | A |
 | Pin/unpin | conversations | Yes | conversation/list SSE | P1-C1 leaves live/disk old on failure | Implemented staged transaction | A |
 | Conversation delete | conversations | Yes | Runtime generation/sender cleanup after commit; list SSE after commit | Failed stage leaves conversation and runtime resources intact | Implemented staged transaction | A |
 | Message edit | conversations | Yes | conversation/list SSE | P1-C1 leaves live/disk old on failure | Implemented staged transaction | A |
 | Message delete | conversations | Yes | conversation/list SSE | P1-C1 leaves live/disk old on failure | Implemented staged transaction | A |
-| Regenerate preparation | conversations, truncation/generating state | Yes | SSE, then local reply or provider task | Live history remains truncated if save fails | Stage and commit before any task | B |
-| Append local assistant reply | conversations, `id_seq` | Yes | conversation/list SSE | Live reply remains if save fails | Stage as short A/B transaction | B |
-| Append empty streaming reply | conversations, `id_seq` | Yes | SSE, then generation flag/network task | Live placeholder remains if save fails | Stage before starting network | B |
-| Append stream text delta | conversations | No | Snapshot SSE for each delta | UI/readers see text not yet durable | Must become transient runtime buffer or checkpoint transaction | B |
-| Stream provider failure text | conversations | Only through later finish save | Snapshot SSE before final save | Failure text can be visible but not durable | Commit as one final short transaction | B |
-| Finish stream | conversations and runtime generation flag | Yes | Stops runtime flag before save; final SSE after save | Live finished state remains; disk may still show generating; safe stage-only log | Needs generation token and retry/error event | B |
+| Regenerate preparation | no destructive history change; runtime generation registry | Validation snapshot is persisted before task | committed snapshot/start, then local reply or provider task | Old assistant remains on validation/provider/final failure | Implemented keep-old-then-replace transaction | B |
+| Append local assistant reply | conversations, `id_seq` | Yes | committed snapshot/list/`finished` after commit | Failed stage leaves durable user/old reply and emits safe `failed` | Implemented shared final helper | B |
+| Append empty streaming reply | None | No | Runtime generation identity only | No durable placeholder exists | Removed by P1-C4 | B |
+| Append stream text delta | Task-local buffer only | No | `delta` plus transient compatibility snapshot | Live/disk persisted state remains unchanged | Implemented transient runtime buffer | B |
+| Stream provider failure text | None | No | Fixed safe `failed` terminal | Task-local buffer is discarded | Implemented failure cleanup | B |
+| Finish stream | conversations, `id_seq`, runtime registry | Yes | committed snapshot/list then exactly one `finished` | Failed stage leaves live/disk/revision old and emits `failed` only | Implemented token-owned final transaction | B |
 | Upload file | files, `id_seq` | Yes | Entire accepted batch is published before one staged metadata commit | Failed blob work commits no metadata; failed state commit compensates all new blobs and leaves live/disk/revision unchanged | Implemented publish/stage/compensate transaction | D |
 | Delete file | files tombstone | Yes | Durable tombstone precedes physical blob cleanup | Failed tombstone persistence retains active metadata/blob; post-commit cleanup failure is logical success with inaccessible orphan | Implemented tombstone then cleanup | D |
 | Attachment references in messages | conversations | Through message transaction | References numeric `metadata.fileId` | Persisted references block ordinary DELETE; send rejects missing/tombstoned IDs | Implemented conservative reference policy | D |
@@ -132,9 +134,9 @@ Required semantics:
 
 ### Category B: State Plus Network Or Background Work
 
-The initial user turn and assistant placeholder must commit before a provider task starts. No mutation, persistence, or component lock may remain held while waiting on the provider.
+The initial user turn must commit before a provider/mock task starts. No assistant placeholder is persisted, and no mutation, persistence, component, file, or Provider transaction lock remains held while waiting on the provider.
 
-Each background result is a separate short transaction. Provider deltas are not durable success. Final content, stop, provider failure, and finish status need explicit commit semantics and generation identity checks.
+Each background final result is a separate short staged transaction. Provider deltas are task-local transient progress, not durable success. Final content, stop, provider failure, and terminal status use generation identity checks and mutually exclusive terminal publication.
 
 ### Category C: State Plus SecretStore
 
@@ -156,7 +158,7 @@ NotFound initialization, corrupt backup, future-schema handling, and migration r
 4. The global mutation mutex serializes snapshot, persistence, and commit. No component `RwLock` or commit barrier is held across disk sync, provider network wait, long-running stream, SSE send, SecretStore operation, or blob I/O. The mutation mutex is never held across network, SecretStore, blob I/O, or SSE.
 5. Transaction N failure cannot restore or overwrite transaction N+1. Runtime persisted-state writers are globally serialized.
 6. Readers never observe a partially committed multi-field state.
-7. Provider calls start only after the initial user message and assistant placeholder required by that call are durable.
+7. Provider calls start only after the initial user message is durable and the matching runtime generation is active; no assistant placeholder is required.
 8. Success SSE is emitted after commit. Transient stream delta events must be explicitly distinguishable from durable snapshots.
 9. State, paths, API keys, secret values, request bodies, and blob bytes never appear in transaction errors or logs.
 10. ID gaps are allowed; duplicate IDs are forbidden. `id_seq` is never decremented during compensation.
@@ -353,25 +355,26 @@ The process-crash windows remain final publish before metadata commit, and durab
 
 ## Provider Network And Streaming Boundary
 
-- The provider request starts only after the user turn and assistant placeholder required for generation are durable and committed live.
+- The initial user turn and any lazy conversation creation are one staged transaction. Provider/config resolution and mock/provider task startup happen only after that transaction is durable and committed live.
+- No durable assistant placeholder is created. The active generation and any partial assistant text are runtime-only until final commit.
 - No transaction, component, persistence, or commit-barrier lock is held during provider connection or streaming.
-- Every final background mutation uses the same staged transaction helper as HTTP mutations.
-- Each generation receives a conversation generation token/epoch. Stop, delete, regenerate, and late stream completion compare the token before committing so an older task cannot overwrite a newer turn.
+- Every mock/provider final assistant result uses the same staged transaction helper as HTTP mutations.
+- Each generation receives a monotonic runtime-only token and cancellation handle. Stop, delete, regenerate, and late stream completion compare token ownership before committing or removing the registry entry, so an older task cannot overwrite or cancel a newer turn.
+- One short generation lifecycle mutex orders reservation, durable transition, registry cleanup, and terminal SSE publication. It is never held across provider network waits or stream reads.
+- Regenerate keeps the old assistant reply durable and visible until one final transaction atomically replaces it. A changed/deleted source or target makes the old finalizer stale.
 - Provider/network errors and persistence errors remain distinct safe error classes.
 
 ### Delta Visibility
 
-Current deltas mutate the persisted conversation object and broadcast snapshot events without persistence. P1-C4 should instead keep the in-progress text in a runtime-only generation buffer and emit explicitly transient `delta` events. A durable snapshot event is emitted only after a checkpoint/final staged commit.
+P1-C4 uses transient delta semantics:
 
-Recommended initial policy:
-
-- Persist the user turn and empty assistant placeholder before network start.
-- Buffer deltas outside persisted live state.
-- Optionally checkpoint at a bounded interval/size through short transactions.
-- On DONE, provider error, or Stop, stage the accumulated text and final status, persist, commit, then emit final snapshot.
-- If final persistence fails, emit a safe stream-persistence error event, do not emit final success, keep retryable runtime data, and never label it as provider failure.
-
-Background streaming is handled separately in P1-C4.
+- The background task owns the accumulated reply buffer. The registry stores no prompt, response, delta, API key, or request body.
+- Each provider delta emits a `delta` event and a compatibility snapshot marked `transient: true`; neither changes live persisted conversations nor `state.v1.json`.
+- On provider/mock completion, the token owner stages the final assistant append/replace against the latest live state, persists it, commits live, then emits the committed snapshot and `finished`.
+- Final persistence failure leaves live/disk/revision at the durable user/old-assistant state, releases the buffer, emits fixed `failed: persistence`, and never emits `finished`.
+- SSE disconnection or absence does not roll back a completed durable commit.
+- Stop uses the discard-partial policy: transient text is dropped, durable state retains the user turn or old regenerated reply, and `stopped` is emitted only after the short stop transaction succeeds.
+- Runtime restart does not resume generation. The durable user turn remains; transient assistant text and active registry entries are lost by design.
 
 ## Endpoint Success And Error Semantics
 
@@ -386,10 +389,10 @@ Background streaming is handled separately in P1-C4.
 | Conversation delete | Discard stage; retain runtime sender/generation until commit | Runtime cleanup failure is local and retryable | Safe 5xx; no delete invalidate |
 | Send initial turn | Discard stage | Provider not started | Safe 5xx; no accepted response/success snapshot |
 | Regenerate preparation | Discard stage | Provider not started | Safe 5xx; old history remains visible |
-| Stream placeholder | Discard stage | Provider not started | Safe persistence error; no generation start |
-| Stream delta | No durable success until checkpoint/final | Network error becomes final staged result | Transient delta only; never durable snapshot claim |
-| Stream finish/failure | Keep runtime buffer for retry; no final commit | Network and persistence errors stay distinct | Safe SSE error; no final-success snapshot |
-| Stop | Failed staged stop leaves prior durable generating state | Runtime cancellation uses generation token | Safe 5xx or retry status; no stopped success event |
+| Stream placeholder | Not used after P1-C4 | None | Runtime generation identity only; no durable empty assistant |
+| Stream delta | No persisted mutation | Network error discards the task-local buffer | Transient delta/snapshot only; never durable success |
+| Stream finish/failure | Discard failed stage and task-local buffer | Network and persistence errors stay distinct | Committed snapshot then `finished`, or safe `failed`; never both |
+| Stop | Failed staged stop leaves prior durable content unchanged | Cancellation uses the generation token and discards partial text | Safe 5xx plus `failed` on persistence error; committed stop emits exactly one `stopped` |
 | File upload | Discard metadata stage; delete operation-created blobs | Cleanup failure records orphan safely | Safe 5xx; no file response |
 | File delete | Discard failed tombstone stage and retain active metadata/blob | Post-commit blob cleanup failure leaves an inaccessible orphan | Reference conflict is 409; committed tombstone remains logical success with fixed warning |
 
@@ -433,16 +436,17 @@ Scope:
 - Numeric persisted-reference protection and send-time active attachment checks.
 - API-inaccessible orphan policy; automatic reconciliation/GC remains deferred.
 
-### P1-C4: Background Streaming Transaction Safety
+### P1-C4: Background Streaming Transaction Safety (Completed)
 
 Scope:
 
-- Initial send/regenerate transaction.
-- Durable assistant placeholder before network.
-- Runtime-only delta buffer or bounded checkpoints.
-- Generation tokens for stop/delete/regenerate races.
-- Final/failure persistence, retry visibility, and SSE ordering.
-- Proof that no transaction lock is held during network wait.
+- One staged initial user/conversation transaction before any provider/mock work.
+- Runtime-only active generation registry, cancellation handle, operation, phase, and monotonic generation ID.
+- Task-local delta buffer with explicitly transient SSE; no durable assistant placeholder or partial message.
+- Token/revision checks for stop/delete/regenerate/edit races and no `entry`-based conversation recreation.
+- Final append/replace through one staged transaction, with terminal success only after durable/live commit.
+- Stop discard-partial semantics and lifecycle serialization that makes `finished`, `stopped`, and `failed` mutually exclusive.
+- Synthetic loopback proof that Category A transactions complete while a provider response is blocked.
 
 ## Synthetic Test Plan
 
@@ -481,12 +485,18 @@ Scope:
 ### Streaming
 
 - Initial persistence failure means no provider call.
-- Placeholder persistence failure means no provider call.
+- Virtual first POST durably creates the conversation and user once, without a placeholder.
 - Delta events are marked transient.
-- Final persistence failure emits no final success.
+- Final persistence failure leaves live/disk/revision unchanged from the committed user/old reply and emits no final success.
+- Mock fallback and provider completion use the same final transaction helper.
+- Regenerate provider/final failures retain the old assistant reply, and edited/deleted targets reject stale finalizers.
 - Stop and finish racing with the same generation token produce one final commit.
 - A late older stream cannot modify a regenerated conversation.
+- Conversation delete cancels the token and an old task cannot recreate the conversation.
+- Different conversations can finalize independently while one conversation rejects concurrent generation.
+- Restart retains the durable user turn and intentionally drops runtime generation/transient text.
 - No transaction/component lock is held during a synthetic network wait.
+- P1-C4 adds 32 synthetic tests across `streaming_transaction`, `generation_registry`, `stream_event_order`, `regenerate_transaction`, and `stop_transaction`.
 
 All tests must use synthetic state, SecretStore fakes, managed blob temp directories, and local capture servers only. They must not read real app data, encrypted secret blobs, or real API keys.
 
@@ -498,13 +508,13 @@ Do not implement Mode A/B backup packaging until these gates pass:
 P1-C1 pure state transaction safety
   -> P1-C2 provider secret consistency (completed)
   -> P1-C3 file/blob handled-failure consistency (completed)
-  -> P1-C4 streaming transaction safety
+  -> P1-C4 streaming transaction safety (completed)
   -> Mode A/B backup package
 ```
 
 Reason: a backup snapshot cannot be represented as consistent while runtime writers can expose uncommitted state, SecretStore operations can leave cross-resource inconsistencies, blobs can be missing/orphaned, or streaming can mutate persisted objects outside transaction boundaries.
 
-## P1-C1 Through P1-C3 Conclusions
+## P1-C1 Through P1-C4 Conclusions
 
 - Recommended architecture: stage, persist, then commit live.
 - Global mutation mutex required: Yes.
@@ -520,11 +530,14 @@ Reason: a backup snapshot cannot be represented as consistent while runtime writ
 - Ordinary handled file failures leave active dangling metadata: No; failed upload state commits compensate new blobs, and failed delete state commits retain the original blob.
 - Referenced managed file ordinary DELETE permitted: No; persisted numeric references return conflict.
 - Message/conversation deletion auto-GCs managed blobs: No; conservative orphan cleanup is deferred.
-- Background streaming handled separately: Yes, in P1-C4.
+- Background streaming staged/final transaction semantics implemented: Yes, in P1-C4.
+- Streaming delta durable: No; it is explicitly transient until final commit.
+- Stop partial reply policy: Discard transient partial text.
+- Streaming resume across restart: No.
 - ID policy: gaps allowed, duplicates forbidden, never decrement `id_seq`.
 - Pure settings/conversation staged transactions implemented: Yes.
 - Missing conversation GET mutates persisted state: No.
 - Runtime revision persisted in schema v6: No.
-- Recovery/backup modes implemented by P1-C1/P1-C2/P1-C3: No.
+- Recovery/backup modes implemented by P1-C1/P1-C2/P1-C3/P1-C4: No.
 
-Recommended next step: P1-C4 background streaming transaction safety. Mode A/B backup packaging remains blocked through P1-C4.
+Recommended next step: Mode A/B backup package design and implementation. The runtime mutation gate through P1-C4 is complete, while documented SecretStore/blob process-crash orphan windows still require package validation and later reconciliation policy.
