@@ -192,6 +192,143 @@ Phase 9B upgrades provider state to `schemaVersion: 4` with `providers[].customH
 
 Phase 10 upgrades local desktop state to `schemaVersion: 5` with managed file metadata for the mock API file skeleton, then `schemaVersion: 6` with provider model capability metadata. Old beta.11 or earlier builds should not be started against schema v5/v6 state files. Use synthetic app data for Phase 10 file tests, or back up and restore real app data before switching builds.
 
+Phase 12 P1-A serializes local state saves, uses unique same-directory temp files, flushes and syncs each complete temp file, and replaces the primary state without deleting it first. Packaging verification should run the synthetic `state_persist` tests and confirm save failures return a non-success response. P1-A does not yet add backup/restore, migration backup, future-schema protection, or in-memory rollback after a failed save.
+
+Phase 12 P1-B initializes defaults only when the primary state is missing. Other read failures stop startup. Malformed state is preserved byte-for-byte in a unique corrupt backup and requires explicit recovery; a backup failure cannot fall through to default state. Future schemas stop startup without being marked corrupt, and schemas 1-5 receive a durable original-byte backup before migration. Strict P1-A stale temp files remain ignored and preserved. Recovery UI remains pending; P1-C4 streaming transaction safety is now complete.
+
+Phase 12 P1-C1 stages pure settings and conversation mutations, persists the staged snapshot through the P1-A atomic writer, and commits live state only after persistence succeeds. Covered operations are assistant selection, current assistant model, favorites, title, pin/unpin, conversation delete, text message edit, and message delete. Missing conversation detail/stream GETs now return a virtual DTO without creating persisted state. Run the synthetic `staged_transaction`, `mutation_transaction`, `transaction_failure`, and `get_does_not_mutate` test groups and confirm success events occur only after commit.
+
+Phase 12 P1-C2 serializes Provider/SecretStore mutations and commits Provider metadata through the same staged-state helper. Key create/update uses a new copy-on-write `secretRef`; failed state persistence deletes the operation-created encrypted blob and retains the old state/secret. Blank-key upsert keeps the old key. Clear/delete commits state before old-secret cleanup. Import never restores source `secretRef` or `hasSecret` and creates no secret. Run the synthetic `provider_transaction`, `secret_compensation`, `provider_import`, `provider_delete`, and `key_clear` groups plus the full Rust test suite.
+
+P1-C2 verification must cover:
+
+- Provider import success/failure, with `hasSecret: false` and no SecretStore write.
+- Provider create/update key success, secret prepare failure, state persistence failure, and new-secret compensation.
+- Blank-key upsert preserving the existing secret without a SecretStore write.
+- Key clear and Provider delete preserving the old ref/blob on state failure.
+- Post-commit cleanup failure returning logical success with a fixed redacted warning and leaving only an unreferenced encrypted orphan.
+- Concurrent key updates, Provider mutation plus Category A mutation, and blank-key upsert plus clear completing without deadlock or lost state.
+- Safe errors containing no key, encrypted bytes, secret ref, storage path, or state body.
+- Synthetic temp state and an in-memory fake SecretStore only. Never read real app data or `mock-api/secrets/*.bin`.
+
+Phase 12 P1-C3 serializes managed file/blob operations and commits file metadata through the staged-state helper. Accepted upload batches publish all program-named blobs before one metadata/ID commit. Blob or state failure commits no partial metadata; failed state persistence compensates every operation-created final blob with bounded retry. DELETE rejects persisted numeric `metadata.fileId` references, commits a durable `deletedAt` tombstone before physical cleanup, and preserves the active blob if tombstone persistence fails. Post-commit cleanup failure remains logical success with a fixed redacted warning and an inaccessible orphan.
+
+P1-C3 verification must cover:
+
+- Single and batch upload success with unique IDs/storage keys, complete metadata/blob publication, and one staged state commit.
+- Blob write or mid-batch publish failure leaving no metadata or partial successful response and cleaning prior batch blobs.
+- State persistence failure after publication leaving live/disk/revision/`id_seq` unchanged and compensating all new blobs.
+- Compensation cleanup exhaustion returning a fixed safe failure while state references none of the residual blobs.
+- Unreferenced DELETE tombstoning metadata before blob cleanup; failed tombstone persistence keeps the original blob active.
+- Post-tombstone cleanup failure returning logical success while metadata/path GET remains unavailable; repeated DELETE is idempotent and retries cleanup.
+- Numeric image/document references returning conflict; malformed legacy URLs do not identify another file.
+- Message/conversation deletion not auto-GCing former attachments.
+- Concurrent uploads, Category A mutation, Provider transaction, and delete/GET ordering completing without duplicate IDs, lost updates, or deadlock.
+- Safe errors and fixed warnings containing no blob bytes, storage key, original file name, absolute path, state JSON, or user message.
+- The synthetic `file_transaction`, `blob_compensation`, `file_delete`, and `file_reference` groups plus the complete Rust suite. Never use real app data or real user files.
+
+Phase 12 P1-C4 commits the initial user turn before any provider/mock task, keeps generation state and deltas runtime-only during normal generation, and commits the final assistant append/replace through the staged-state helper before terminal success. Regenerate retains the old reply until atomic replacement. An explicit Stop stages and persists the currently displayed partial buffer before terminal success. Generation tokens prevent stale finish/delete races, and restart retains durable messages without resuming the stream.
+
+P1-C4 verification must cover:
+
+- Initial persistence failure: safe HTTP failure, no active generation, no provider/mock start, no generation-start/delta/terminal success, and unchanged live/disk/revision.
+- Final persistence failure for provider and mock paths: no assistant in live/disk, no revision increase, fixed persistence failure, and no `finished`.
+- Transient deltas: UI events may show progress, while live persisted conversations and `state.v1.json` contain no partial assistant reply.
+- Regenerate success atomically replaces the old reply; provider, persistence, edited-target, and deleted-target failures preserve current durable content.
+- Stop/finish race emits exactly one of `finished`, `stopped`, or `failed`; the persist-partial stop policy commits a nonempty current buffer through the staged-state helper and never creates an empty assistant message.
+- Same-conversation send/regenerate conflict, different-conversation concurrency, stale generation rejection, and conversation delete without background recreation.
+- Category A and file/provider transaction concurrency during stream/final commit without lost updates or deadlock.
+- Restart drops active runtime generation and transient text while retaining the durable user message.
+- Synthetic loopback provider wait permits a concurrent Category A transaction, proving no persisted/component/mutation/file/Provider lock spans network wait.
+- Run `streaming_transaction`, `generation_registry`, `stream_event_order`, `regenerate_transaction`, and `stop_transaction` plus `transaction_failure`, `staged_transaction`, and the complete Rust suite. P1-C4 adds 32 synthetic tests.
+
+P1-C1/P1-C2/P1-C3/P1-C4 complete the handled runtime mutation gate for Mode A/B backup package work. Do not claim that state and network are atomic, streaming resumes across restart, or every delta is durable. Do not claim that SecretStore and JSON state are fully atomic across process crashes: an unreferenced encrypted orphan can remain between new-secret prepare and state commit or between state commit and old-secret cleanup. Managed blob publication and physical deletion also retain crash-only orphan windows, and automatic orphan reconciliation/GC is not implemented.
+
+Phase 12 P2-A adds backend-only portable backup directory packages with `formatVersion: 1`. Mode A contains sanitized `state.json`, `manifest.json`, and `SHA256SUMS.txt` without managed blobs. Mode B additionally contains every active managed blob under `blobs/file-<file-id>.blob` and is the recommended portable mode. Both modes exclude SecretStore/DPAPI blobs, API keys, source secret references, active generation state, transient deltas, logs, and absolute app-data paths.
+
+P2-A verification must cover:
+
+- Mode A success, no blob directory/bytes, no blob-root read, and point-in-time state unaffected by later mutations.
+- Mode B active blob inclusion; tombstone/orphan exclusion; unreferenced active inclusion; missing active blob hard failure without Mode A downgrade.
+- Invalid storage key, symlink/non-regular/escape source, metadata size/hash mismatch, and blob copy failure produce no final package.
+- Manifest format/mode/schema/import-export/exclusion flags and sorted `fileId` records.
+- SHA256SUMS contains sorted relative paths for state/manifest/blobs, excludes itself, and matches re-read package copies.
+- Tampered state/blob/manifest, unknown entries, unsafe paths, or a `secrets/` directory fail validation before publish.
+- Mode B file lock blocks upload/delete during snapshot/copy; Category A/Provider updates produce a complete old-or-new snapshot; active generation/transient delta is excluded.
+- Concurrent exports serialize and publish unique directories. Name collisions and write/manifest/publish failures never overwrite or delete another package.
+- SecretStore fake panics on access, proving access count zero. Safe errors contain no user data, display name, storage key, secret reference, or source/destination path.
+- Run `backup_export`, `backup_mode_a`, `backup_mode_b`, `backup_manifest`, `backup_checksum`, and `backup_concurrency` plus the complete Rust suite. P2-A adds 36 synthetic tests.
+
+P2-A does not expose backup UI/API, create ZIP files, implement restore, include Mode C, clean orphans, restore active streams, or make state/blob resources crash-atomic. The next step is P2-B restore package validation and dry-run reporting without writes.
+
+Phase 12 P2-B adds internal validation and a no-write restore dry run for format v1 packages. It supports only state schema 6, Provider import/export version 4, and the existing `state-only` / `full-local-data` modes. Restore is full replacement only; merge restore and actual write-back remain unsupported.
+
+P2-B verification must cover:
+
+- Mode A reports every active managed file as potentially unavailable, retains attachment metadata/parts, and accepts only an absent or empty `blobs/` directory.
+- Mode B requires an exact one-to-one active metadata/manifest/blob set; missing, extra, tombstoned, duplicate, MIME/size/hash-mismatched, symlink, reparse, or escaped blobs fail closed.
+- Manifest format/version/schema/mode/exclusion flags and unknown fields are validated strictly. Schema 1-5 and future schemas are unsupported rather than migrated.
+- `SHA256SUMS.txt` requires 64 hex characters, exactly two spaces, controlled relative paths, no duplicates/case collisions/self-entry, and exact manifest/state/blob coverage.
+- Manifest/state are parsed and hashed from the same bounded read. Blobs are stream-hashed. Control-file and entry-count limits are enforced.
+- State IDs, map keys, branch selection, ID high-water marks, Provider/model/file metadata, custom headers/body, modality metadata, runtime flags, and attachment URLs are structurally validated.
+- Conversation text containing security terms remains valid; do not use whole-JSON keyword rejection.
+- All Providers are planned as `hasSecret: false` with memory-only replacement references. All file storage keys are replaced in memory. No planned reference/key is logged or persisted.
+- No live state, disk state, revision, ID, active generation, SSE channel, blob root, package bytes, or SecretStore value changes during dry-run.
+- A second dry-run must detect package tampering after the first. P2-C must revalidate and cannot treat a successful report as cached authorization.
+- Run `restore_dry_run`, `restore_validation`, `restore_checksum`, `restore_path`, `restore_mode_a`, `restore_mode_b`, `backup_`, and the complete Rust suite. P2-B adds 77 synthetic tests.
+
+P2-B does not create a pre-restore backup, install blobs, replace state, rollback, expose an API/UI, migrate schemas, restore API keys, support Mode C/ZIP/merge, or resume streaming. P2-C must add mandatory pre-restore backup and complete revalidation before any actual restore transaction.
+
+Phase 12 P2-C1 adds an internal offline candidate staging builder. Actual restore remains unavailable.
+
+- Re-run full format v1 package/tree/state/checksum/blob validation for every staging call; never reuse a dry-run report.
+- Confirm the stage uses a generated ASCII operation ID and same-parent temp/final names, does not overwrite another stage, and leaves no temp stage after success or handled failure.
+- Confirm every Provider and managed file receives a fresh per-attempt controlled reference/key, Provider `hasSecret` remains false, and the empty staged `secrets/` directory contains no blob.
+- Mode A must retain attachment parts/metadata, create no staged blob, and report active attachments unavailable.
+- Mode B must stream-copy exactly all active package blobs, including unreferenced active files, exclude tombstoned/unknown blobs, and recheck source plus staged size/SHA256.
+- Confirm staged state uses unique-temp/write/flush/sync/rename and leaves no state temp.
+- Confirm strict independent stage validation rejects unknown/control entries, nonempty secrets, extra/missing/tampered blobs, unsafe keys/paths, symlinks, and reparse points.
+- Confirm capacity insufficient/check failure occurs before stage creation and fails closed.
+- Confirm current `mock-api` contents remain byte-for-byte unchanged and no rollback snapshot, failed-restore directory, journal, SecretStore access, SSE, revision, or live commit occurs.
+- Run `restore_stage`, `restore_staging`, `restore_stage_mode_a`, `restore_stage_mode_b`, `restore_stage_capacity`, `restore_dry_run`, `backup_`, and the complete Rust suite. P2-C1 adds 46 dedicated synthetic tests.
+
+P2-C1 itself has no restore HTTP API, Tauri command, UI, folder picker, current-data switch, rollback, journal, Mode C, ZIP, merge, schema migration, SecretStore restoration, or orphan reconciliation. P2-C2 now supplies the mandatory local rollback snapshot and journaled directory commit/rollback as a separate unwired internal primitive.
+
+Phase 12 P2-C2 adds an internal offline journaled commit and handled-failure rollback engine. It remains unwired and is not a user-facing restore feature.
+
+- Confirm the exact P2-C1 stage is re-opened and fully validated before commit; a prior dry-run or staging result is not cached authorization.
+- Confirm current `mock-api` is read-only prevalidated as schema 6 and is never deleted or directly overwritten.
+- Confirm the commit order is current to `mock-api.pre-restore.<operation-id>`, then stage to current, with `commit-old-moved` and `commit-new-moved` journal boundaries.
+- Confirm journal creation/update uses create-new or unique temp, write/flush/sync, atomic replacement, and fail-closed handling. Windows directory durability is best effort and does not claim complete power-loss atomicity.
+- Confirm publication failure after old move restores the original current and records `rollback-completed` while retaining the stage and journal.
+- Confirm provisional-new validation failure preserves it as `mock-api.failed-restore.<operation-id>`, restores/revalidates the original current, and records `rollback-completed`.
+- Confirm rollback rename/validation failure records `rollback-failed` when possible, retains evidence, returns manual recovery required, and never creates default state.
+- Confirm encrypted secret blobs in the rollback snapshot remain opaque: no SecretStore access, blob read, decrypt, copy, or log occurs.
+- Confirm a successful P2-C2 call returns only `PendingStartupValidation`, leaves the rollback snapshot and journal at `commit-new-moved`, and does not write `startup-validation`/`completed` or start the mock API.
+- Run `restore_commit`, `restore_journal`, `restore_rollback`, `restore_commit_failure`, `restore_stage`, `restore_dry_run`, and the complete Rust suite. P2-C2 adds 57 dedicated synthetic tests.
+
+P2-C2 still has no HTTP API, Tauri command, UI, folder picker, Mode C, ZIP, merge, SecretStore restoration, or orphan reconciliation. P2-C3 now supplies startup integration and interrupted-operation recovery internally, but restore remains unavailable to users.
+
+Phase 12 P2-C3 adds pre-load restore reconciliation and guarded provisional startup:
+
+- Confirm reconciliation runs before SecretStore construction, normal persistence load, default initialization, migration/corrupt backup, router/runtime setup, and listener binding.
+- Confirm strict journal parsing rejects malformed, unknown-field/phase, future-version, oversized, linked/reparse, and invalid-operation journals while preserving stale valid journal temps.
+- Confirm artifact inventory rejects case collisions, operation mismatch, multiple dangerous operation IDs, rollback/failed data without a main journal, and ambiguous topology without touching unrelated directories.
+- Confirm no-journal stage/stage-temp candidates remain unpublished and normal first-run NotFound initialization still works.
+- Confirm `staging`/`backup-current`/`commit-old-moved` reconcile conservatively to validated old current plus `rollback-completed`.
+- Confirm `commit-new-moved`/`startup-validation` revalidate exact Mode A/B candidate layout every startup and never reuse an old validation result.
+- Confirm provisional load is exact schema 6 and produces no default state, migration, corrupt backup, pre-migration backup, state write, or same-process retry on failure.
+- Confirm a matching private token writes `completed` only after state/storage ownership and before listener readiness; stale token, phase change, or completion write failure blocks readiness.
+- Confirm provisional load failure preserves failed-new, restores/revalidates rollback, writes `rollback-completed`, and returns safe startup failure.
+- Confirm `rollback-completed` allows no residual, one stage residual, or one failed-new residual, but rejects stage plus failed-new, temp-stage, or a retained rollback as topology conflicts.
+- Confirm `rollback-failed` always blocks and `completed` retains journal/rollback without automatic rollback on later ordinary errors.
+- Confirm recovery never accesses SecretStore or opens/hashes/decrypts opaque secret blobs, and all errors remain free of paths, operation IDs, state/content, storage keys, and secret references.
+- Run `restore_recovery`, `restore_startup`, `restore_reconciliation`, `restore_crash`, all P2-C2 filters, and the complete Rust suite. P2-C3 adds 82 dedicated synthetic tests.
+
+P2-C3 does not add restore API/UI, native folder picker, package selection, confirmation, shutdown/restart orchestration, progress reporting, artifact cleanup, Mode C, ZIP, merge, schema restore migration, portable-secret restoration, orphan GC, or stream resume.
+
+Phase 12 backend acceptance is recorded in `docs/rikkadesk-phase-12-backend-acceptance-report.md`. Required release wording: **Backend safety chain accepted. User-facing restore unavailable.** Do not describe backup/restore as fully released.
+
 It may contain:
 
 - settings

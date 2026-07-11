@@ -99,6 +99,12 @@ export interface ConversationErrorEventDto {
   message: string;
 }
 
+export interface ConversationGenerationTerminalEventDto {
+  type: "finished" | "stopped" | "failed";
+  generationId: number;
+  reason?: string;
+}
+
 export interface MessageSearchResultDto {
   nodeId: string;
   messageId: string;
