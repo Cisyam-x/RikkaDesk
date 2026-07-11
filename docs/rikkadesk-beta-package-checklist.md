@@ -292,7 +292,22 @@ Phase 12 P2-C1 adds an internal offline candidate staging builder. Actual restor
 - Confirm current `mock-api` contents remain byte-for-byte unchanged and no rollback snapshot, failed-restore directory, journal, SecretStore access, SSE, revision, or live commit occurs.
 - Run `restore_stage`, `restore_staging`, `restore_stage_mode_a`, `restore_stage_mode_b`, `restore_stage_capacity`, `restore_dry_run`, `backup_`, and the complete Rust suite. P2-C1 adds 46 dedicated synthetic tests.
 
-P2-C1 has no restore HTTP API, Tauri command, UI, folder picker, current-data switch, rollback, journal, Mode C, ZIP, merge, schema migration, SecretStore restoration, or orphan reconciliation. P2-C2 must implement the mandatory local rollback snapshot and journaled directory commit/rollback before actual restore can be exposed.
+P2-C1 itself has no restore HTTP API, Tauri command, UI, folder picker, current-data switch, rollback, journal, Mode C, ZIP, merge, schema migration, SecretStore restoration, or orphan reconciliation. P2-C2 now supplies the mandatory local rollback snapshot and journaled directory commit/rollback as a separate unwired internal primitive.
+
+Phase 12 P2-C2 adds an internal offline journaled commit and handled-failure rollback engine. It remains unwired and is not a user-facing restore feature.
+
+- Confirm the exact P2-C1 stage is re-opened and fully validated before commit; a prior dry-run or staging result is not cached authorization.
+- Confirm current `mock-api` is read-only prevalidated as schema 6 and is never deleted or directly overwritten.
+- Confirm the commit order is current to `mock-api.pre-restore.<operation-id>`, then stage to current, with `commit-old-moved` and `commit-new-moved` journal boundaries.
+- Confirm journal creation/update uses create-new or unique temp, write/flush/sync, atomic replacement, and fail-closed handling. Windows directory durability is best effort and does not claim complete power-loss atomicity.
+- Confirm publication failure after old move restores the original current and records `rollback-completed` while retaining the stage and journal.
+- Confirm provisional-new validation failure preserves it as `mock-api.failed-restore.<operation-id>`, restores/revalidates the original current, and records `rollback-completed`.
+- Confirm rollback rename/validation failure records `rollback-failed` when possible, retains evidence, returns manual recovery required, and never creates default state.
+- Confirm encrypted secret blobs in the rollback snapshot remain opaque: no SecretStore access, blob read, decrypt, copy, or log occurs.
+- Confirm a successful P2-C2 call returns only `PendingStartupValidation`, leaves the rollback snapshot and journal at `commit-new-moved`, and does not write `startup-validation`/`completed` or start the mock API.
+- Run `restore_commit`, `restore_journal`, `restore_rollback`, `restore_commit_failure`, `restore_stage`, `restore_dry_run`, and the complete Rust suite. P2-C2 adds 57 dedicated synthetic tests.
+
+P2-C2 still has no HTTP API, Tauri command, UI, folder picker, startup integration, interrupted-operation recovery, Mode C, ZIP, merge, SecretStore restoration, or orphan reconciliation. P2-C3 must reconcile journal/directory crash states and validate startup before any restore can be exposed or launched.
 
 It may contain:
 

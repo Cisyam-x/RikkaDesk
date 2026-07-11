@@ -232,8 +232,10 @@ The portable package and rollback snapshot are different artifacts:
 
 Actual staging must generate fresh local Provider secret references and file storage keys. It must not reuse P2-B deterministic planned values. After source validation, package content is copied and revalidated inside staging; commit reads only the staging copy. A prior dry-run never permits P2-C to skip this work.
 
-P2-C1 now implements an internal staging writer only. It revalidates format v1 on every call, creates fresh local Provider references and file storage keys, builds an independently validated same-volume candidate `mock-api` directory, and never accesses SecretStore or current formal data. No actual restore commit, rollback operation, startup maintenance integration, HTTP API, Tauri command, or UI exists yet.
+P2-C1 implements an internal staging writer. It revalidates format v1 on every call, creates fresh local Provider references and file storage keys, builds an independently validated same-volume candidate `mock-api` directory, and never accesses SecretStore or current formal data.
+
+P2-C2 now implements an internal offline journaled directory commit and handled-failure rollback. It revalidates the stage, read-only validates current schema 6 data, preserves the complete current `mock-api` directory by same-parent rename, publishes the stage by rename, and retains both the rollback snapshot and journal. Current encrypted secret blobs are opaque rollback data and are never read or decrypted. Success stops at `commit-new-moved` with `PendingStartupValidation`; no HTTP API, Tauri command, UI, startup integration, or user-consumable restore exists.
 
 ## Deferred Work
 
-P2-C1 offline candidate staging is implemented without switching current data. P2-C2 must add mandatory rollback snapshot, journal, directory commit, and rollback. P2-C3 must add startup validation and interrupted-restore recovery. Restore UI/commands, ZIP packaging, Mode C, merge restore, automatic orphan reconciliation, active-stream recovery, and cross-resource crash atomicity remain unimplemented.
+P2-C1 offline candidate staging and P2-C2 mandatory rollback snapshot, journal, directory commit, and handled-failure rollback are implemented as unwired internal primitives. P2-C3 must add startup validation and interrupted-restore recovery before any restore can be consumed. Restore UI/commands, ZIP packaging, Mode C, merge restore, automatic orphan reconciliation, active-stream recovery, and cross-resource crash atomicity remain unimplemented.

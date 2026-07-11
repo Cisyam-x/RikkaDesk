@@ -42,6 +42,9 @@ use tokio::{
     sync::{broadcast, Mutex, Notify, RwLock},
 };
 use tower_http::cors::{Any, CorsLayer};
+
+mod restore_commit;
+
 #[cfg(windows)]
 use windows_sys::Win32::{
     Foundation::{GetLastError, LocalFree},

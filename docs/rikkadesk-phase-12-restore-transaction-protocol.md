@@ -1,6 +1,6 @@
 # RikkaDesk Phase 12 Restore Transaction Protocol
 
-This document defines the Phase 12 P2-C0 protocol for a future actual full-replacement restore and records the P2-C1 offline staging implementation. P2-C1 builds synthetic/internal candidate staging directories only. It does not commit restore, expose an HTTP API or Tauri command, add UI, access SecretStore, or modify the current schema.
+This document defines the Phase 12 P2-C0 protocol for a future actual full-replacement restore and records the P2-C1 offline staging and P2-C2 journaled directory commit implementations. These are internal offline primitives only. They expose no HTTP API, Tauri command, or UI, do not access SecretStore, and do not modify the current schema.
 
 ## Current Boundary
 
@@ -11,7 +11,8 @@ This document defines the Phase 12 P2-C0 protocol for a future actual full-repla
 - Mode A (`state-only`) and Mode B (`full-local-data`) export are implemented.
 - Format v1 validation and no-write dry-run are implemented.
 - P2-C1 offline Mode A/Mode B candidate staging is implemented with complete package revalidation, fresh Provider references/file storage keys, capacity gating, atomic staged-state write, streamed blob copy, and independent validation before and after publication.
-- Actual restore, rollback execution, startup integration, and UI are not implemented.
+- P2-C2 implements a mandatory rollback snapshot, atomic restore journal, same-parent directory commit, and handled-failure rollback behind an internal offline gate.
+- A successful P2-C2 commit stops at `commit-new-moved` and returns `PendingStartupValidation`. Startup validation, interrupted-operation reconciliation, restore UI/API, and user orchestration are not implemented.
 - Mode C, ZIP, merge restore, schema migration during restore, and stream resume remain deferred.
 
 The sole format v1 authority is `docs/rikkadesk-phase-12-backup-package-format.md`. A dry-run report is informational and is never authorization to skip validation during an actual restore.
@@ -189,6 +190,7 @@ Allowed phases:
 - `startup-validation`
 - `completed`
 - `rollback-required`
+- `rollback-completed`
 - `rollback-failed`
 
 The journal must not contain:
@@ -200,7 +202,7 @@ The journal must not contain:
 - storage keys or secret references
 - API keys, credentials, or encrypted secret content
 
-Each transition uses a unique temp journal file, `write_all`, `flush`, `sync_all`, and atomic replacement. The executor must sync the journal parent directory where the platform permits it. A journal transition is written only after the preceding filesystem action is durably observed.
+Each transition uses a unique temp journal file, `write_all`, `flush`, `sync_all`, and atomic replacement. Initial creation uses create-new semantics and never overwrites an existing journal. The executor syncs the parent directory where the platform provides a reliable primitive. Windows currently uses a best-effort directory-handle barrier because a portable directory `fsync` equivalent is unavailable; complete power-loss durability is not claimed. A journal transition is written only after the preceding filesystem action is observed.
 
 Journal creation does not make an incomplete staging directory official. Directory existence and journal phase must agree; ambiguity fails closed.
 
@@ -260,6 +262,7 @@ If staging cannot be renamed to current after old data moved:
 3. Rename `mock-api.pre-restore.<operation-id>` back to `mock-api`.
 4. Revalidate the restored original directory before allowing startup.
 5. Preserve staging and journal for controlled later cleanup.
+6. Write `rollback-completed` only after the restored original directory passes read-only validation.
 
 ### Startup Validation Fails
 
@@ -271,6 +274,7 @@ If the new current directory fails offline startup validation:
 4. Revalidate the original directory.
 5. Do not create default state.
 6. Keep the failed directory and journal for local diagnosis.
+7. Write `rollback-completed` only after the restored original directory passes read-only validation.
 
 ### Rollback Fails
 
@@ -341,13 +345,16 @@ Logs, journal, UI, and reports must not include absolute paths, user names, stat
 
 The implementation accepts only a package root and trusted app-data parent. It has no `MockApiState` or SecretStore parameter, creates only its own `mock-api.restore-stage.tmp.<operation-id>` and validated `mock-api.restore-stage.<operation-id>` directories, and never creates a rollback snapshot or restore journal. Forty-six dedicated synthetic tests cover Mode A/B, fresh normalization, TOCTOU/hash checks, capacity, strict layout, failure cleanup, publication, independent revalidation, and unchanged current data.
 
-### P2-C2: Rollback Snapshot, Journal, Commit, And Rollback
+### P2-C2: Rollback Snapshot, Journal, Commit, And Rollback (Completed Internally)
 
-- Add the mandatory current-directory rename snapshot.
-- Implement journal atomic replacement and phase reconciliation.
-- Implement old/new directory rename commit.
-- Implement rollback and failed-restore preservation.
-- Add fault injection at every filesystem/journal boundary.
+- The commit API accepts only a trusted app-data parent and a controlled numeric operation ID. It derives current, stage, rollback, failed-new, and journal paths internally and rejects traversal, links/reparse points, collisions, an existing journal, or unrelated restore artifacts.
+- A process-wide mutex plus a trusted offline gate prevents concurrent or active-runtime commit. The offline gate is checked before validation and again immediately before the first directory rename.
+- The candidate stage is freshly re-opened and validated with the P2-C1 validator. Current data is prevalidated read-only from schema 6 state and structural directory metadata; encrypted secret blobs are preserved opaquely and are never opened, enumerated, decrypted, copied, or logged.
+- The commit order is fixed: journal `staging`/`backup-current`, rename current to the mandatory rollback directory, record `commit-old-moved`, rename stage to current, record `commit-new-moved`, and revalidate the provisional new current.
+- If publication fails after the old directory moved, rollback restores the original directory and records `rollback-completed`. If the provisional new current exists, it is first preserved as `mock-api.failed-restore.<operation-id>`, then the original directory is restored and validated.
+- A rollback rename or validation failure records `rollback-failed` when possible, retains all evidence, blocks automatic continuation, and returns a fixed manual-recovery error. Journal update ambiguity also fails closed.
+- Success returns only `PendingStartupValidation`; it does not write `startup-validation` or `completed`, start the mock API, delete the rollback snapshot, or clean operation artifacts.
+- Fifty-seven dedicated synthetic tests cover validation, operation IDs, conflicts, journal create/write/flush/sync/replace faults, both rename boundaries, rollback success/failure, journal ambiguity, concurrency, secret opacity, and the P2-C3 success boundary.
 
 ### P2-C3: Startup Validation And Interrupted-Restore Recovery
 
@@ -356,6 +363,8 @@ The implementation accepts only a package root and trusted app-data parent. It h
 - Add synthetic crash-state matrix tests.
 - Prove no default-state fallback on restore/recovery failure.
 - Keep HTTP API and UI absent.
+
+P2-C2 does not make a restore user-consumable. P2-C3 must reconcile the retained journal and directory topology after process interruption, repeat startup validation before any write, advance `startup-validation`/`completed` only when safe, and refuse default-state fallback on ambiguity.
 
 ### P5: User Orchestration
 
@@ -401,4 +410,4 @@ Every test uses synthetic temp directories, state, package bytes, and opaque non
 - Journal and startup validation prevent ambiguous state from launching.
 - P2-C does not support merge restore, Mode C, ZIP, schema auto-migration, or stream resume.
 
-The recommended next implementation is P2-C2 rollback snapshot/journal/commit design and implementation. P2-C2 must revalidate a P2-C1 candidate and must not expose actual restore until rollback and all commit-boundary fault tests pass.
+P2-C2 now revalidates and commits a P2-C1 candidate with mandatory rollback and commit-boundary fault coverage. The recommended next implementation is P2-C3 startup validation and interrupted-operation reconciliation; actual restore must remain unexposed until that recovery matrix passes.

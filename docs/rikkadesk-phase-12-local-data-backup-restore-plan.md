@@ -2,7 +2,7 @@
 
 This document began as the Phase 12 P0 audit and design plan and is now the living implementation and status plan for local persistence, backup, restore, corruption recovery, schema migration, managed file blobs, and Windows DPAPI secret handling.
 
-The original P0 audit was documentation only. Later sections record the implemented mutation hardening, portable Mode A/Mode B backup export, no-write restore validation, and the still-unimplemented actual restore transaction boundary.
+The original P0 audit was documentation only. Later sections record the implemented mutation hardening, portable Mode A/Mode B backup export, no-write restore validation, offline staging, and the internal journaled directory commit/rollback boundary.
 
 ## Current Status
 
@@ -18,7 +18,7 @@ The original P0 audit was documentation only. Later sections record the implemen
 - Runtime mutation hardening: P1-C1 pure state, P1-C2 Provider/SecretStore, P1-C3 managed file/blob handled-failure semantics, and P1-C4 streaming lifecycle semantics are completed.
 - Portable backup export: backup package format v1 Mode A (`state-only`) and Mode B (`full-local-data`) are implemented without secrets.
 - Restore validation: P2-B no-write dry-run validation is implemented; it does not authorize or perform restore.
-- Actual restore: not implemented. P2-C0 defines the offline transaction protocol; P2-C1 candidate staging is implemented; P2-C2 commit/rollback and P2-C3 crash reconciliation remain future work.
+- Actual restore: not user-consumable. P2-C0 defines the offline transaction protocol; P2-C1 candidate staging and P2-C2 journaled commit/handled rollback are implemented internally; P2-C3 startup validation and interrupted-operation reconciliation remain required.
 
 ## P0 Decisions
 
@@ -795,7 +795,23 @@ P2-C1 implements an internal offline staging builder with no API/UI/runtime call
 - Only a fully validated temp stage is renamed to the candidate final name, then re-opened and validated again. Failures best-effort remove only the current operation's owned stage.
 - Forty-six dedicated synthetic tests use no real app data, backup, user file, secret blob, API key, or provider.
 
-The builder has no `MockApiState` or SecretStore parameter and does not write, rename, enumerate, or replace the current formal `mock-api` directory. It creates no pre-restore/failed-restore directory or journal and emits no SSE/revision/live commit. A final stage is only a candidate directory, not restored or official data. P2-C2 remains responsible for rollback snapshot, journal, commit, and rollback.
+The builder has no `MockApiState` or SecretStore parameter and does not write, rename, enumerate, or replace the current formal `mock-api` directory. It creates no pre-restore/failed-restore directory or journal and emits no SSE/revision/live commit. A final stage is only a candidate directory, not restored or official data. P2-C2 consumes that controlled stage through a separate offline commit primitive.
+
+## P2-C2 Journaled Commit And Rollback Implementation Status
+
+P2-C2 implements an internal, unwired offline commit engine:
+
+- The engine accepts only a trusted app-data parent and a controlled three-component numeric operation ID. All operation paths are derived internally beside `mock-api`; no arbitrary restore path is accepted.
+- A process mutex and twice-checked trusted offline permit gate the transaction. Existing journals, operation collisions, unrelated rollback/failed artifacts, links/reparse points, invalid current state, and invalid stages fail before current data is renamed.
+- The P2-C1 stage validator is rerun immediately before commit. Current `state.v1.json` is validated read-only as schema 6, while existing secret blobs and allowed diagnostic data remain opaque and untouched.
+- Journal updates use create-new or unique-temp durable writes plus atomic replacement. Directory commit is current to rollback, then stage to current; no current-directory delete or direct state overwrite exists.
+- A handled failure after the old directory moves restores rollback to current. If a provisional new current exists, it is preserved as a failed-restore directory first. The restored original is revalidated before `rollback-completed` is recorded.
+- Rollback failure or journal ambiguity fails closed, retains operation evidence, and requires manual/P2-C3 recovery. No default state is created.
+- Success returns `PendingStartupValidation` and leaves journal phase `commit-new-moved`, the rollback snapshot, and provisional new current in place. It does not write `startup-validation`/`completed`, start the mock API, or expose an API/UI.
+- Windows parent-directory durability remains a documented best-effort handle barrier rather than a claim of complete power-loss atomicity.
+- Fifty-seven synthetic P2-C2 tests cover journal and rename fault boundaries, rollback paths, operation conflicts, concurrency, secret opacity, and the pending-startup boundary. No real app data, user backup, user file, secret, API key, or provider is used.
+
+P2-C3 remains mandatory before launch or user orchestration. It must reconcile retained journal/directory states after interruption, repeat read-only validation, decide whether to continue or roll back, and block startup on ambiguity without default-state fallback.
 
 ### P2-A: Portable Metadata/Full Backup Export Package (Completed)
 
@@ -920,6 +936,6 @@ Current P1-A/P1-B/P1-C1/P1-C2/P1-C3/P1-C4 status:
 - Runtime mutation consistency risk exists: Reduced through P1-C4 for Category A, Provider/SecretStore, managed file/blob, and streaming handled-failure paths. State/network are not one atomic transaction and active streams do not resume after restart.
 - State/blob consistency risk exists: Handled failures are compensated/tombstoned after P1-C3, but crash-only orphan windows and restore reconciliation remain.
 - DPAPI secret blobs are portable across machines/users: No.
-- A formal Mode A/B backup package exists: Yes, format v1 export, P2-B strict validation/dry-run, and P2-C1 independently validated candidate staging. Actual restore does not exist.
+- A formal Mode A/B backup package exists: Yes, format v1 export, P2-B strict validation/dry-run, P2-C1 independently validated candidate staging, and P2-C2 internal journaled commit/handled rollback. A user-consumable restore does not exist because P2-C3 recovery/startup integration is still required.
 
-Recommended next step: P2-C2 rollback snapshot, journal, directory commit, and rollback. Do not expose actual restore until commit-boundary fault injection and rollback tests pass.
+Recommended next step: P2-C3 startup validation and interrupted-restore reconciliation. Do not expose actual restore until journal/directory crash-state recovery, no-default fallback, and startup ownership tests pass.
