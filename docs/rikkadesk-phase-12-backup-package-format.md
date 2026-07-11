@@ -221,6 +221,19 @@ Dry-run reports only versions, mode, safe counts, fixed warnings, and normalizat
 
 The validator takes no `MockApiState` or SecretStore handle. It cannot modify live state, disk state, revision, IDs, SSE, active generations, the formal blob root, or encrypted secret blobs. It does not create a pre-restore backup or temp restore directory. A successful dry run is not an authorization token or validation cache: P2-C must completely re-read and revalidate the package immediately before any restore transaction.
 
+## P2-C0 Actual Restore Protocol Boundary
+
+The future actual restore protocol is defined in `docs/rikkadesk-phase-12-restore-transaction-protocol.md`. Actual restore is offline full replacement only: RikkaDesk must be closed, format v1 must be completely revalidated, and commit must use a same-volume staged `mock-api` directory plus a mandatory local rollback snapshot.
+
+The portable package and rollback snapshot are different artifacts:
+
+- A portable Mode A/B package always remains secret-free and can never restore an API key or source-machine secret reference.
+- A local rollback snapshot is an opaque rename-preserved copy of the current complete `mock-api` directory. It can contain encrypted secret blobs solely so the same-machine pre-restore state can be restored after failure. It is not portable and must never be shared or uploaded.
+
+Actual staging must generate fresh local Provider secret references and file storage keys. It must not reuse P2-B deterministic planned values. After source validation, package content is copied and revalidated inside staging; commit reads only the staging copy. A prior dry-run never permits P2-C to skip this work.
+
+No actual restore writer, rollback operation, startup maintenance integration, HTTP API, Tauri command, or UI exists yet.
+
 ## Deferred Work
 
-P2-C actual restore must add mandatory pre-restore backup, fresh validation, staged blob/state installation, rollback, and crash-boundary policy. Restore UI/commands, ZIP packaging, Mode C, merge restore, automatic orphan reconciliation, active-stream recovery, and cross-resource crash atomicity remain unimplemented.
+P2-C1 must add offline staging without switching current data. P2-C2 must add mandatory rollback snapshot, journal, directory commit, and rollback. P2-C3 must add startup validation and interrupted-restore recovery. Restore UI/commands, ZIP packaging, Mode C, merge restore, automatic orphan reconciliation, active-stream recovery, and cross-resource crash atomicity remain unimplemented.

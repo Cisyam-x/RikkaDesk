@@ -1,12 +1,12 @@
 # RikkaDesk Phase 12 Local Data Backup, Restore, And Migration Safety Plan
 
-This document is the Phase 12 P0 audit and design plan. It records the current local persistence behavior and defines safe boundaries for future backup, restore, corruption recovery, schema migration, managed file blobs, and Windows DPAPI secret handling.
+This document began as the Phase 12 P0 audit and design plan and is now the living implementation and status plan for local persistence, backup, restore, corruption recovery, schema migration, managed file blobs, and Windows DPAPI secret handling.
 
-P0 is documentation only. It does not implement backup or restore APIs, add UI, read real app data, change `state.v1.json`, change `schemaVersion`, change provider import/export, or create a backup archive.
+The original P0 audit was documentation only. Later sections record the implemented mutation hardening, portable Mode A/Mode B backup export, no-write restore validation, and the still-unimplemented actual restore transaction boundary.
 
 ## Current Status
 
-- Baseline commit: `6767eb841169db63b047ed280b6c1a2f3ca4b349`.
+- Original Phase 12 audit baseline commit: `6767eb841169db63b047ed280b6c1a2f3ca4b349`.
 - Stable runtime tag: `rikkadesk-v0.1.0-beta.14`.
 - App/package version: `0.1.0`.
 - State filename: `state.v1.json`.
@@ -16,6 +16,9 @@ P0 is documentation only. It does not implement backup or restore APIs, add UI, 
 - GitHub Release: No.
 - Real-provider image input: not enabled by default.
 - Runtime mutation hardening: P1-C1 pure state, P1-C2 Provider/SecretStore, P1-C3 managed file/blob handled-failure semantics, and P1-C4 streaming lifecycle semantics are completed.
+- Portable backup export: backup package format v1 Mode A (`state-only`) and Mode B (`full-local-data`) are implemented without secrets.
+- Restore validation: P2-B no-write dry-run validation is implemented; it does not authorize or perform restore.
+- Actual restore: not implemented. P2-C0 defines the offline transaction protocol; P2-C1 staging, P2-C2 commit/rollback, and P2-C3 crash reconciliation remain future work.
 
 ## P0 Decisions
 
@@ -368,7 +371,7 @@ On Windows, `hasSecret` existence checks use file metadata and do not read/decry
 
 State without secret blobs:
 
-- Provider non-sensitive configuration and `secretRef` are restored.
+- Provider non-sensitive configuration is restored, but package/source `secretRef` values are never treated as usable and are replaced for a future actual restore.
 - Secret lookup reports missing.
 - The provider key must be entered again.
 - `secretRef` is an identifier, not secret material, but it does not restore credentials.
@@ -510,7 +513,7 @@ Restore result:
 - Conversation text and settings can be restored.
 - Attachments can display unavailable/missing states.
 - Provider configuration remains, but API keys must be entered again.
-- The manifest must say `includesFiles: false` and `includesSecrets: false`.
+- The format v1 manifest must use `mode: "state-only"`, `managedBlobsIncluded: false`, and `secretsIncluded: false`.
 
 Use Mode A only when incomplete attachment restoration is acceptable.
 
@@ -519,7 +522,7 @@ Use Mode A only when incomplete attachment restoration is acceptable.
 Includes:
 
 - `state.v1.json`
-- managed file blobs referenced by active metadata
+- every managed file blob represented by active metadata, including active unreferenced files
 - backup manifest
 - per-file SHA256 checksums
 - consistency report
@@ -540,13 +543,9 @@ Restore result:
 
 Mode B is the recommended default portable backup format.
 
-### Mode C: Same-Machine Secure Backup
+### Mode C: Same-Machine Secure Backup (Deferred)
 
-Includes:
-
-- everything in Mode B
-- encrypted secret blobs
-- manifest declaration `includesSecrets: true`
+Mode C is not part of portable backup format v1. Format v1 validation requires `secretsIncluded: false` and rejects any secret directory or encrypted secret entry.
 
 Restrictions:
 
@@ -559,102 +558,17 @@ Restrictions:
 
 Recommendation: defer Mode C implementation. Phase 12 should deliver Modes A/B and a clear secret re-entry workflow first.
 
-## Backup Manifest Draft
+## Historical Backup Manifest Draft
 
-The package manifest should be UTF-8 JSON and contain metadata only:
+The earlier P0 draft used fields such as `backupMode`, `includesFiles`, and `includesSecrets`. That draft is historical, is not accepted by the implementation, and must not be used to build or validate a package.
 
-```json
-{
-  "formatVersion": 1,
-  "appVersion": "0.1.0",
-  "schemaVersion": 6,
-  "createdAt": "<ISO-8601>",
-  "sourcePlatform": "windows",
-  "sourceAppIdentifier": "com.cisyamx.rikkadesk",
-  "backupMode": "metadata-only | full-without-secrets | same-machine-secure",
-  "includesState": true,
-  "includesFiles": false,
-  "includesSecrets": false,
-  "fileCount": 0,
-  "checksums": {
-    "state.v1.json": "<SHA256>"
-  },
-  "notes": []
-}
-```
-
-Manifest rules:
-
-- No API key, Authorization value, custom header value, cookie, token, or password.
-- No secret blob content.
-- No chat content or chat summary.
-- No Windows username, user profile path, or absolute path.
-- Every package entry uses a normalized relative archive path.
-- Checksums cover the exact archived bytes.
-- `fileCount` and `checksums` must agree with archive contents.
-- Unknown files in the package fail validation rather than being silently extracted.
-- `secretRef` may remain inside state because it is an identifier, not credential material. A portable restore must still mark the provider as missing its key until a secret is re-entered.
-
-Recommended additions during P2/P3 design:
-
-- package creation ID
-- state saved timestamp
-- total uncompressed bytes
-- active/missing/orphan file counts
-- archive entry allowlist version
-
-None of those fields may contain user content or local paths.
+The only formal format v1 authority is `docs/rikkadesk-phase-12-backup-package-format.md`. Its manifest uses `format`, `formatVersion`, `mode`, `stateSchemaVersion`, `providerImportExportVersion`, fixed exclusion flags, one state record, and controlled file records. Format v1 supports only `state-only` and `full-local-data`, always requires `secretsIncluded: false`, and never restores a package/source secret reference as usable credentials.
 
 ## Safe Restore Transaction Design
 
-Future restore must be offline or coordinated by a helper that can guarantee the running app has released state/blob files.
+The formal transaction, staging, journal, commit, rollback, crash recovery, and disk-space protocol is now defined only in `docs/rikkadesk-phase-12-restore-transaction-protocol.md`.
 
-Required sequence:
-
-1. Require RikkaDesk to be fully closed.
-2. Confirm no RikkaDesk process is running.
-3. Open the backup as data, not as executable content.
-4. Read and parse the manifest before extracting entries.
-5. Validate `formatVersion` against the supported backup format.
-6. Validate `schemaVersion` against the current app's supported migration range.
-7. Validate `sourceAppIdentifier` exactly.
-8. Validate backup mode and reject unexpected secret entries.
-9. Validate entry names against an allowlist and reject traversal, absolute paths, links, devices, and duplicate names.
-10. Check available disk space for staging, current-data backup, and rollback.
-11. Verify every checksum before changing app data.
-12. Create a timestamped automatic backup of current app data without reading secret contents.
-13. Extract/copy restore contents into a unique sibling staging directory on the same volume.
-14. Parse staged state JSON and validate schema, required fields, IDs, storage keys, relative paths, MIME, and size metadata.
-15. Validate state/blob consistency and produce missing/orphan reports.
-16. For Mode A, explicitly accept unavailable attachments before commit.
-17. For Mode C, attempt DPAPI validation without logging plaintext; abort or restore providers without secrets according to explicit user choice.
-18. Write a restore journal containing only operation IDs, phase names, and safe error codes.
-19. Commit by preserving current app data as rollback data and replacing it with the fully validated staged snapshot.
-20. If commit fails, restore the original app data and leave the staged directory for safe cleanup.
-21. Keep failed-restore diagnostics free of chat content, file content, secrets, usernames, and absolute paths.
-22. On first startup, perform integrity checks before allowing new writes.
-23. Clear the restore journal only after startup validation succeeds.
-
-Direct overwrite of current app data is forbidden.
-
-### Failure Handling
-
-| Failure | Required behavior |
-|---|---|
-| Power loss during staging | Current app data remains untouched; stale staging is detected next run. |
-| Power loss during commit | Journal identifies whether rollback or completion is required. |
-| RikkaDesk starts during restore | Abort before commit; do not race the app writer. |
-| Disk space insufficient | Abort before automatic backup/extraction changes current data. |
-| Defender/antivirus locks a file | Abort and retain original data; report a safe locked-file error. |
-| Checksum mismatch | Reject the package; do not extract/restore it. |
-| Unsupported schema | Preserve both package and current data; require a compatible build. |
-| Missing blob | Report it; require explicit Mode A-style acceptance or abort Mode B/C. |
-| Orphan blob | Report it; do not automatically trust or expose it. |
-| DPAPI decryption failure | Keep provider config, mark secret unavailable, never expose/delete blob silently. |
-| Package modified or contains unknown entry | Reject before app data changes. |
-| Rollback fails | Stop, preserve all directories/journal, and require manual recovery; never create default state over them. |
-
-Restore failure must not silently create and save default state over user data.
+The approved P2-C0 decision is offline full replacement: RikkaDesk and the mock API must be stopped, the package must be completely revalidated, staging must become an independently valid same-volume `mock-api` directory, and current data must be preserved by directory rename before staged data becomes official. Direct state overwrite, live in-process restore, merge restore, Mode C, and default-state fallback are forbidden.
 
 ## Documentation Audit
 
@@ -666,7 +580,7 @@ Current docs describe:
 - avoiding old builds against newer schemas
 - private handoff checks
 
-They do not define a formal backup package, manifest, checksum set, consistent state/blob snapshot, restore transaction, or portable-secret policy. Manual folder copies are therefore not a supported portable backup format.
+Mode A/B export and P2-B validation/dry-run now define a formal package, manifest, checksum set, and consistent export snapshot. P2-C0 defines the future offline restore protocol, but no actual restore writer exists. Manual folder copies are not a supported portable backup format.
 
 Phase 12 owns formal app data backup/restore and migration safety semantics.
 
@@ -813,7 +727,7 @@ The complete call-site inventory, lock order, external-side-effect matrix, compe
 - Defines stop as discard-partial, makes terminal events mutually exclusive, and prevents old tasks from recreating deleted conversations.
 - Adds 32 synthetic tests, including blocked loopback SSE with a concurrent Category A transaction.
 
-The runtime mutation gate through P1-C4 is complete. Mode A/B backup package work may begin, subject to the documented SecretStore/blob process-crash residuals and package-level validation requirements.
+The runtime mutation gate through P1-C4 is complete. Mode A/B export and P2-B validation/dry-run are also complete; actual offline restore remains unimplemented.
 
 ## P2-A Implementation Status
 
@@ -851,6 +765,20 @@ Phase 12 P2-B implements internal restore package validation and a no-write dry-
 - P2-B adds 77 synthetic restore tests; no real app data, secret, user backup, user file, API key, or provider is used.
 
 P2-C must revalidate the selected package, create a mandatory pre-restore backup, and then implement an atomic staged restore/rollback transaction. None of those write paths exists in P2-B.
+
+## P2-C0 Protocol Design Status
+
+P2-C0 defines the offline full-replacement restore protocol in `docs/rikkadesk-phase-12-restore-transaction-protocol.md`.
+
+- Live in-process restore and public path-based HTTP restore are rejected.
+- Staging, rollback, failed-new data, and journal are same-volume siblings outside the current directory.
+- A mandatory local rollback snapshot preserves the complete current `mock-api` directory, including opaque encrypted secret blobs, without reading or decrypting them.
+- Portable Mode A/B packages remain secret-free and are fully revalidated for every actual attempt.
+- Commit uses old-directory rename followed by staged-directory rename; current data is never deleted or directly overwritten.
+- Journal phases and directory existence are reconciled after crashes; ambiguous or rollback-failed states block startup.
+- P2-C1 builds and validates staging only. P2-C2 adds journal/rename/rollback. P2-C3 integrates startup validation and interrupted-restore recovery.
+
+P2-C0 changes documentation only. Actual restore remains unavailable.
 
 ### P2-A: Portable Metadata/Full Backup Export Package (Completed)
 
@@ -975,6 +903,6 @@ Current P1-A/P1-B/P1-C1/P1-C2/P1-C3/P1-C4 status:
 - Runtime mutation consistency risk exists: Reduced through P1-C4 for Category A, Provider/SecretStore, managed file/blob, and streaming handled-failure paths. State/network are not one atomic transaction and active streams do not resume after restart.
 - State/blob consistency risk exists: Handled failures are compensated/tombstoned after P1-C3, but crash-only orphan windows and restore reconciliation remain.
 - DPAPI secret blobs are portable across machines/users: No.
-- A formal backup/restore package currently exists: No.
+- A formal Mode A/B backup package exists: Yes, format v1 export plus P2-B strict validation/dry-run. Actual restore does not exist.
 
-Recommended next step: Mode A/B backup package work. Managed blob restore, reconciliation, and backup/restore UI remain separate later phases, and package design must retain the documented SecretStore/blob crash-only residuals.
+Recommended next step: P2-C1 offline staging builder with mandatory package revalidation, fresh secretRef/storageKey generation, and staged state/blob validation. P2-C1 must not rename or replace current app data.
