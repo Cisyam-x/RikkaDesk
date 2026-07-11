@@ -536,9 +536,12 @@ fn reconcile_rollback_completed(
     inventory: &RestoreArtifactInventory,
     journal: &RestoreJournal,
 ) -> Result<RestoreStartupDisposition, RestoreRecoveryError> {
+    let residual_count = usize::from(inventory.operation_stage_exists(&journal.operation_id))
+        + usize::from(inventory.operation_failed_exists(&journal.operation_id));
     if restore_commit_path_exists(&paths.rollback)
         .map_err(|_| RestoreRecoveryError::TopologyConflict)?
         || inventory.operation_temp_stage_exists(&journal.operation_id)
+        || residual_count > 1
     {
         return Err(RestoreRecoveryError::TopologyConflict);
     }
@@ -1374,6 +1377,60 @@ mod tests {
     }
 
     #[test]
+    fn restore_reconciliation_commit_new_mode_b_missing_blob_rolls_back() {
+        let fixture = SyntheticRecoveryFixture::new("commit-new-mode-b-missing-blob");
+        fixture.setup_committed(
+            RestoreJournalPhase::CommitNewMoved,
+            BackupManifestMode::FullLocalData,
+        );
+        let state: PersistedMockState = serde_json::from_slice(
+            &std_fs::read(fixture.paths.current.join(STATE_FILE_NAME)).unwrap(),
+        )
+        .unwrap();
+        let blob = fixture
+            .paths
+            .current
+            .join(FILES_DIR_NAME)
+            .join(FILE_BLOBS_DIR_NAME)
+            .join(&state.files[0].storage_key);
+        std_fs::remove_file(blob).unwrap();
+
+        assert_rolled_back(fixture.reconcile().unwrap());
+        assert!(fixture.paths.failed.is_dir());
+        assert_eq!(
+            fixture.read_journal().phase,
+            RestoreJournalPhase::RollbackCompleted
+        );
+    }
+
+    #[test]
+    fn restore_reconciliation_commit_new_mode_b_blob_mismatch_rolls_back() {
+        let fixture = SyntheticRecoveryFixture::new("commit-new-mode-b-blob-mismatch");
+        fixture.setup_committed(
+            RestoreJournalPhase::CommitNewMoved,
+            BackupManifestMode::FullLocalData,
+        );
+        let state: PersistedMockState = serde_json::from_slice(
+            &std_fs::read(fixture.paths.current.join(STATE_FILE_NAME)).unwrap(),
+        )
+        .unwrap();
+        let blob = fixture
+            .paths
+            .current
+            .join(FILES_DIR_NAME)
+            .join(FILE_BLOBS_DIR_NAME)
+            .join(&state.files[0].storage_key);
+        std_fs::write(blob, b"synthetic mismatched recovery blob").unwrap();
+
+        assert_rolled_back(fixture.reconcile().unwrap());
+        assert!(fixture.paths.failed.is_dir());
+        assert_eq!(
+            fixture.read_journal().phase,
+            RestoreJournalPhase::RollbackCompleted
+        );
+    }
+
+    #[test]
     fn restore_reconciliation_commit_new_with_stage_remaining_rolls_back() {
         let fixture = SyntheticRecoveryFixture::new("commit-new-stage-remains");
         fixture.setup_committed(
@@ -1461,14 +1518,65 @@ mod tests {
     }
 
     #[test]
-    fn restore_reconciliation_rollback_completed_valid_current_starts() {
-        let fixture = SyntheticRecoveryFixture::new("rollback-completed-valid");
+    fn restore_reconciliation_rollback_completed_without_residual_starts() {
+        let fixture = SyntheticRecoveryFixture::new("rollback-completed-no-residual");
         fixture.create_current();
         fixture.write_journal(
             RestoreJournalPhase::RollbackCompleted,
             BackupManifestMode::StateOnly,
         );
         assert_rolled_back(fixture.reconcile().unwrap());
+    }
+
+    #[test]
+    fn restore_reconciliation_rollback_completed_with_stage_residual_starts() {
+        let fixture = SyntheticRecoveryFixture::new("rollback-completed-stage-residual");
+        fixture.create_current();
+        fixture.create_stage(BackupManifestMode::StateOnly);
+        fixture.write_journal(
+            RestoreJournalPhase::RollbackCompleted,
+            BackupManifestMode::StateOnly,
+        );
+
+        assert_rolled_back(fixture.reconcile().unwrap());
+        assert!(fixture.paths.stage.is_dir());
+    }
+
+    #[test]
+    fn restore_reconciliation_rollback_completed_with_failed_residual_starts() {
+        let fixture = SyntheticRecoveryFixture::new("rollback-completed-failed-residual");
+        fixture.create_current();
+        create_existing_current(&fixture.paths.failed, &fixture.opaque_secret);
+        fixture.write_journal(
+            RestoreJournalPhase::RollbackCompleted,
+            BackupManifestMode::StateOnly,
+        );
+
+        assert_rolled_back(fixture.reconcile().unwrap());
+        assert!(fixture.paths.failed.is_dir());
+    }
+
+    #[test]
+    fn restore_reconciliation_rollback_completed_with_stage_and_failed_blocks() {
+        let fixture = SyntheticRecoveryFixture::new("rollback-completed-ambiguous-residuals");
+        fixture.create_current();
+        fixture.create_stage(BackupManifestMode::StateOnly);
+        create_existing_current(&fixture.paths.failed, &fixture.opaque_secret);
+        fixture.write_journal(
+            RestoreJournalPhase::RollbackCompleted,
+            BackupManifestMode::StateOnly,
+        );
+
+        assert_eq!(
+            fixture.reconcile().unwrap_err(),
+            RestoreRecoveryError::TopologyConflict
+        );
+        assert!(fixture.paths.stage.is_dir());
+        assert!(fixture.paths.failed.is_dir());
+        assert_eq!(
+            fixture.read_journal().phase,
+            RestoreJournalPhase::RollbackCompleted
+        );
     }
 
     #[test]
@@ -1653,6 +1761,69 @@ mod tests {
         );
         let token = expect_provisional(fixture.reconcile().unwrap());
         std_fs::create_dir(&fixture.paths.temp_stage).unwrap();
+
+        assert_eq!(
+            mark_restore_startup_completed_with_io(token, &SyntheticRecoveryIo::clean())
+                .unwrap_err(),
+            RestoreRecoveryError::TopologyConflict
+        );
+        assert_eq!(
+            fixture.read_journal().phase,
+            RestoreJournalPhase::StartupValidation
+        );
+    }
+
+    #[test]
+    fn restore_startup_stage_created_before_completion_rejected() {
+        let fixture = SyntheticRecoveryFixture::new("completion-stage");
+        fixture.setup_committed(
+            RestoreJournalPhase::CommitNewMoved,
+            BackupManifestMode::StateOnly,
+        );
+        let token = expect_provisional(fixture.reconcile().unwrap());
+        fixture.create_stage(BackupManifestMode::StateOnly);
+
+        assert_eq!(
+            mark_restore_startup_completed_with_io(token, &SyntheticRecoveryIo::clean())
+                .unwrap_err(),
+            RestoreRecoveryError::TopologyConflict
+        );
+        assert_eq!(
+            fixture.read_journal().phase,
+            RestoreJournalPhase::StartupValidation
+        );
+    }
+
+    #[test]
+    fn restore_startup_failed_created_before_completion_rejected() {
+        let fixture = SyntheticRecoveryFixture::new("completion-failed");
+        fixture.setup_committed(
+            RestoreJournalPhase::CommitNewMoved,
+            BackupManifestMode::StateOnly,
+        );
+        let token = expect_provisional(fixture.reconcile().unwrap());
+        create_existing_current(&fixture.paths.failed, &fixture.opaque_secret);
+
+        assert_eq!(
+            mark_restore_startup_completed_with_io(token, &SyntheticRecoveryIo::clean())
+                .unwrap_err(),
+            RestoreRecoveryError::TopologyConflict
+        );
+        assert_eq!(
+            fixture.read_journal().phase,
+            RestoreJournalPhase::StartupValidation
+        );
+    }
+
+    #[test]
+    fn restore_startup_missing_rollback_before_completion_rejected() {
+        let fixture = SyntheticRecoveryFixture::new("completion-missing-rollback");
+        fixture.setup_committed(
+            RestoreJournalPhase::CommitNewMoved,
+            BackupManifestMode::StateOnly,
+        );
+        let token = expect_provisional(fixture.reconcile().unwrap());
+        std_fs::remove_dir_all(&fixture.paths.rollback).unwrap();
 
         assert_eq!(
             mark_restore_startup_completed_with_io(token, &SyntheticRecoveryIo::clean())
@@ -1978,7 +2149,8 @@ mod tests {
         let guard = RESTORE_COMMIT_MUTEX.lock().unwrap();
         assert!(RESTORE_COMMIT_MUTEX.try_lock().is_err());
         drop(guard);
-        assert!(RESTORE_COMMIT_MUTEX.try_lock().is_ok());
+        let reacquired = RESTORE_COMMIT_MUTEX.lock().unwrap();
+        drop(reacquired);
     }
 
     #[test]
