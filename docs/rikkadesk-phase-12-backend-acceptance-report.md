@@ -12,7 +12,7 @@ This is not a statement that backup/restore is fully released. No restore HTTP A
 
 | Item | Accepted value |
 |---|---|
-| Code boundary | `d618e96f` (`fix: reject ambiguous rollback residual topology`) |
+| Final accepted code boundary | `c41c2d9597082e567588830302ceaeb011c45365` (`fix: persist partial responses when generation stops`) |
 | App version | `0.1.0` |
 | State schema | `6` |
 | Provider import/export | `4` |
@@ -22,6 +22,15 @@ This is not a statement that backup/restore is fully released. No restore HTTP A
 | Restore strategy | Offline full replacement only |
 
 No new migration, format v2, Mode C, ZIP, merge restore, restore route/command/UI, tag, Release, or dependency is part of this acceptance.
+
+## Post-Acceptance Smoke Fixes
+
+Two post-acceptance smoke fixes are included in the final accepted code boundary:
+
+- The first send of a new conversation returns the durable conversation produced by the successful staged commit. The frontend seeds the detail cache before changing the active conversation or route, and request epochs prevent late detail responses from replacing that seed.
+- An explicit Stop uses a persist-partial policy. The generation that obtains terminal ownership stages and persists its nonempty partial assistant buffer before emitting the committed snapshot and `stopped`. An empty buffer creates no assistant message.
+
+These fixes do not add a restore route, command, or UI and do not change schema, provider import/export, or backup format versions.
 
 ## Accepted Scope
 
@@ -65,7 +74,7 @@ Production persisted mutations continue to use these boundaries:
 | Category A | Clone staged state, validate, persist, then commit to live state |
 | Provider/SecretStore | Copy-on-write secret reference, state commit, bounded compensation/cleanup |
 | File/blob | Publish before metadata commit with compensation; tombstone before delete cleanup |
-| Streaming | Initial user commit before work; deltas transient; final assistant commit before success |
+| Streaming | Initial user commit before work; running deltas transient; finish or explicit Stop commits assistant content before terminal success |
 
 The production call-site review found no new `mutate live -> persist -> dirty live on failure` path. Direct persistence in this area remains inside the staged transaction helper; test-only helpers are excluded from production behavior.
 
@@ -124,7 +133,7 @@ These filter counts overlap and must not be summed. Every listed group passed.
 | `staged_transaction` | 4 |
 | `provider_transaction` | 12 |
 | `file_transaction` | 11 |
-| `streaming_transaction` | 14 |
+| `streaming_transaction` | 15 |
 | `backup_` | 41 |
 | `restore_dry_run` | 9 |
 | `restore_stage` | 11 |
@@ -140,9 +149,17 @@ These filter counts overlap and must not be summed. Every listed group passed.
 | `restore_startup` | 24 |
 | `restore_reconciliation` | 22 |
 | `restore_crash` | 12 |
-| Complete Rust suite | 433 |
+| Complete Rust suite | 440 |
 
-Additional targeted filters passed: secret compensation 3, managed blob 1, stream event order 4, stop transaction 4, regenerate transaction 4, and backup checksum 3.
+Additional targeted filters passed: secret compensation 3, managed blob 1, stream event order 4, stop transaction 10, generation registry 6, transaction failure 9, regenerate transaction 4, and backup checksum 3.
+
+## Manual Smoke
+
+**PASS.**
+
+- A new conversation's first send showed neither an empty conversation page nor a transient select-conversation state. The durable user message appeared once after cache seeding and navigation.
+- Stopping a synthetic streaming reply persisted the visible partial assistant content. The same partial content remained after application restart, with no duplicate assistant message.
+- The smoke used isolated synthetic app data and a loopback synthetic stream. No real Provider, API key, user file, app data, or secret blob was read or modified.
 
 ## Static Security Audit
 

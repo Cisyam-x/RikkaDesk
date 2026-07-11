@@ -392,7 +392,7 @@ P1-C4 uses transient delta semantics:
 | Stream placeholder | Not used after P1-C4 | None | Runtime generation identity only; no durable empty assistant |
 | Stream delta | No persisted mutation | Network error discards the task-local buffer | Transient delta/snapshot only; never durable success |
 | Stream finish/failure | Discard failed stage and task-local buffer | Network and persistence errors stay distinct | Committed snapshot then `finished`, or safe `failed`; never both |
-| Stop | Failed staged stop leaves prior durable content unchanged | Cancellation uses the generation token and discards partial text | Safe 5xx plus `failed` on persistence error; committed stop emits exactly one `stopped` |
+| Stop | Failed staged stop leaves prior durable content unchanged | Token-owned stop finalization stages and persists a nonempty partial buffer; an empty buffer creates no message | Persistence failure emits only `failed: persistence`; committed snapshot precedes exactly one `stopped` |
 | File upload | Discard metadata stage; delete operation-created blobs | Cleanup failure records orphan safely | Safe 5xx; no file response |
 | File delete | Discard failed tombstone stage and retain active metadata/blob | Post-commit blob cleanup failure leaves an inaccessible orphan | Reference conflict is 409; committed tombstone remains logical success with fixed warning |
 
