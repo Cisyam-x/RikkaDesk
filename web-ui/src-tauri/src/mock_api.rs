@@ -2179,6 +2179,13 @@ struct SendMessageRequest {
     image_input_mode: Option<String>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SendMessageResponse {
+    status: &'static str,
+    conversation: ConversationDto,
+}
+
 #[derive(Deserialize)]
 struct UpdateConversationTitleRequest {
     title: String,
@@ -5735,6 +5742,7 @@ async fn send_message(
     broadcast_conversation_snapshot(&state, &initial.conversation).await;
     broadcast_list_invalidate(&state).await;
     broadcast_generation_start(&state, &id, &handle).await;
+    let accepted_conversation = initial.conversation.clone();
     drop(transition_guard);
 
     if user_has_non_text_parts {
@@ -5757,7 +5765,11 @@ async fn send_message(
                         config,
                         messages,
                     );
-                    return Json(json!({ "status": "accepted" })).into_response();
+                    return Json(SendMessageResponse {
+                        status: "accepted",
+                        conversation: accepted_conversation,
+                    })
+                    .into_response();
                 }
                 Ok(None) => {}
                 Err(LocalImageCaptureStartError::User(error)) => {
@@ -5769,11 +5781,19 @@ async fn send_message(
                         model_id,
                         error,
                     );
-                    return Json(json!({ "status": "accepted" })).into_response();
+                    return Json(SendMessageResponse {
+                        status: "accepted",
+                        conversation: accepted_conversation,
+                    })
+                    .into_response();
                 }
                 Err(LocalImageCaptureStartError::Config) => {
                     fail_running_generation(&state, &id, &handle, "configuration").await;
-                    return Json(json!({ "status": "accepted" })).into_response();
+                    return Json(SendMessageResponse {
+                        status: "accepted",
+                        conversation: accepted_conversation,
+                    })
+                    .into_response();
                 }
             }
         }
@@ -5786,7 +5806,11 @@ async fn send_message(
             model_id,
             LOCAL_ATTACHMENT_REPLY_TEXT.to_string(),
         );
-        return Json(json!({ "status": "accepted" })).into_response();
+        return Json(SendMessageResponse {
+            status: "accepted",
+            conversation: accepted_conversation,
+        })
+        .into_response();
     }
 
     let real_chat_config = if user_text.is_some() {
@@ -5794,7 +5818,11 @@ async fn send_message(
             Ok(config) => config,
             Err(_) => {
                 fail_running_generation(&state, &id, &handle, "configuration").await;
-                return Json(json!({ "status": "accepted" })).into_response();
+                return Json(SendMessageResponse {
+                    status: "accepted",
+                    conversation: accepted_conversation,
+                })
+                .into_response();
             }
         }
     } else {
@@ -5815,7 +5843,11 @@ async fn send_message(
             model_id,
             reply_text,
         );
-        return Json(json!({ "status": "accepted" })).into_response();
+        return Json(SendMessageResponse {
+            status: "accepted",
+            conversation: accepted_conversation,
+        })
+        .into_response();
     };
 
     let messages = openai_messages_from_conversation(&initial.conversation);
@@ -5828,7 +5860,11 @@ async fn send_message(
             model_id,
             "Phase 3E currently supports text-only chat.".to_string(),
         );
-        return Json(json!({ "status": "accepted" })).into_response();
+        return Json(SendMessageResponse {
+            status: "accepted",
+            conversation: accepted_conversation,
+        })
+        .into_response();
     }
 
     spawn_openai_stream_generation(
@@ -5841,7 +5877,11 @@ async fn send_message(
         messages,
     );
 
-    Json(json!({ "status": "accepted" })).into_response()
+    Json(SendMessageResponse {
+        status: "accepted",
+        conversation: accepted_conversation,
+    })
+    .into_response()
 }
 
 fn is_capture_local_image_intent(payload: &SendMessageRequest) -> bool {
@@ -14635,6 +14675,47 @@ mod tests {
             1
         );
         assert_eq!(state.revision.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn streaming_transaction_send_response_contains_committed_conversation() {
+        let temp = SyntheticTempDir::new("stream-initial-response");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let id = "stream-initial-response".to_string();
+
+        let response = send_message(
+            State(state),
+            Path(id.clone()),
+            Json(SendMessageRequest {
+                parts: synthetic_text_parts("synthetic response turn"),
+                mode_injection_ids: None,
+                lorebook_ids: None,
+                image_input_confirmed: None,
+                image_input_mode: None,
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("synthetic response body should be readable");
+        let payload: Value =
+            serde_json::from_slice(&body).expect("synthetic response should be JSON");
+        assert_eq!(payload["status"], "accepted");
+        assert_eq!(payload["conversation"]["id"], id);
+        assert_eq!(
+            payload["conversation"]["messages"]
+                .as_array()
+                .expect("response messages should be an array")
+                .len(),
+            1
+        );
+        assert_eq!(
+            payload["conversation"]["messages"][0]["messages"][0]["parts"][0]["text"],
+            "synthetic response turn"
+        );
     }
 
     #[tokio::test]

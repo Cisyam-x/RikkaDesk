@@ -83,6 +83,11 @@ interface EditingSession {
   textPartIndex: number | null;
 }
 
+interface SendMessageResponse {
+  status: string;
+  conversation: ConversationDto;
+}
+
 function createHomeDraftId() {
   return `home-${uuidv4()}`;
 }
@@ -313,12 +318,30 @@ function useConversationDetail(activeId: string | null, updateSummary: Conversat
   const [detail, setDetail] = React.useState<ConversationDto | null>(null);
   const [detailLoading, setDetailLoading] = React.useState(false);
   const [detailError, setDetailError] = React.useState<string | null>(null);
+  const activeIdRef = React.useRef(activeId);
+  const requestEpochRef = React.useRef(0);
+  const seededConversationIdRef = React.useRef<string | null>(null);
+  activeIdRef.current = activeId;
 
   const resetDetail = React.useCallback(() => {
+    requestEpochRef.current += 1;
+    seededConversationIdRef.current = null;
     setDetail(null);
     setDetailError(null);
     setDetailLoading(false);
   }, []);
+
+  const seedDetail = React.useCallback(
+    (conversation: ConversationDto) => {
+      requestEpochRef.current += 1;
+      seededConversationIdRef.current = conversation.id;
+      setDetail(conversation);
+      setDetailError(null);
+      setDetailLoading(false);
+      updateSummary(toConversationSummaryUpdate(conversation));
+    },
+    [updateSummary],
+  );
 
   React.useEffect(() => {
     if (!activeId) {
@@ -327,25 +350,50 @@ function useConversationDetail(activeId: string | null, updateSummary: Conversat
     }
 
     let mounted = true;
-    setDetailLoading(true);
+    const requestEpoch = ++requestEpochRef.current;
+    const hasSeededDetail = seededConversationIdRef.current === activeId;
+    if (!hasSeededDetail) {
+      setDetail(null);
+    }
+    setDetailLoading(!hasSeededDetail);
     setDetailError(null);
 
     const abortController = new AbortController();
+    const ownsRequest = () =>
+      mounted &&
+      requestEpochRef.current === requestEpoch &&
+      activeIdRef.current === activeId;
+    const applyConversation = (conversation: ConversationDto) => {
+      if (!ownsRequest() || conversation.id !== activeId) return false;
+      if (
+        seededConversationIdRef.current === activeId &&
+        conversation.messages.length === 0
+      ) {
+        return false;
+      }
+
+      seededConversationIdRef.current = null;
+      setDetail(conversation);
+      updateSummary(toConversationSummaryUpdate(conversation));
+      setDetailError(null);
+      setDetailLoading(false);
+      return true;
+    };
 
     api
       .get<ConversationDto>(`conversations/${activeId}`)
       .then((data) => {
-        if (!mounted) return;
-        setDetail(data);
-        updateSummary(toConversationSummaryUpdate(data));
+        applyConversation(data);
       })
       .catch((err: Error) => {
-        if (!mounted) return;
+        if (!ownsRequest()) return;
         setDetailError(err.message || t("conversations.errors.load_detail_failed"));
-        setDetail(null);
+        if (!hasSeededDetail) {
+          setDetail(null);
+        }
       })
       .finally(() => {
-        if (!mounted) return;
+        if (!ownsRequest()) return;
         setDetailLoading(false);
       });
 
@@ -353,7 +401,7 @@ function useConversationDetail(activeId: string | null, updateSummary: Conversat
       `conversations/${activeId}/stream`,
       {
         onMessage: ({ event, data }) => {
-          if (!mounted) return;
+          if (!ownsRequest()) return;
 
           if (event === "error" && data.type === "error") {
             toast.error(data.message);
@@ -362,10 +410,7 @@ function useConversationDetail(activeId: string | null, updateSummary: Conversat
 
           if (event === "snapshot" && data.type === "snapshot") {
             useAppStore.getState().setClockOffset(data.serverTime);
-            setDetail(data.conversation);
-            updateSummary(toConversationSummaryUpdate(data.conversation));
-            setDetailError(null);
-            setDetailLoading(false);
+            applyConversation(data.conversation);
             return;
           }
 
@@ -385,7 +430,7 @@ function useConversationDetail(activeId: string | null, updateSummary: Conversat
           setDetailLoading(false);
         },
         onError: (streamError) => {
-          if (!mounted) return;
+          if (!ownsRequest()) return;
           console.error("Conversation detail SSE error:", streamError);
         },
       },
@@ -412,6 +457,7 @@ function useConversationDetail(activeId: string | null, updateSummary: Conversat
     detailError,
     selectedNodeMessages,
     resetDetail,
+    seedDetail,
   };
 }
 
@@ -424,6 +470,7 @@ function useDraftInputController({
   useConversationPromptInjection,
   navigate,
   refreshList,
+  seedDetail,
 }: {
   activeId: string | null;
   isHomeRoute: boolean;
@@ -433,6 +480,7 @@ function useDraftInputController({
   useConversationPromptInjection: boolean;
   navigate: ReturnType<typeof useNavigate>;
   refreshList: () => void;
+  seedDetail: (conversation: ConversationDto) => void;
 }) {
   const draftKey = activeId ?? (isHomeRoute ? homeDraftId : null);
   const draft = useChatInputStore(
@@ -506,12 +554,9 @@ function useDraftInputController({
 
     const conversationId = uuidv4();
     const promptInjectionIds = getPromptInjectionIds(draftKey);
-    clearDraft(draftKey);
-    setHomeDraftId(createHomeDraftId());
-    setActiveId(conversationId);
-    navigate(`/c/${conversationId}`);
-    try {
-      await api.post<{ status: string }>(`conversations/${conversationId}/messages`, {
+    const response = await api.post<SendMessageResponse>(
+      `conversations/${conversationId}/messages`,
+      {
         parts,
         ...(options ?? {}),
         ...(useConversationPromptInjection
@@ -520,12 +565,14 @@ function useDraftInputController({
               lorebookIds: promptInjectionIds.lorebookIds,
             }
           : {}),
-      });
-      refreshList();
-    } catch (error) {
-      restoreDraft();
-      throw error;
-    }
+      },
+    );
+    seedDetail(response.conversation);
+    setActiveId(conversationId);
+    navigate(`/c/${conversationId}`);
+    clearDraft(draftKey);
+    setHomeDraftId(createHomeDraftId());
+    refreshList();
   }, [
     activeId,
     addDraftParts,
@@ -535,6 +582,7 @@ function useDraftInputController({
     getSubmitParts,
     navigate,
     refreshList,
+    seedDetail,
     setActiveId,
     setDraftText,
     setHomeDraftId,
@@ -758,7 +806,7 @@ function ConversationsPageInner() {
   const [homeDraftId, setHomeDraftId] = React.useState(() => createHomeDraftId());
   const [editingSession, setEditingSession] = React.useState<EditingSession | null>(null);
 
-  const { detail, detailLoading, detailError, selectedNodeMessages, resetDetail } =
+  const { detail, detailLoading, detailError, selectedNodeMessages, resetDetail, seedDetail } =
     useConversationDetail(activeId, updateConversationSummary);
 
   const {
@@ -781,18 +829,21 @@ function ConversationsPageInner() {
     useConversationPromptInjection: currentAssistant?.allowConversationPromptInjection === true,
     navigate,
     refreshList,
+    seedDetail,
   });
 
   const activeConversation = conversations.find((item) => item.id === activeId);
+  const activeConversationTitle =
+    activeConversation?.title ?? (detail?.id === activeId ? detail.title : null);
   const chatSuggestions = detail?.chatSuggestions ?? EMPTY_SUGGESTIONS;
 
   React.useEffect(() => {
     const base = t("conversations.meta.title");
-    document.title = activeConversation?.title ? `${activeConversation.title} - ${base}` : base;
+    document.title = activeConversationTitle ? `${activeConversationTitle} - ${base}` : base;
     return () => {
       document.title = base;
     };
-  }, [activeConversation?.title, t]);
+  }, [activeConversationTitle, t]);
   const isNewChat = isHomeRoute && !activeId;
   const showSuggestions =
     Boolean(activeId) && !detailLoading && !detailError && chatSuggestions.length > 0;
@@ -1125,9 +1176,7 @@ function ConversationsPageInner() {
           <SidebarTrigger />
           <div className="min-w-0 flex-1">
             <div className="truncate text-sm text-muted-foreground">
-              {activeConversation
-                ? activeConversation.title
-                : t("conversations.header.select_conversation")}
+              {activeConversationTitle ?? t("conversations.header.select_conversation")}
             </div>
             {currentModel && currentProvider ? (
               <div className="truncate text-xs text-muted-foreground/80">
