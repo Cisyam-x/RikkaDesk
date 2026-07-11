@@ -307,7 +307,24 @@ Phase 12 P2-C2 adds an internal offline journaled commit and handled-failure rol
 - Confirm a successful P2-C2 call returns only `PendingStartupValidation`, leaves the rollback snapshot and journal at `commit-new-moved`, and does not write `startup-validation`/`completed` or start the mock API.
 - Run `restore_commit`, `restore_journal`, `restore_rollback`, `restore_commit_failure`, `restore_stage`, `restore_dry_run`, and the complete Rust suite. P2-C2 adds 57 dedicated synthetic tests.
 
-P2-C2 still has no HTTP API, Tauri command, UI, folder picker, startup integration, interrupted-operation recovery, Mode C, ZIP, merge, SecretStore restoration, or orphan reconciliation. P2-C3 must reconcile journal/directory crash states and validate startup before any restore can be exposed or launched.
+P2-C2 still has no HTTP API, Tauri command, UI, folder picker, Mode C, ZIP, merge, SecretStore restoration, or orphan reconciliation. P2-C3 now supplies startup integration and interrupted-operation recovery internally, but restore remains unavailable to users.
+
+Phase 12 P2-C3 adds pre-load restore reconciliation and guarded provisional startup:
+
+- Confirm reconciliation runs before SecretStore construction, normal persistence load, default initialization, migration/corrupt backup, router/runtime setup, and listener binding.
+- Confirm strict journal parsing rejects malformed, unknown-field/phase, future-version, oversized, linked/reparse, and invalid-operation journals while preserving stale valid journal temps.
+- Confirm artifact inventory rejects case collisions, operation mismatch, multiple dangerous operation IDs, rollback/failed data without a main journal, and ambiguous topology without touching unrelated directories.
+- Confirm no-journal stage/stage-temp candidates remain unpublished and normal first-run NotFound initialization still works.
+- Confirm `staging`/`backup-current`/`commit-old-moved` reconcile conservatively to validated old current plus `rollback-completed`.
+- Confirm `commit-new-moved`/`startup-validation` revalidate exact Mode A/B candidate layout every startup and never reuse an old validation result.
+- Confirm provisional load is exact schema 6 and produces no default state, migration, corrupt backup, pre-migration backup, state write, or same-process retry on failure.
+- Confirm a matching private token writes `completed` only after state/storage ownership and before listener readiness; stale token, phase change, or completion write failure blocks readiness.
+- Confirm provisional load failure preserves failed-new, restores/revalidates rollback, writes `rollback-completed`, and returns safe startup failure.
+- Confirm `rollback-completed` starts the old current, `rollback-failed` always blocks, and `completed` retains journal/rollback without automatic rollback on later ordinary errors.
+- Confirm recovery never accesses SecretStore or opens/hashes/decrypts opaque secret blobs, and all errors remain free of paths, operation IDs, state/content, storage keys, and secret references.
+- Run `restore_recovery`, `restore_startup`, `restore_reconciliation`, `restore_crash`, all P2-C2 filters, and the complete Rust suite. P2-C3 adds 74 dedicated synthetic tests.
+
+P2-C3 does not add restore API/UI, native folder picker, package selection, confirmation, shutdown/restart orchestration, progress reporting, artifact cleanup, Mode C, ZIP, merge, schema restore migration, portable-secret restoration, orphan GC, or stream resume. Run a complete Phase 12 acceptance pass before any P5 user orchestration.
 
 It may contain:
 

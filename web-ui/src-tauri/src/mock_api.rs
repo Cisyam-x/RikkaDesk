@@ -44,6 +44,7 @@ use tokio::{
 use tower_http::cors::{Any, CorsLayer};
 
 mod restore_commit;
+mod restore_recovery;
 
 #[cfg(windows)]
 use windows_sys::Win32::{
@@ -1365,7 +1366,6 @@ struct NoopRestoreStagingHooks;
 
 impl RestoreStagingHooks for NoopRestoreStagingHooks {}
 
-
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopProviderConfig {
@@ -2325,23 +2325,7 @@ impl MockApiState {
 }
 
 pub async fn start(app_data_dir: PathBuf) -> Result<MockApiHandle, Box<dyn std::error::Error>> {
-    let secret_store = create_secret_store(&app_data_dir);
-    let persistence = MockPersistence::new(app_data_dir);
-    let loaded = load_persisted_state(&persistence).await?;
-    match loaded.outcome {
-        StateLoadOutcome::Loaded => {}
-        StateLoadOutcome::InitializedDefault => {
-            eprintln!("RikkaDesk local state initialized");
-        }
-        StateLoadOutcome::Migrated { from, to } => {
-            eprintln!("RikkaDesk local state migrated from schema {from} to schema {to}");
-        }
-    }
-    let state = Arc::new(MockApiState::new(
-        persistence,
-        secret_store,
-        loaded.persisted,
-    ));
+    let state = prepare_mock_api_startup(app_data_dir).await?;
     let router = Router::new()
         .route("/api/settings/stream", get(settings_stream))
         .route("/api/conversations/paged", get(conversations_paged))
@@ -2439,10 +2423,70 @@ pub async fn start(app_data_dir: PathBuf) -> Result<MockApiHandle, Box<dyn std::
     Ok(MockApiHandle { base_url })
 }
 
+async fn prepare_mock_api_startup(
+    app_data_dir: PathBuf,
+) -> Result<Arc<MockApiState>, Box<dyn std::error::Error>> {
+    let restore_disposition =
+        restore_recovery::reconcile_restore_before_start(&app_data_dir).await?;
+    let persistence = MockPersistence::new(app_data_dir.clone());
+    let (loaded, provisional_restore_token) = match restore_disposition {
+        restore_recovery::RestoreStartupDisposition::StartProvisionalRestore(token) => {
+            match load_restore_validated_state(&persistence).await {
+                Ok(loaded) => (loaded, Some(token)),
+                Err(_) => {
+                    restore_recovery::rollback_after_provisional_startup_failure(token).await?;
+                    return Err(Box::new(
+                        restore_recovery::RestoreRecoveryError::StartupLoadFailed,
+                    ));
+                }
+            }
+        }
+        restore_recovery::RestoreStartupDisposition::NoRestoreOperation
+        | restore_recovery::RestoreStartupDisposition::StartRolledBackCurrent
+        | restore_recovery::RestoreStartupDisposition::StartCompletedCurrent => {
+            (load_persisted_state(&persistence).await?, None)
+        }
+    };
+    match loaded.outcome {
+        StateLoadOutcome::Loaded => {}
+        StateLoadOutcome::InitializedDefault => {
+            eprintln!("RikkaDesk local state initialized");
+        }
+        StateLoadOutcome::Migrated { from, to } => {
+            eprintln!("RikkaDesk local state migrated from schema {from} to schema {to}");
+        }
+    }
+    let secret_store = create_secret_store(&app_data_dir);
+    let state = Arc::new(MockApiState::new(
+        persistence,
+        secret_store,
+        loaded.persisted,
+    ));
+    if let Some(token) = provisional_restore_token {
+        restore_recovery::mark_restore_startup_completed(token).await?;
+    }
+    Ok(state)
+}
+
 async fn load_persisted_state(
     persistence: &MockPersistence,
 ) -> Result<StateLoadResult, StateLoadError> {
     load_persisted_state_with_migrator(persistence, &RealStateMigrator).await
+}
+
+async fn load_restore_validated_state(
+    persistence: &MockPersistence,
+) -> Result<StateLoadResult, StateLoadError> {
+    let bytes = persistence
+        .read_state_bytes()
+        .await
+        .map_err(StateLoadError::ReadFailed)?;
+    let persisted = parse_and_validate_restore_state(&bytes, STATE_SCHEMA_VERSION)
+        .map_err(|_| StateLoadError::RecoveryRequired)?;
+    Ok(StateLoadResult {
+        persisted,
+        outcome: StateLoadOutcome::Loaded,
+    })
 }
 
 async fn load_persisted_state_with_migrator(

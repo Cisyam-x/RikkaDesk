@@ -3,15 +3,15 @@
 use super::*;
 use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
 
-const RESTORE_JOURNAL_FILE_NAME: &str = "restore-journal.json";
-const RESTORE_JOURNAL_TEMP_PREFIX: &str = "restore-journal.json.tmp";
-const RESTORE_JOURNAL_FORMAT: &str = "rikkadesk-restore-journal";
-const RESTORE_JOURNAL_VERSION: u32 = 1;
-const RESTORE_ROLLBACK_DIR_PREFIX: &str = "mock-api.pre-restore";
-const RESTORE_FAILED_DIR_PREFIX: &str = "mock-api.failed-restore";
-const RESTORE_OPERATION_ID_MAX_LEN: usize = 80;
+pub(super) const RESTORE_JOURNAL_FILE_NAME: &str = "restore-journal.json";
+pub(super) const RESTORE_JOURNAL_TEMP_PREFIX: &str = "restore-journal.json.tmp";
+pub(super) const RESTORE_JOURNAL_FORMAT: &str = "rikkadesk-restore-journal";
+pub(super) const RESTORE_JOURNAL_VERSION: u32 = 1;
+pub(super) const RESTORE_ROLLBACK_DIR_PREFIX: &str = "mock-api.pre-restore";
+pub(super) const RESTORE_FAILED_DIR_PREFIX: &str = "mock-api.failed-restore";
+pub(super) const RESTORE_OPERATION_ID_MAX_LEN: usize = 80;
 
-static RESTORE_COMMIT_MUTEX: StdMutex<()> = StdMutex::new(());
+pub(super) static RESTORE_COMMIT_MUTEX: StdMutex<()> = StdMutex::new(());
 static RESTORE_JOURNAL_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
@@ -26,7 +26,7 @@ enum RestoreCommitResult {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RestoreCommitError {
+pub(super) enum RestoreCommitError {
     OfflineGateFailed,
     Conflict,
     JournalExists,
@@ -93,7 +93,7 @@ impl RestoreOfflineGate for TrustedOfflineRestoreGate {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-enum RestoreJournalPhase {
+pub(super) enum RestoreJournalPhase {
     Staging,
     BackupCurrent,
     CommitOldMoved,
@@ -107,7 +107,7 @@ enum RestoreJournalPhase {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-enum RestoreJournalSafeErrorCode {
+pub(super) enum RestoreJournalSafeErrorCode {
     CommitFailed,
     RollbackFailed,
     JournalAmbiguous,
@@ -115,14 +115,14 @@ enum RestoreJournalSafeErrorCode {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct RestoreJournal {
-    format: String,
-    version: u32,
-    operation_id: String,
-    phase: RestoreJournalPhase,
-    mode: BackupManifestMode,
-    created_at: String,
-    safe_error_code: Option<RestoreJournalSafeErrorCode>,
+pub(super) struct RestoreJournal {
+    pub(super) format: String,
+    pub(super) version: u32,
+    pub(super) operation_id: String,
+    pub(super) phase: RestoreJournalPhase,
+    pub(super) mode: BackupManifestMode,
+    pub(super) created_at: String,
+    pub(super) safe_error_code: Option<RestoreJournalSafeErrorCode>,
 }
 
 impl RestoreJournal {
@@ -332,14 +332,14 @@ impl<'a> RestoreJournalStore<'a> {
 }
 
 #[derive(Clone)]
-struct RestoreCommitPaths {
-    parent: PathBuf,
-    current: PathBuf,
-    stage: PathBuf,
-    rollback: PathBuf,
-    failed: PathBuf,
-    journal: PathBuf,
-    temp_stage: PathBuf,
+pub(super) struct RestoreCommitPaths {
+    pub(super) parent: PathBuf,
+    pub(super) current: PathBuf,
+    pub(super) stage: PathBuf,
+    pub(super) rollback: PathBuf,
+    pub(super) failed: PathBuf,
+    pub(super) journal: PathBuf,
+    pub(super) temp_stage: PathBuf,
 }
 
 fn commit_restore_offline(
@@ -467,7 +467,7 @@ fn acquire_restore_commit_mutex() -> Result<StdMutexGuard<'static, ()>, RestoreC
         .map_err(|_| RestoreCommitError::Conflict)
 }
 
-fn validate_restore_operation_id(operation_id: &str) -> Result<(), RestoreCommitError> {
+pub(super) fn validate_restore_operation_id(operation_id: &str) -> Result<(), RestoreCommitError> {
     if operation_id.is_empty()
         || operation_id.len() > RESTORE_OPERATION_ID_MAX_LEN
         || !operation_id.is_ascii()
@@ -487,7 +487,9 @@ fn validate_restore_operation_id(operation_id: &str) -> Result<(), RestoreCommit
     Ok(())
 }
 
-fn validate_restore_commit_parent(parent: &FilePath) -> Result<PathBuf, RestoreCommitError> {
+pub(super) fn validate_restore_commit_parent(
+    parent: &FilePath,
+) -> Result<PathBuf, RestoreCommitError> {
     let metadata = std_fs::symlink_metadata(parent).map_err(|_| RestoreCommitError::Conflict)?;
     if metadata_is_link_or_reparse(&metadata) || !metadata.is_dir() {
         return Err(RestoreCommitError::Conflict);
@@ -501,7 +503,7 @@ fn validate_restore_commit_parent(parent: &FilePath) -> Result<PathBuf, RestoreC
     Ok(canonical)
 }
 
-fn derive_restore_commit_paths(
+pub(super) fn derive_restore_commit_paths(
     parent: PathBuf,
     operation_id: &str,
 ) -> Result<RestoreCommitPaths, RestoreCommitError> {
@@ -559,7 +561,7 @@ fn validate_restore_commit_conflicts(paths: &RestoreCommitPaths) -> Result<(), R
     Ok(())
 }
 
-fn validate_restore_commit_stage(
+pub(super) fn validate_restore_commit_stage(
     stage: &FilePath,
 ) -> Result<BackupManifestMode, RestoreCommitError> {
     if validate_staged_mock_api_directory(stage, BackupManifestMode::StateOnly).is_ok() {
@@ -571,7 +573,7 @@ fn validate_restore_commit_stage(
     Err(RestoreCommitError::StageInvalid)
 }
 
-fn validate_existing_mock_api_before_restore(
+pub(super) fn validate_existing_mock_api_before_restore(
     current: &FilePath,
 ) -> Result<PersistedMockState, RestoreCommitError> {
     let metadata =
@@ -767,7 +769,7 @@ fn ensure_regular_directory(
     }
 }
 
-fn restore_commit_path_exists(path: &FilePath) -> Result<bool, RestoreCommitError> {
+pub(super) fn restore_commit_path_exists(path: &FilePath) -> Result<bool, RestoreCommitError> {
     match std_fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
@@ -779,7 +781,7 @@ fn serialize_restore_journal(journal: &RestoreJournal) -> Result<Vec<u8>, Restor
     serde_json::to_vec_pretty(journal).map_err(|_| RestoreCommitError::JournalWriteFailed)
 }
 
-fn read_restore_journal_strict(
+pub(super) fn read_restore_journal_strict(
     path: &FilePath,
     expected_operation_id: &str,
     expected_mode: BackupManifestMode,
@@ -807,8 +809,15 @@ fn read_restore_journal_strict(
     Ok(journal)
 }
 
+pub(super) fn update_restore_journal_atomic(
+    parent: &FilePath,
+    journal: &RestoreJournal,
+) -> Result<(), RestoreCommitError> {
+    RestoreJournalStore::new(parent, &RealRestoreCommitIo).update(journal)
+}
+
 #[cfg(windows)]
-fn sync_restore_parent_directory(parent: &FilePath) -> io::Result<()> {
+pub(super) fn sync_restore_parent_directory(parent: &FilePath) -> io::Result<()> {
     use windows_sys::Win32::{
         Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
         Storage::FileSystem::{
@@ -842,7 +851,7 @@ fn sync_restore_parent_directory(parent: &FilePath) -> io::Result<()> {
 }
 
 #[cfg(not(windows))]
-fn sync_restore_parent_directory(parent: &FilePath) -> io::Result<()> {
+pub(super) fn sync_restore_parent_directory(parent: &FilePath) -> io::Result<()> {
     std_fs::File::open(parent)?.sync_all()
 }
 

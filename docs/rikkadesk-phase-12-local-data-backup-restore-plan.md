@@ -18,7 +18,7 @@ The original P0 audit was documentation only. Later sections record the implemen
 - Runtime mutation hardening: P1-C1 pure state, P1-C2 Provider/SecretStore, P1-C3 managed file/blob handled-failure semantics, and P1-C4 streaming lifecycle semantics are completed.
 - Portable backup export: backup package format v1 Mode A (`state-only`) and Mode B (`full-local-data`) are implemented without secrets.
 - Restore validation: P2-B no-write dry-run validation is implemented; it does not authorize or perform restore.
-- Actual restore: not user-consumable. P2-C0 defines the offline transaction protocol; P2-C1 candidate staging and P2-C2 journaled commit/handled rollback are implemented internally; P2-C3 startup validation and interrupted-operation reconciliation remain required.
+- Actual restore: backend safety chain implemented but not user-consumable. P2-C1 candidate staging, P2-C2 journaled commit/handled rollback, and P2-C3 startup validation/interrupted-operation reconciliation are internal only; no restore API/UI/orchestration exists.
 
 ## P0 Decisions
 
@@ -811,7 +811,21 @@ P2-C2 implements an internal, unwired offline commit engine:
 - Windows parent-directory durability remains a documented best-effort handle barrier rather than a claim of complete power-loss atomicity.
 - Fifty-seven synthetic P2-C2 tests cover journal and rename fault boundaries, rollback paths, operation conflicts, concurrency, secret opacity, and the pending-startup boundary. No real app data, user backup, user file, secret, API key, or provider is used.
 
-P2-C3 remains mandatory before launch or user orchestration. It must reconcile retained journal/directory states after interruption, repeat read-only validation, decide whether to continue or roll back, and block startup on ambiguity without default-state fallback.
+## P2-C3 Startup Reconciliation Implementation Status
+
+P2-C3 integrates the retained restore transaction into the earliest mock API startup boundary:
+
+- Reconciliation executes before SecretStore creation, persistence loading, default initialization, migration/backup writes, runtime registry/router creation, and listener bind.
+- A strict 1 MiB journal reader and direct-child artifact inventory compare journal operation/mode/phase with actual current/stage/rollback/failed topology. Unknown, future, linked, case-colliding, multi-operation, or mismatched states fail closed.
+- Safe interrupted pre-publish states conservatively restore or retain the old current and record `rollback-completed`; interrupted commit never guesses that an existing stage should be published.
+- `commit-new-moved`/`startup-validation` revalidate the candidate every startup. The guarded provisional loader requires exact schema 6 and cannot initialize default state, migrate, or create corrupt/pre-migration backups.
+- A private startup token owns only its matching operation. State/storage ownership is built before compare-phase journal completion, and `completed` is durable before router/listener readiness.
+- Provisional load failure preserves the rejected current as failed-new, restores and validates rollback, records `rollback-completed`, returns a safe failure, and never retries with default state in the same process.
+- `rollback-failed` and ambiguous recovery block startup. `completed` is not automatically rolled back for later ordinary state or listener errors.
+- Reconciliation/rollback never accesses SecretStore or opens encrypted secret files. Opaque synthetic fixtures demonstrate rename preservation and zero-open current validation.
+- Seventy-four P2-C3 synthetic tests cover the crash matrix, guarded loading, startup ordering, journal/token faults, concurrency, normal first-run behavior, and secret opacity.
+
+P2-C3 retains completed journals, rollback snapshots, failed-new directories, and unused stages for later policy. The backend safety chain is complete, but package selection, confirmation, app shutdown/restart, status UI, and cleanup remain unavailable.
 
 ### P2-A: Portable Metadata/Full Backup Export Package (Completed)
 
@@ -936,6 +950,6 @@ Current P1-A/P1-B/P1-C1/P1-C2/P1-C3/P1-C4 status:
 - Runtime mutation consistency risk exists: Reduced through P1-C4 for Category A, Provider/SecretStore, managed file/blob, and streaming handled-failure paths. State/network are not one atomic transaction and active streams do not resume after restart.
 - State/blob consistency risk exists: Handled failures are compensated/tombstoned after P1-C3, but crash-only orphan windows and restore reconciliation remain.
 - DPAPI secret blobs are portable across machines/users: No.
-- A formal Mode A/B backup package exists: Yes, format v1 export, P2-B strict validation/dry-run, P2-C1 independently validated candidate staging, and P2-C2 internal journaled commit/handled rollback. A user-consumable restore does not exist because P2-C3 recovery/startup integration is still required.
+- A formal Mode A/B backup package exists: Yes, format v1 export, P2-B strict validation/dry-run, P2-C1 independently validated staging, P2-C2 journaled commit/handled rollback, and P2-C3 startup reconciliation. A user-consumable restore still does not exist because orchestration and UI are absent.
 
-Recommended next step: P2-C3 startup validation and interrupted-restore reconciliation. Do not expose actual restore until journal/directory crash-state recovery, no-default fallback, and startup ownership tests pass.
+Recommended next step: run a Phase 12 total acceptance pass across P1/P2 before planning P5 user orchestration. Do not expose actual restore until the end-to-end synthetic workflow, residual retention policy, safe shutdown/restart ownership, and user confirmation design are approved.
