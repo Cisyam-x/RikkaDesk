@@ -1985,8 +1985,8 @@ enum GenerationOperation {
 enum GenerationPhase {
     Reserved,
     Running,
-    Finalizing,
-    Stopping,
+    FinalizingFinish,
+    FinalizingStop,
 }
 
 struct GenerationCancellation {
@@ -2029,6 +2029,9 @@ struct ActiveGeneration {
     handle: GenerationHandle,
     operation: GenerationOperation,
     phase: GenerationPhase,
+    commit_plan: Option<GenerationCommitPlan>,
+    model_id: Option<String>,
+    partial_reply: String,
 }
 
 #[derive(Clone)]
@@ -2082,10 +2085,23 @@ enum BeginGenerationError {
 }
 
 enum StopGenerationRequest {
-    Owner(GenerationHandle),
+    Owner(StopGenerationOwner),
     AlreadyStopping,
     Finalizing,
     NotFound,
+}
+
+struct StopGenerationOwner {
+    handle: GenerationHandle,
+    commit_plan: Option<GenerationCommitPlan>,
+    model_id: Option<String>,
+    partial_reply: String,
+}
+
+struct GenerationDeltaRecord {
+    commit_plan: GenerationCommitPlan,
+    model_id: String,
+    accumulated: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -5735,7 +5751,7 @@ async fn send_message(
             return state_mutation_error_response("send initial message", error);
         }
     };
-    if !activate_generation(&state, &id, &handle).await {
+    if !activate_generation(&state, &id, &handle, initial.plan.clone(), model_id.clone()).await {
         remove_generation_if_current(&state, &id, &handle).await;
         return internal_error_response("Generation could not be started");
     }
@@ -5942,8 +5958,8 @@ async fn stop_conversation(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let transition_guard = state.generation_transition_mutex.lock().await;
-    let handle = match request_generation_stop(&state, &id).await {
-        StopGenerationRequest::Owner(handle) => handle,
+    let owner = match request_generation_stop(&state, &id).await {
+        StopGenerationRequest::Owner(owner) => owner,
         StopGenerationRequest::AlreadyStopping => {
             return Json(json!({ "status": "stopping" })).into_response()
         }
@@ -5952,18 +5968,21 @@ async fn stop_conversation(
         }
         StopGenerationRequest::NotFound => return not_found_response("No active generation"),
     };
+    let handle = owner.handle.clone();
 
-    let result = commit_stopped_generation(&state, id.clone()).await;
+    let result = commit_stopped_generation(&state, id.clone(), owner).await;
     let removed = remove_generation_if_current(&state, &id, &handle).await;
 
     let updated = match result {
         Ok(updated) => updated,
         Err(error) => {
             if removed {
-                broadcast_current_conversation_snapshot(&state, &id).await;
-                broadcast_list_invalidate(&state).await;
-                broadcast_generation_terminal(&state, &id, &handle, "failed", Some("persistence"))
-                    .await;
+                let reason = if matches!(error, StateMutationError::Persistence(_)) {
+                    "persistence"
+                } else {
+                    "stale"
+                };
+                broadcast_generation_terminal(&state, &id, &handle, "failed", Some(reason)).await;
             }
             drop(transition_guard);
             return state_mutation_error_response("stop generation", error);
@@ -6187,7 +6206,15 @@ async fn regenerate_message(
                 return state_mutation_error_response("prepare regeneration", error);
             }
         };
-    if !activate_generation(&state, &id, &handle).await {
+    if !activate_generation(
+        &state,
+        &id,
+        &handle,
+        prepared.plan.clone(),
+        model_id.clone(),
+    )
+    .await
+    {
         remove_generation_if_current(&state, &id, &handle).await;
         return internal_error_response("Generation could not be started");
     }
@@ -7312,6 +7339,9 @@ async fn begin_generation(
             handle: handle.clone(),
             operation,
             phase: GenerationPhase::Reserved,
+            commit_plan: None,
+            model_id: None,
+            partial_reply: String::new(),
         },
     );
     Ok(handle)
@@ -7321,6 +7351,8 @@ async fn activate_generation(
     state: &Arc<MockApiState>,
     conversation_id: &str,
     handle: &GenerationHandle,
+    commit_plan: GenerationCommitPlan,
+    model_id: String,
 ) -> bool {
     let mut generations = state.active_generations.lock().await;
     let Some(active) = generations.get_mut(conversation_id) else {
@@ -7331,6 +7363,8 @@ async fn activate_generation(
     {
         return false;
     }
+    active.commit_plan = Some(commit_plan);
+    active.model_id = Some(model_id);
     active.phase = GenerationPhase::Running;
     true
 }
@@ -7387,8 +7421,33 @@ async fn claim_generation_for_finalization(
     {
         return false;
     }
-    active.phase = GenerationPhase::Finalizing;
+    active.phase = GenerationPhase::FinalizingFinish;
     true
+}
+
+async fn record_generation_delta(
+    state: &Arc<MockApiState>,
+    conversation_id: &str,
+    handle: &GenerationHandle,
+    delta: &str,
+) -> Option<GenerationDeltaRecord> {
+    let mut generations = state.active_generations.lock().await;
+    let active = generations.get_mut(conversation_id)?;
+    if active.handle.generation_id != handle.generation_id
+        || active.phase != GenerationPhase::Running
+        || handle.cancellation.is_cancelled()
+    {
+        return None;
+    }
+
+    let commit_plan = active.commit_plan.clone()?;
+    let model_id = active.model_id.clone()?;
+    active.partial_reply.push_str(delta);
+    Some(GenerationDeltaRecord {
+        commit_plan,
+        model_id,
+        accumulated: active.partial_reply.clone(),
+    })
 }
 
 async fn remove_generation_if_current(
@@ -7435,13 +7494,34 @@ async fn request_generation_stop(
     };
     match active.phase {
         GenerationPhase::Reserved | GenerationPhase::Running => {
-            active.phase = GenerationPhase::Stopping;
+            active.phase = GenerationPhase::FinalizingStop;
             active.handle.cancellation.cancel();
-            StopGenerationRequest::Owner(active.handle.clone())
+            StopGenerationRequest::Owner(StopGenerationOwner {
+                handle: active.handle.clone(),
+                commit_plan: active.commit_plan.clone(),
+                model_id: active.model_id.clone(),
+                partial_reply: active.partial_reply.clone(),
+            })
         }
-        GenerationPhase::Stopping => StopGenerationRequest::AlreadyStopping,
-        GenerationPhase::Finalizing => StopGenerationRequest::Finalizing,
+        GenerationPhase::FinalizingStop => StopGenerationRequest::AlreadyStopping,
+        GenerationPhase::FinalizingFinish => StopGenerationRequest::Finalizing,
     }
+}
+
+async fn owns_stop_finalization(
+    state: &Arc<MockApiState>,
+    conversation_id: &str,
+    handle: &GenerationHandle,
+) -> bool {
+    state
+        .active_generations
+        .lock()
+        .await
+        .get(conversation_id)
+        .is_some_and(|active| {
+            active.handle.generation_id == handle.generation_id
+                && active.phase == GenerationPhase::FinalizingStop
+        })
 }
 
 async fn take_generation_after_conversation_delete(
@@ -7753,7 +7833,29 @@ async fn commit_final_assistant_message(
 async fn commit_stopped_generation(
     state: &Arc<MockApiState>,
     conversation_id: String,
+    owner: StopGenerationOwner,
 ) -> Result<ConversationDto, StateMutationError> {
+    if !owns_stop_finalization(state, &conversation_id, &owner.handle).await {
+        return Err(StateMutationError::Conflict("Generation stop is stale"));
+    }
+
+    if !owner.partial_reply.is_empty() {
+        let commit_plan = owner.commit_plan.ok_or(StateMutationError::Conflict(
+            "Generation commit plan is unavailable",
+        ))?;
+        let model_id = owner.model_id.ok_or(StateMutationError::Conflict(
+            "Generation model is unavailable",
+        ))?;
+        return commit_final_assistant_message(
+            state,
+            conversation_id,
+            commit_plan,
+            model_id,
+            owner.partial_reply,
+        )
+        .await;
+    }
+
     transact_persisted_state(
         state,
         PureStateMutationScope::Conversations,
@@ -7874,11 +7976,11 @@ async fn broadcast_generation_delta(
     state: &Arc<MockApiState>,
     conversation_id: &str,
     handle: &GenerationHandle,
-    plan: &GenerationCommitPlan,
-    model_id: &str,
     delta: &str,
-    accumulated: &str,
-) {
+) -> bool {
+    let Some(record) = record_generation_delta(state, conversation_id, handle, delta).await else {
+        return false;
+    };
     let sender = conversation_sender(state, conversation_id).await;
     let _ = sender.send(SsePayload {
         event: "delta".to_string(),
@@ -7893,11 +7995,12 @@ async fn broadcast_generation_delta(
         state,
         conversation_id,
         handle,
-        plan,
-        model_id,
-        accumulated,
+        &record.commit_plan,
+        &record.model_id,
+        &record.accumulated,
     )
     .await;
+    true
 }
 
 async fn broadcast_generation_terminal(
@@ -8370,6 +8473,10 @@ fn spawn_local_reply_generation(
     reply_text: String,
 ) {
     tokio::spawn(async move {
+        if !publish_local_reply_delta(&state, &conversation_id, &handle, &reply_text).await {
+            return;
+        }
+        tokio::task::yield_now().await;
         let _ = finalize_generation_with_text(
             &state,
             &conversation_id,
@@ -8382,6 +8489,15 @@ fn spawn_local_reply_generation(
     });
 }
 
+async fn publish_local_reply_delta(
+    state: &Arc<MockApiState>,
+    conversation_id: &str,
+    handle: &GenerationHandle,
+    reply_text: &str,
+) -> bool {
+    broadcast_generation_delta(state, conversation_id, handle, reply_text).await
+}
+
 fn spawn_openai_stream_generation(
     state: Arc<MockApiState>,
     conversation_id: String,
@@ -8392,16 +8508,8 @@ fn spawn_openai_stream_generation(
     messages: Vec<OpenAiChatMessage>,
 ) {
     tokio::spawn(async move {
-        match stream_openai_compatible_chat(
-            &state,
-            &conversation_id,
-            &handle,
-            &plan,
-            &model_id,
-            &config,
-            messages,
-        )
-        .await
+        match stream_openai_compatible_chat(&state, &conversation_id, &handle, &config, messages)
+            .await
         {
             Ok(GenerationStreamOutcome::Completed(reply_text)) if !reply_text.is_empty() => {
                 let _ = finalize_generation_with_text(
@@ -8436,8 +8544,6 @@ fn spawn_openai_vision_capture_generation(
             &state,
             &conversation_id,
             &handle,
-            &plan,
-            &model_id,
             &config,
             messages,
         )
@@ -8466,8 +8572,6 @@ async fn stream_openai_compatible_chat(
     state: &Arc<MockApiState>,
     conversation_id: &str,
     handle: &GenerationHandle,
-    plan: &GenerationCommitPlan,
-    model_id: &str,
     config: &OpenAiChatConfig,
     messages: Vec<OpenAiChatMessage>,
 ) -> Result<GenerationStreamOutcome, String> {
@@ -8523,16 +8627,7 @@ async fn stream_openai_compatible_chat(
                         return Ok(GenerationStreamOutcome::CancelledOrStale);
                     }
                     buffered_reply.push_str(&delta);
-                    broadcast_generation_delta(
-                        state,
-                        conversation_id,
-                        handle,
-                        plan,
-                        model_id,
-                        &delta,
-                        &buffered_reply,
-                    )
-                    .await;
+                    broadcast_generation_delta(state, conversation_id, handle, &delta).await;
                 }
             }
         }
@@ -8546,16 +8641,7 @@ async fn stream_openai_compatible_chat(
             }
             ParsedOpenAiStreamLine::Delta(delta) => {
                 buffered_reply.push_str(&delta);
-                broadcast_generation_delta(
-                    state,
-                    conversation_id,
-                    handle,
-                    plan,
-                    model_id,
-                    &delta,
-                    &buffered_reply,
-                )
-                .await;
+                broadcast_generation_delta(state, conversation_id, handle, &delta).await;
             }
         }
     }
@@ -8571,8 +8657,6 @@ async fn stream_openai_compatible_vision_capture(
     state: &Arc<MockApiState>,
     conversation_id: &str,
     handle: &GenerationHandle,
-    plan: &GenerationCommitPlan,
-    model_id: &str,
     config: &OpenAiChatConfig,
     messages: Vec<OpenAiCompatibleChatMessage>,
 ) -> Result<GenerationStreamOutcome, String> {
@@ -8632,16 +8716,7 @@ async fn stream_openai_compatible_vision_capture(
                         return Ok(GenerationStreamOutcome::CancelledOrStale);
                     }
                     buffered_reply.push_str(&delta);
-                    broadcast_generation_delta(
-                        state,
-                        conversation_id,
-                        handle,
-                        plan,
-                        model_id,
-                        &delta,
-                        &buffered_reply,
-                    )
-                    .await;
+                    broadcast_generation_delta(state, conversation_id, handle, &delta).await;
                 }
             }
         }
@@ -8655,16 +8730,7 @@ async fn stream_openai_compatible_vision_capture(
             }
             ParsedOpenAiStreamLine::Delta(delta) => {
                 buffered_reply.push_str(&delta);
-                broadcast_generation_delta(
-                    state,
-                    conversation_id,
-                    handle,
-                    plan,
-                    model_id,
-                    &delta,
-                    &buffered_reply,
-                )
-                .await;
+                broadcast_generation_delta(state, conversation_id, handle, &delta).await;
             }
         }
     }
@@ -11098,7 +11164,16 @@ mod tests {
                     .plan
             }
         };
-        assert!(activate_generation(state, conversation_id, &handle).await);
+        assert!(
+            activate_generation(
+                state,
+                conversation_id,
+                &handle,
+                plan.clone(),
+                MOCK_MODEL_ID.to_string(),
+            )
+            .await
+        );
         broadcast_current_conversation_snapshot(state, conversation_id).await;
         broadcast_generation_start(state, conversation_id, &handle).await;
         drop(transition_guard);
@@ -11114,17 +11189,24 @@ mod tests {
             .subscribe()
     }
 
-    fn drain_event_names(receiver: &mut broadcast::Receiver<SsePayload>) -> Vec<String> {
+    fn drain_events(receiver: &mut broadcast::Receiver<SsePayload>) -> Vec<SsePayload> {
         let mut events = Vec::new();
         loop {
             match receiver.try_recv() {
-                Ok(payload) => events.push(payload.event),
+                Ok(payload) => events.push(payload),
                 Err(broadcast::error::TryRecvError::Empty)
                 | Err(broadcast::error::TryRecvError::Closed) => break,
                 Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
             }
         }
         events
+    }
+
+    fn drain_event_names(receiver: &mut broadcast::Receiver<SsePayload>) -> Vec<String> {
+        drain_events(receiver)
+            .into_iter()
+            .map(|payload| payload.event)
+            .collect()
     }
 
     fn selected_texts(conversation: &ConversationDto) -> Vec<String> {
@@ -14783,19 +14865,10 @@ mod tests {
         let state = transaction_test_state(&temp, default_persisted_state(), None).await;
         let id = "stream-transient-delta";
         let mut events = subscribe_generation_events(&state, id).await;
-        let (handle, plan) =
+        let (handle, _plan) =
             start_synthetic_generation(&state, id, GenerationOperation::Send).await;
 
-        broadcast_generation_delta(
-            &state,
-            id,
-            &handle,
-            &plan,
-            MOCK_MODEL_ID,
-            "synthetic delta",
-            "synthetic delta",
-        )
-        .await;
+        assert!(broadcast_generation_delta(&state, id, &handle, "synthetic delta").await);
 
         assert_eq!(live_conversation(&state, id).await.messages.len(), 1);
         assert_eq!(
@@ -15106,10 +15179,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_transaction_active_stream_discards_transient_reply() {
+    async fn stop_transaction_nonempty_buffer_persists_partial_reply() {
         let temp = SyntheticTempDir::new("stop-active");
         let state = transaction_test_state(&temp, default_persisted_state(), None).await;
         let id = "stop-active";
+        let mut events = subscribe_generation_events(&state, id).await;
+        let (handle, _) = start_synthetic_generation(&state, id, GenerationOperation::Send).await;
+        assert!(broadcast_generation_delta(&state, id, &handle, "synthetic partial reply").await);
+
+        let response = stop_conversation(State(state.clone()), Path(id.to_string()))
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(live_conversation(&state, id).await.messages.len(), 2);
+        assert_eq!(
+            selected_texts(&live_conversation(&state, id).await).last(),
+            Some(&"synthetic partial reply".to_string())
+        );
+        assert_eq!(
+            disk_conversation(&temp, id)["messages"]
+                .as_array()
+                .expect("disk messages should be an array")
+                .len(),
+            2
+        );
+        assert!(!has_active_generation(&state, id).await);
+        let names = drain_event_names(&mut events);
+        assert_eq!(names.iter().filter(|event| *event == "stopped").count(), 1);
+        assert_eq!(names.iter().filter(|event| *event == "finished").count(), 0);
+        let stopped = names.iter().position(|event| event == "stopped").unwrap();
+        let committed = names[..stopped]
+            .iter()
+            .rposition(|event| event == "snapshot")
+            .unwrap();
+        assert!(committed < stopped);
+    }
+
+    #[tokio::test]
+    async fn stop_transaction_restart_retains_partial_reply() {
+        let temp = SyntheticTempDir::new("stop-restart-partial");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let id = "stop-restart-partial";
+        let (handle, _) = start_synthetic_generation(&state, id, GenerationOperation::Send).await;
+        assert!(broadcast_generation_delta(&state, id, &handle, "restart-safe partial").await);
+        let response = stop_conversation(State(state), Path(id.to_string()))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let persisted: PersistedMockState =
+            serde_json::from_value(read_test_state(&test_persistence(&temp)))
+                .expect("synthetic disk state should deserialize");
+        let restarted = Arc::new(MockApiState::new(
+            test_persistence(&temp),
+            Arc::new(TestSecretStore),
+            persisted,
+        ));
+        assert_eq!(
+            selected_texts(&live_conversation(&restarted, id).await).last(),
+            Some(&"restart-safe partial".to_string())
+        );
+        assert!(!has_active_generation(&restarted, id).await);
+    }
+
+    #[tokio::test]
+    async fn stop_transaction_empty_buffer_creates_no_assistant_message() {
+        let temp = SyntheticTempDir::new("stop-empty");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let id = "stop-empty";
         let mut events = subscribe_generation_events(&state, id).await;
         let _ = start_synthetic_generation(&state, id, GenerationOperation::Send).await;
 
@@ -15119,10 +15257,15 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(live_conversation(&state, id).await.messages.len(), 1);
-        assert!(!has_active_generation(&state, id).await);
+        assert_eq!(
+            disk_conversation(&temp, id)["messages"]
+                .as_array()
+                .expect("disk messages should be an array")
+                .len(),
+            1
+        );
         let names = drain_event_names(&mut events);
         assert_eq!(names.iter().filter(|event| *event == "stopped").count(), 1);
-        assert_eq!(names.iter().filter(|event| *event == "finished").count(), 0);
     }
 
     #[tokio::test]
@@ -15133,6 +15276,7 @@ mod tests {
         let mut events = subscribe_generation_events(&state, id).await;
         let (handle, plan) =
             start_synthetic_generation(&state, id, GenerationOperation::Send).await;
+        assert!(broadcast_generation_delta(&state, id, &handle, "synthetic race partial").await);
         let finish_state = state.clone();
         let finish_handle = handle.clone();
         let finish = tokio::spawn(async move {
@@ -15166,7 +15310,14 @@ mod tests {
             .filter(|event| matches!(event.as_str(), "finished" | "stopped" | "failed"))
             .count();
         assert_eq!(terminals, 1);
-        assert!(live_conversation(&state, id).await.messages.len() <= 2);
+        assert_eq!(live_conversation(&state, id).await.messages.len(), 2);
+        assert_eq!(
+            disk_conversation(&temp, id)["messages"]
+                .as_array()
+                .expect("disk messages should be an array")
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]
@@ -15193,7 +15344,9 @@ mod tests {
             transaction_test_state_failing_on_replace(&temp, default_persisted_state(), 2).await;
         let id = "stop-persistence-failure";
         let mut events = subscribe_generation_events(&state, id).await;
-        let _ = start_synthetic_generation(&state, id, GenerationOperation::Send).await;
+        let (handle, _) = start_synthetic_generation(&state, id, GenerationOperation::Send).await;
+        assert!(broadcast_generation_delta(&state, id, &handle, "rejected partial reply").await);
+        let revision = state.revision.load(Ordering::Acquire);
 
         let response = stop_conversation(State(state.clone()), Path(id.to_string()))
             .await
@@ -15202,9 +15355,142 @@ mod tests {
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert!(!has_active_generation(&state, id).await);
         assert_eq!(live_conversation(&state, id).await.messages.len(), 1);
-        let names = drain_event_names(&mut events);
-        assert_eq!(names.iter().filter(|event| *event == "failed").count(), 1);
-        assert_eq!(names.iter().filter(|event| *event == "stopped").count(), 0);
+        assert_eq!(state.revision.load(Ordering::Acquire), revision);
+        assert_eq!(
+            disk_conversation(&temp, id)["messages"]
+                .as_array()
+                .expect("disk messages should be an array")
+                .len(),
+            1
+        );
+        let events = drain_events(&mut events);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event == "failed")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event == "stopped")
+                .count(),
+            0
+        );
+        let failed = events
+            .iter()
+            .find(|event| event.event == "failed")
+            .expect("failed terminal should be emitted");
+        assert_eq!(failed.data["reason"], "persistence");
+        assert!(!events.iter().any(|event| {
+            event.event == "snapshot"
+                && event.data.to_string().contains("rejected partial reply")
+                && event.data["transient"] != true
+        }));
+    }
+
+    #[tokio::test]
+    async fn stop_transaction_stale_owner_cannot_overwrite_new_generation() {
+        let temp = SyntheticTempDir::new("stop-stale-owner");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let id = "stop-stale-owner";
+        let (old_handle, old_plan) =
+            start_synthetic_generation(&state, id, GenerationOperation::Send).await;
+        assert!(broadcast_generation_delta(&state, id, &old_handle, "stale partial").await);
+        let old_owner = match request_generation_stop(&state, id).await {
+            StopGenerationRequest::Owner(owner) => owner,
+            _ => panic!("old generation should own stop finalization"),
+        };
+        assert!(remove_generation_if_current(&state, id, &old_handle).await);
+
+        let new_handle = begin_generation(&state, id, GenerationOperation::Send)
+            .await
+            .expect("new generation should reserve");
+        assert!(
+            activate_generation(&state, id, &new_handle, old_plan, MOCK_MODEL_ID.to_string(),)
+                .await
+        );
+        let revision = state.revision.load(Ordering::Acquire);
+        assert!(matches!(
+            commit_stopped_generation(&state, id.to_string(), old_owner).await,
+            Err(StateMutationError::Conflict(_))
+        ));
+        assert_eq!(state.revision.load(Ordering::Acquire), revision);
+        assert_eq!(live_conversation(&state, id).await.messages.len(), 1);
+        let generations = state.active_generations.lock().await;
+        assert_eq!(
+            generations.get(id).unwrap().handle.generation_id,
+            new_handle.generation_id
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_transaction_deleted_conversation_is_not_recreated() {
+        let temp = SyntheticTempDir::new("stop-deleted-conversation");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let id = "stop-deleted-conversation";
+        let (handle, _) = start_synthetic_generation(&state, id, GenerationOperation::Send).await;
+        assert!(broadcast_generation_delta(&state, id, &handle, "deleted partial").await);
+        let owner = match request_generation_stop(&state, id).await {
+            StopGenerationRequest::Owner(owner) => owner,
+            _ => panic!("generation should own stop finalization"),
+        };
+
+        let response = delete_conversation(State(state.clone()), Path(id.to_string()))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(matches!(
+            commit_stopped_generation(&state, id.to_string(), owner).await,
+            Err(StateMutationError::Conflict(_))
+        ));
+        assert!(!state.conversations.read().await.contains_key(id));
+        assert!(disk_conversation(&temp, id).is_null());
+    }
+
+    #[tokio::test]
+    async fn stop_transaction_without_sse_subscriber_still_persists_partial() {
+        let temp = SyntheticTempDir::new("stop-no-subscriber");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let id = "stop-no-subscriber";
+        let (handle, _) = start_synthetic_generation(&state, id, GenerationOperation::Send).await;
+        assert!(broadcast_generation_delta(&state, id, &handle, "subscriber-free partial").await);
+
+        let response = stop_conversation(State(state.clone()), Path(id.to_string()))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            selected_texts(&live_conversation(&state, id).await).last(),
+            Some(&"subscriber-free partial".to_string())
+        );
+        assert_eq!(
+            disk_conversation(&temp, id)["messages"]
+                .as_array()
+                .expect("disk messages should be an array")
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_transaction_mock_fallback_uses_shared_partial_commit() {
+        let temp = SyntheticTempDir::new("stop-mock-fallback");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let id = "stop-mock-fallback";
+        let (handle, _) = start_synthetic_generation(&state, id, GenerationOperation::Send).await;
+        assert!(publish_local_reply_delta(&state, id, &handle, MOCK_REPLY_TEXT).await);
+
+        let response = stop_conversation(State(state.clone()), Path(id.to_string()))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            selected_texts(&live_conversation(&state, id).await).last(),
+            Some(&MOCK_REPLY_TEXT.to_string())
+        );
+        assert_eq!(live_conversation(&state, id).await.messages.len(), 2);
     }
 
     #[tokio::test]
@@ -15269,7 +15555,16 @@ mod tests {
         let new_handle = begin_generation(&state, id, GenerationOperation::Send)
             .await
             .expect("new generation should reserve");
-        assert!(activate_generation(&state, id, &new_handle).await);
+        assert!(
+            activate_generation(
+                &state,
+                id,
+                &new_handle,
+                old_plan.clone(),
+                MOCK_MODEL_ID.to_string(),
+            )
+            .await
+        );
 
         assert!(!finalize_generation_with_text(
             &state,
@@ -15394,16 +15689,7 @@ mod tests {
         let mut events = subscribe_generation_events(&state, id).await;
         let (handle, plan) =
             start_synthetic_generation(&state, id, GenerationOperation::Send).await;
-        broadcast_generation_delta(
-            &state,
-            id,
-            &handle,
-            &plan,
-            MOCK_MODEL_ID,
-            "synthetic event delta",
-            "synthetic event delta",
-        )
-        .await;
+        assert!(broadcast_generation_delta(&state, id, &handle, "synthetic event delta").await);
         assert!(finalize_generation_with_text(
             &state,
             id,
@@ -15589,7 +15875,7 @@ mod tests {
         let temp = SyntheticTempDir::new("stream-network-no-locks");
         let state = transaction_test_state(&temp, default_persisted_state(), None).await;
         let id = "stream-network-no-locks";
-        let (handle, plan) =
+        let (handle, _plan) =
             start_synthetic_generation(&state, id, GenerationOperation::Send).await;
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -15630,14 +15916,11 @@ mod tests {
         };
         let stream_state = state.clone();
         let stream_handle = handle.clone();
-        let stream_plan = plan.clone();
         let stream = tokio::spawn(async move {
             stream_openai_compatible_chat(
                 &stream_state,
                 id,
                 &stream_handle,
-                &stream_plan,
-                MOCK_MODEL_ID,
                 &config,
                 vec![OpenAiChatMessage {
                     role: "user".to_string(),
@@ -16135,18 +16418,12 @@ mod tests {
         let temp = SyntheticTempDir::new("backup-active-generation");
         let state = backup_test_state(&temp, Vec::new()).await;
         let id = "backup-active-generation";
-        let (handle, plan) =
+        let (handle, _plan) =
             start_synthetic_generation(&state, id, GenerationOperation::Send).await;
-        broadcast_generation_delta(
-            &state,
-            id,
-            &handle,
-            &plan,
-            MOCK_MODEL_ID,
-            "synthetic transient backup delta",
-            "synthetic transient backup delta",
-        )
-        .await;
+        assert!(
+            broadcast_generation_delta(&state, id, &handle, "synthetic transient backup delta",)
+                .await
+        );
         let destination = backup_destination(&temp, "active-generation");
         let package = export_backup_package(&state, &destination, BackupExportMode::ModeA)
             .await

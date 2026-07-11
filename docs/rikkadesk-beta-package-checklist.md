@@ -227,7 +227,7 @@ P1-C3 verification must cover:
 - Safe errors and fixed warnings containing no blob bytes, storage key, original file name, absolute path, state JSON, or user message.
 - The synthetic `file_transaction`, `blob_compensation`, `file_delete`, and `file_reference` groups plus the complete Rust suite. Never use real app data or real user files.
 
-Phase 12 P1-C4 commits the initial user turn before any provider/mock task, keeps generation state and deltas runtime-only, and commits the final assistant append/replace through the staged-state helper before terminal success. Regenerate retains the old reply until atomic replacement. Stop discards transient partial text. Generation tokens prevent stale finish/delete races, and restart retains the durable user turn without resuming the stream.
+Phase 12 P1-C4 commits the initial user turn before any provider/mock task, keeps generation state and deltas runtime-only during normal generation, and commits the final assistant append/replace through the staged-state helper before terminal success. Regenerate retains the old reply until atomic replacement. An explicit Stop stages and persists the currently displayed partial buffer before terminal success. Generation tokens prevent stale finish/delete races, and restart retains durable messages without resuming the stream.
 
 P1-C4 verification must cover:
 
@@ -235,7 +235,7 @@ P1-C4 verification must cover:
 - Final persistence failure for provider and mock paths: no assistant in live/disk, no revision increase, fixed persistence failure, and no `finished`.
 - Transient deltas: UI events may show progress, while live persisted conversations and `state.v1.json` contain no partial assistant reply.
 - Regenerate success atomically replaces the old reply; provider, persistence, edited-target, and deleted-target failures preserve current durable content.
-- Stop/finish race emits exactly one of `finished`, `stopped`, or `failed`; the discard-partial stop policy leaves only prior durable content.
+- Stop/finish race emits exactly one of `finished`, `stopped`, or `failed`; the persist-partial stop policy commits a nonempty current buffer through the staged-state helper and never creates an empty assistant message.
 - Same-conversation send/regenerate conflict, different-conversation concurrency, stale generation rejection, and conversation delete without background recreation.
 - Category A and file/provider transaction concurrency during stream/final commit without lost updates or deadlock.
 - Restart drops active runtime generation and transient text while retaining the durable user message.

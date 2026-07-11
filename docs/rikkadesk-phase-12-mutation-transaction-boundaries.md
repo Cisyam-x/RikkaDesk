@@ -97,7 +97,7 @@ State and blob storage are not one crash-atomic resource. A process crash betwee
 | Favorite models | settings | Yes | settings SSE | P1-C1 discards failed stage; live/disk/revision remain old | Implemented staged transaction | A |
 | Conversation detail/stream missing-ID read | None in persisted state | No | Runtime-only stream sender | Returns a virtual DTO without inserting or saving | Implemented pure GET | Read |
 | Send user message | conversations, title/mode/lorebook, `id_seq`; runtime generation registry | Yes before provider work | committed snapshot/start, then local reply or provider task | Failed stage leaves live/disk/revision unchanged; reservation is removed; no task/event | Implemented initial staged transaction | B |
-| Stop conversation | conversations timestamp plus runtime generation registry | Yes | Cancels stream reads; discards transient partial; terminal after commit | Failed stage leaves durable content unchanged and emits `failed`, not `stopped` | Implemented token-owned stop transaction | B |
+| Stop conversation | conversations plus runtime generation registry | Yes | Claims token-owned stop finalization; commits a nonempty partial buffer; terminal after commit | Empty buffer creates no message; failed stage leaves durable content unchanged and emits `failed`, not `stopped` | Implemented token-owned persist-partial stop transaction | B |
 | Conversation title | conversations | Yes | conversation/list SSE | P1-C1 leaves live/disk old on failure | Implemented staged transaction | A |
 | Pin/unpin | conversations | Yes | conversation/list SSE | P1-C1 leaves live/disk old on failure | Implemented staged transaction | A |
 | Conversation delete | conversations | Yes | Runtime generation/sender cleanup after commit; list SSE after commit | Failed stage leaves conversation and runtime resources intact | Implemented staged transaction | A |
@@ -373,7 +373,7 @@ P1-C4 uses transient delta semantics:
 - On provider/mock completion, the token owner stages the final assistant append/replace against the latest live state, persists it, commits live, then emits the committed snapshot and `finished`.
 - Final persistence failure leaves live/disk/revision at the durable user/old-assistant state, releases the buffer, emits fixed `failed: persistence`, and never emits `finished`.
 - SSE disconnection or absence does not roll back a completed durable commit.
-- Stop uses the discard-partial policy: transient text is dropped, durable state retains the user turn or old regenerated reply, and `stopped` is emitted only after the short stop transaction succeeds.
+- Stop uses the persist-partial policy: deltas remain transient during normal generation, but explicit Stop atomically snapshots the current buffer and stages a nonempty partial assistant append/replace. `stopped` is emitted only after durable/live commit; persistence failure preserves prior durable content and emits fixed `failed: persistence`.
 - Runtime restart does not resume generation. The durable user turn remains; transient assistant text and active registry entries are lost by design.
 
 ## Endpoint Success And Error Semantics
@@ -445,7 +445,7 @@ Scope:
 - Task-local delta buffer with explicitly transient SSE; no durable assistant placeholder or partial message.
 - Token/revision checks for stop/delete/regenerate/edit races and no `entry`-based conversation recreation.
 - Final append/replace through one staged transaction, with terminal success only after durable/live commit.
-- Stop discard-partial semantics and lifecycle serialization that makes `finished`, `stopped`, and `failed` mutually exclusive.
+- Stop persist-partial semantics and lifecycle serialization that makes `finished`, `stopped`, and `failed` mutually exclusive.
 - Synthetic loopback proof that Category A transactions complete while a provider response is blocked.
 
 ## Synthetic Test Plan
@@ -532,7 +532,7 @@ Reason: a backup snapshot cannot be represented as consistent while runtime writ
 - Message/conversation deletion auto-GCs managed blobs: No; conservative orphan cleanup is deferred.
 - Background streaming staged/final transaction semantics implemented: Yes, in P1-C4.
 - Streaming delta durable: No; it is explicitly transient until final commit.
-- Stop partial reply policy: Discard transient partial text.
+- Stop partial reply policy: Persist the nonempty current buffer only after explicit Stop obtains terminal ownership; normal deltas remain transient.
 - Streaming resume across restart: No.
 - ID policy: gaps allowed, duplicates forbidden, never decrement `id_seq`.
 - Pure settings/conversation staged transactions implemented: Yes.

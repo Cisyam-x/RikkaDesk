@@ -101,7 +101,7 @@ Implemented behavior:
 - Streaming text is task-local. `delta` and compatibility snapshots are explicitly transient; live persisted conversations and `state.v1.json` contain no partial assistant reply.
 - Provider/mock completion stages the final assistant append, persists it, commits live, then emits the committed snapshot and `finished`. Final persistence failure retains only the durable user turn, emits fixed `failed: persistence`, and never emits `finished`.
 - Regenerate keeps the old assistant reply until a final staged transaction atomically replaces it. Provider failure, persistence failure, or a changed/deleted source/target preserves user edits and prevents stale overwrite.
-- Stop uses the discard-partial policy. It cancels stream reads, drops transient text, persists the stopped durable state, and emits exactly one `stopped`; persistence failure emits `failed` instead.
+- Stop uses the persist-partial policy. It takes token-owned terminal control, cancels stream reads, stages the currently displayed nonempty buffer as a normal assistant message, commits live only after persistence, and then emits exactly one `stopped`. An empty buffer creates no message; persistence failure emits fixed `failed: persistence` and never emits `stopped`.
 - Conversation delete commits first, cancels/removes the matching runtime token, and prevents an old finalizer from recreating the conversation. Category A mutations during a stream are retained by the final staged snapshot.
 - Runtime restart intentionally drops active generations and transient assistant text. The durable user turn remains; stream resume and automatic request retry are not implemented.
 - P1-C4 adds 32 synthetic transaction, registry, event-order, regenerate, stop, restart, and loopback-network tests. No real app data, encrypted secret blob, API key, user file, or real provider is used.
@@ -724,7 +724,7 @@ The complete call-site inventory, lock order, external-side-effect matrix, compe
 - Commits the initial user turn before provider/mock startup and uses no durable assistant placeholder.
 - Keeps provider waits and stream reads outside transaction/component/commit/file/Provider locks.
 - Uses runtime generation tokens, cancellation, transient delta semantics, final/failure staged commits, stale target checks, and post-commit terminal SSE ordering.
-- Defines stop as discard-partial, makes terminal events mutually exclusive, and prevents old tasks from recreating deleted conversations.
+- Defines stop as persist-partial after explicit cancellation, makes terminal events mutually exclusive, and prevents old tasks from recreating deleted conversations.
 - Adds 32 synthetic tests, including blocked loopback SSE with a concurrent Category A transaction.
 
 The runtime mutation gate through P1-C4 is complete. Mode A/B export and P2-B validation/dry-run are also complete; actual offline restore remains unimplemented.

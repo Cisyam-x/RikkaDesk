@@ -41,6 +41,7 @@ import {
   type MessageDto,
   type ConversationNodeUpdateEventDto,
   type ConversationErrorEventDto,
+  type ConversationGenerationTerminalEventDto,
   type ConversationSnapshotEventDto,
   type ProviderModel,
   type Settings,
@@ -57,7 +58,8 @@ import i18n from "~/i18n";
 type ConversationStreamEvent =
   | ConversationSnapshotEventDto
   | ConversationNodeUpdateEventDto
-  | ConversationErrorEventDto;
+  | ConversationErrorEventDto
+  | ConversationGenerationTerminalEventDto;
 
 interface SelectedNodeMessage {
   node: MessageNodeDto;
@@ -98,6 +100,15 @@ function truncatePreviewText(value: string, maxLength = 48): string {
   }
 
   return `${value.slice(0, maxLength)}...`;
+}
+
+function initialSendTitle(parts: UIMessagePart[], fallback: string): string {
+  const text = parts
+    .find((part): part is Extract<UIMessagePart, { type: "text" }> => part.type === "text")
+    ?.text.trim();
+  if (!text) return fallback;
+
+  return truncatePreviewText(text);
 }
 
 function getQuickJumpPreview(
@@ -408,6 +419,17 @@ function useConversationDetail(activeId: string | null, updateSummary: Conversat
             return;
           }
 
+          if (
+            (event === "finished" || event === "stopped" || event === "failed") &&
+            data.type === event
+          ) {
+            setDetail((prev) =>
+              prev?.id === activeId ? { ...prev, isGenerating: false } : prev,
+            );
+            setDetailLoading(false);
+            return;
+          }
+
           if (event === "snapshot" && data.type === "snapshot") {
             useAppStore.getState().setClockOffset(data.serverTime);
             applyConversation(data.conversation);
@@ -471,6 +493,8 @@ function useDraftInputController({
   navigate,
   refreshList,
   seedDetail,
+  onInitialSendPending,
+  onInitialSendSettled,
 }: {
   activeId: string | null;
   isHomeRoute: boolean;
@@ -481,6 +505,8 @@ function useDraftInputController({
   navigate: ReturnType<typeof useNavigate>;
   refreshList: () => void;
   seedDetail: (conversation: ConversationDto) => void;
+  onInitialSendPending: (parts: UIMessagePart[]) => void;
+  onInitialSendSettled: () => void;
 }) {
   const draftKey = activeId ?? (isHomeRoute ? homeDraftId : null);
   const draft = useChatInputStore(
@@ -554,25 +580,32 @@ function useDraftInputController({
 
     const conversationId = uuidv4();
     const promptInjectionIds = getPromptInjectionIds(draftKey);
-    const response = await api.post<SendMessageResponse>(
-      `conversations/${conversationId}/messages`,
-      {
-        parts,
-        ...(options ?? {}),
-        ...(useConversationPromptInjection
-          ? {
-              modeInjectionIds: promptInjectionIds.modeInjectionIds,
-              lorebookIds: promptInjectionIds.lorebookIds,
-            }
-          : {}),
-      },
-    );
-    seedDetail(response.conversation);
-    setActiveId(conversationId);
-    navigate(`/c/${conversationId}`);
-    clearDraft(draftKey);
-    setHomeDraftId(createHomeDraftId());
-    refreshList();
+    onInitialSendPending(parts);
+    try {
+      const response = await api.post<SendMessageResponse>(
+        `conversations/${conversationId}/messages`,
+        {
+          parts,
+          ...(options ?? {}),
+          ...(useConversationPromptInjection
+            ? {
+                modeInjectionIds: promptInjectionIds.modeInjectionIds,
+                lorebookIds: promptInjectionIds.lorebookIds,
+              }
+            : {}),
+        },
+      );
+      seedDetail(response.conversation);
+      setActiveId(conversationId);
+      navigate(`/c/${conversationId}`);
+      onInitialSendSettled();
+      clearDraft(draftKey);
+      setHomeDraftId(createHomeDraftId());
+      refreshList();
+    } catch (error) {
+      onInitialSendSettled();
+      throw error;
+    }
   }, [
     activeId,
     addDraftParts,
@@ -581,6 +614,8 @@ function useDraftInputController({
     getPromptInjectionIds,
     getSubmitParts,
     navigate,
+    onInitialSendPending,
+    onInitialSendSettled,
     refreshList,
     seedDetail,
     setActiveId,
@@ -782,6 +817,7 @@ export default function ConversationsPage() {
 
 function ConversationsPageInner() {
   const { t } = useTranslation("page");
+  const { t: tCommon } = useTranslation("common");
   const navigate = useNavigate();
   const { id: routeId } = useParams();
   const isHomeRoute = !routeId;
@@ -805,9 +841,22 @@ function ConversationsPageInner() {
 
   const [homeDraftId, setHomeDraftId] = React.useState(() => createHomeDraftId());
   const [editingSession, setEditingSession] = React.useState<EditingSession | null>(null);
+  const [initialSendPendingTitle, setInitialSendPendingTitle] = React.useState<string | null>(null);
 
   const { detail, detailLoading, detailError, selectedNodeMessages, resetDetail, seedDetail } =
     useConversationDetail(activeId, updateConversationSummary);
+
+  const handleInitialSendPending = React.useCallback(
+    (parts: UIMessagePart[]) => {
+      setInitialSendPendingTitle(
+        initialSendTitle(parts, tCommon("conversation_sidebar.new_conversation")),
+      );
+    },
+    [tCommon],
+  );
+  const handleInitialSendSettled = React.useCallback(() => {
+    setInitialSendPendingTitle(null);
+  }, []);
 
   const {
     draftKey,
@@ -830,11 +879,15 @@ function ConversationsPageInner() {
     navigate,
     refreshList,
     seedDetail,
+    onInitialSendPending: handleInitialSendPending,
+    onInitialSendSettled: handleInitialSendSettled,
   });
 
   const activeConversation = conversations.find((item) => item.id === activeId);
   const activeConversationTitle =
-    activeConversation?.title ?? (detail?.id === activeId ? detail.title : null);
+    activeConversation?.title ??
+    (detail?.id === activeId ? detail.title : null) ??
+    initialSendPendingTitle;
   const chatSuggestions = detail?.chatSuggestions ?? EMPTY_SUGGESTIONS;
 
   React.useEffect(() => {
