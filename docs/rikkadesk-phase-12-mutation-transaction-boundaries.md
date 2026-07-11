@@ -540,4 +540,17 @@ Reason: a backup snapshot cannot be represented as consistent while runtime writ
 - Runtime revision persisted in schema v6: No.
 - Recovery/backup modes implemented by P1-C1/P1-C2/P1-C3/P1-C4: No.
 
-Recommended next step: Mode A/B backup package design and implementation. The runtime mutation gate through P1-C4 is complete, while documented SecretStore/blob process-crash orphan windows still require package validation and later reconciliation policy.
+P2-A Mode A/B backup package export is complete. The recommended next step is P2-B restore validation and dry-run; documented SecretStore/blob process-crash orphan windows still require later reconciliation policy.
+
+## P2-A Backup Export Lock Boundary
+
+P2-A completes the backend-only Mode A/B export primitive defined in `docs/rikkadesk-phase-12-backup-package-format.md`.
+
+- All exports begin with runtime-only `backup_export_mutex`, so package temp/final names and validation cannot race another export in the same process.
+- Mode A briefly takes `mutation_transaction_mutex` and the commit read barrier to clone a point-in-time persisted snapshot, then releases all state locks before package I/O.
+- Mode B takes `file_blob_transaction_mutex` before the same short state snapshot. It releases mutation/component/commit locks before copying and retains only file/blob lock until active blob copies are complete.
+- This matches existing upload/delete/provider-image ordering (`file/blob -> staged state`) and introduces no `mutation -> file/blob` reverse wait.
+- Provider/SecretStore lock and SecretStore APIs are never used. Runtime generation registry and transient buffers are not persisted or inspected.
+- Validation and directory rename occur after package contents are written and synced. A failed build removes only its temp directory and never publishes or overwrites a final package.
+
+P2-A does not change the transaction semantics of live state, implement restore writes, or eliminate SecretStore/blob process-crash orphan windows. P2-B should reuse format validation for a no-write restore dry run.

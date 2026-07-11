@@ -815,11 +815,31 @@ The complete call-site inventory, lock order, external-side-effect matrix, compe
 
 The runtime mutation gate through P1-C4 is complete. Mode A/B backup package work may begin, subject to the documented SecretStore/blob process-crash residuals and package-level validation requirements.
 
-### P2: Portable Metadata/Full Backup Package
+## P2-A Implementation Status
+
+Phase 12 P2-A implements internal portable backup export primitives and directory package format version 1. It does not expose a user command, HTTP endpoint, or UI, and it does not implement restore.
+
+Implemented behavior:
+
+- Mode A exports one consistent sanitized `state.json`, `manifest.json`, and `SHA256SUMS.txt`. It does not inspect or copy managed blobs.
+- Mode B exports the same point-in-time state plus every active managed blob under controlled `blobs/file-<file-id>.blob` names. Missing active blobs fail closed; tombstoned and orphan blobs are excluded; active unreferenced files remain included.
+- Source Provider/settings secret references are replaced with backup-unavailable placeholders and `hasSecret` state is cleared. Export never calls SecretStore or copies `mock-api/secrets/*.bin`; API keys must be re-entered after a future restore.
+- Runtime generations and transient deltas are absent. A committed user turn can be included without an in-progress transient assistant reply, and backup does not support stream resume.
+- `backup_export_mutex` serializes exports. Mode B then takes file/blob lock before the short mutation/snapshot lock, releases mutation/component/commit locks, and retains only file/blob lock while streaming blob copies.
+- Package files use create-new, flush, and sync. SHA256 is computed from package copies. Manifest/checksum/state/blob relationships are re-read and validated before a unique temp directory is renamed to a non-existing final directory.
+- Source blob resolution validates storage metadata, rejects symlink/non-regular/escape sources, and never uses display names or source storage keys as package paths.
+- Validation rejects unsafe relative paths, duplicate/mismatched files, unknown blob entries, tampering, secrets directories, schema/version mismatch, and checksum/size mismatch.
+- P2-A adds 36 synthetic backup tests. No real app data, secret blob, API key, user file, or real provider is used, and no generated package is stored in the repository.
+
+The complete format is defined in `docs/rikkadesk-phase-12-backup-package-format.md`. P2-A uses a direct `sha2` dependency already present transitively in the lockfile; it adds no ZIP/archive framework.
+
+P2-A does not implement restore validation/dry-run, restore commit/rollback, UI, ZIP, Mode C, orphan scan/cleanup, cross-resource crash atomicity, or complete power-loss protection.
+
+### P2-A: Portable Metadata/Full Backup Export Package (Completed)
 
 Goal:
 
-- Implement manifest and checksum generation for Modes A/B, excluding secrets.
+- Export and self-validate format v1 Mode A/B directory packages while excluding secrets.
 
 Candidate files:
 
@@ -829,11 +849,27 @@ Candidate files:
 
 Acceptance:
 
-- Manifest contains no local path/user content/secret.
-- Mode A exports state metadata only.
-- Mode B exports state plus referenced blobs.
-- Every entry is checksummed and allowlisted.
-- No API key or DPAPI blob is exported.
+- Manifest contains no source path, source secret reference, API key, or blob content.
+- Mode A exports a sanitized state snapshot only and does not read managed blobs.
+- Mode B exports state plus every active blob, including unreferenced active files.
+- Every package file is allowlisted and SHA256-verified before publication.
+- No API key, SecretStore value, or DPAPI blob is accessed or exported.
+
+Implemented with backend-only primitives and synthetic tests. Restore remains unavailable.
+
+### P2-B: Restore Validation And Dry Run
+
+Goal:
+
+- Parse and validate a selected format v1 package without modifying current app data.
+
+Required behavior:
+
+- Reuse package path/hash/schema/mode validation.
+- Report missing, unknown, tombstoned, and incompatible entries with fixed safe diagnostics.
+- Normalize all Providers to `hasSecret: false` in the proposed restore state.
+- Produce a dry-run report only; do not replace state or blobs.
+- Keep Mode C and secret restoration deferred.
 
 ### P3: Managed File Blob Backup/Restore
 

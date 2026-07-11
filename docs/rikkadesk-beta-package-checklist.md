@@ -244,6 +244,23 @@ P1-C4 verification must cover:
 
 P1-C1/P1-C2/P1-C3/P1-C4 complete the handled runtime mutation gate for Mode A/B backup package work. Do not claim that state and network are atomic, streaming resumes across restart, or every delta is durable. Do not claim that SecretStore and JSON state are fully atomic across process crashes: an unreferenced encrypted orphan can remain between new-secret prepare and state commit or between state commit and old-secret cleanup. Managed blob publication and physical deletion also retain crash-only orphan windows, and automatic orphan reconciliation/GC is not implemented.
 
+Phase 12 P2-A adds backend-only portable backup directory packages with `formatVersion: 1`. Mode A contains sanitized `state.json`, `manifest.json`, and `SHA256SUMS.txt` without managed blobs. Mode B additionally contains every active managed blob under `blobs/file-<file-id>.blob` and is the recommended portable mode. Both modes exclude SecretStore/DPAPI blobs, API keys, source secret references, active generation state, transient deltas, logs, and absolute app-data paths.
+
+P2-A verification must cover:
+
+- Mode A success, no blob directory/bytes, no blob-root read, and point-in-time state unaffected by later mutations.
+- Mode B active blob inclusion; tombstone/orphan exclusion; unreferenced active inclusion; missing active blob hard failure without Mode A downgrade.
+- Invalid storage key, symlink/non-regular/escape source, metadata size/hash mismatch, and blob copy failure produce no final package.
+- Manifest format/mode/schema/import-export/exclusion flags and sorted `fileId` records.
+- SHA256SUMS contains sorted relative paths for state/manifest/blobs, excludes itself, and matches re-read package copies.
+- Tampered state/blob/manifest, unknown entries, unsafe paths, or a `secrets/` directory fail validation before publish.
+- Mode B file lock blocks upload/delete during snapshot/copy; Category A/Provider updates produce a complete old-or-new snapshot; active generation/transient delta is excluded.
+- Concurrent exports serialize and publish unique directories. Name collisions and write/manifest/publish failures never overwrite or delete another package.
+- SecretStore fake panics on access, proving access count zero. Safe errors contain no user data, display name, storage key, secret reference, or source/destination path.
+- Run `backup_export`, `backup_mode_a`, `backup_mode_b`, `backup_manifest`, `backup_checksum`, and `backup_concurrency` plus the complete Rust suite. P2-A adds 36 synthetic tests.
+
+P2-A does not expose backup UI/API, create ZIP files, implement restore, include Mode C, clean orphans, restore active streams, or make state/blob resources crash-atomic. The next step is P2-B restore package validation and dry-run reporting without writes.
+
 It may contain:
 
 - settings

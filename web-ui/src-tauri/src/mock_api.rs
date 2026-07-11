@@ -3,7 +3,7 @@ use std::{
     convert::Infallible,
     error::Error,
     fmt, fs as std_fs,
-    io::{self, Write},
+    io::{self, Read, Write},
     net::{IpAddr, SocketAddr},
     path::{Path as FilePath, PathBuf},
     ptr,
@@ -32,6 +32,7 @@ use chrono::Utc;
 use reqwest::header::{HeaderName as ReqwestHeaderName, HeaderValue as ReqwestHeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use tokio::{
     fs,
     net::TcpListener,
@@ -52,6 +53,16 @@ const PERSIST_DIR_NAME: &str = "mock-api";
 const STATE_FILE_NAME: &str = "state.v1.json";
 const STATE_TMP_FILE_PREFIX: &str = "state.v1.json.tmp";
 const STATE_BACKUP_CREATE_ATTEMPTS: usize = 32;
+const BACKUP_FORMAT_NAME: &str = "rikkadesk-backup";
+const BACKUP_FORMAT_VERSION: u32 = 1;
+const BACKUP_CREATE_ATTEMPTS: usize = 32;
+const BACKUP_MANIFEST_FILE_NAME: &str = "manifest.json";
+const BACKUP_STATE_FILE_NAME: &str = "state.json";
+const BACKUP_CHECKSUM_FILE_NAME: &str = "SHA256SUMS.txt";
+const BACKUP_BLOBS_DIR_NAME: &str = "blobs";
+const BACKUP_TEMP_DIR_PREFIX: &str = ".rikkadesk-backup.tmp";
+const BACKUP_FINAL_DIR_PREFIX: &str = "RikkaDesk-backup-v1";
+const BACKUP_SECRET_REF_MARKER: &str = "backup-unavailable";
 const STATE_SCHEMA_VERSION: u32 = 6;
 const FILE_METADATA_STATE_SCHEMA_VERSION: u32 = 5;
 const CUSTOM_REQUEST_CONFIG_STATE_SCHEMA_VERSION: u32 = 4;
@@ -1012,6 +1023,104 @@ impl ManagedFileMetadata {
     }
 }
 
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackupExportMode {
+    ModeA,
+    ModeB,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum BackupManifestMode {
+    #[serde(rename = "state-only")]
+    StateOnly,
+    #[serde(rename = "full-local-data")]
+    FullLocalData,
+}
+
+impl BackupExportMode {
+    fn manifest_mode(self) -> BackupManifestMode {
+        match self {
+            Self::ModeA => BackupManifestMode::StateOnly,
+            Self::ModeB => BackupManifestMode::FullLocalData,
+        }
+    }
+
+    fn includes_managed_blobs(self) -> bool {
+        matches!(self, Self::ModeB)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BackupManifestState {
+    path: String,
+    sha256: String,
+    size_bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BackupManifestFile {
+    file_id: u64,
+    package_path: String,
+    mime: String,
+    size_bytes: u64,
+    sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BackupManifest {
+    format: String,
+    format_version: u32,
+    mode: BackupManifestMode,
+    created_at: String,
+    app_version: String,
+    state_schema_version: u32,
+    provider_import_export_version: u32,
+    secrets_included: bool,
+    managed_blobs_included: bool,
+    runtime_generations_included: bool,
+    state: BackupManifestState,
+    files: Vec<BackupManifestFile>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+struct BackupExportPackage {
+    path: PathBuf,
+    manifest: BackupManifest,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackupExportError {
+    SnapshotInvalid,
+    BlobMissing,
+    BlobReadFailed,
+    WriteFailed,
+    HashMismatch,
+    PackageValidationFailed,
+    PublishFailed,
+}
+
+impl fmt::Display for BackupExportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::SnapshotInvalid => "backup snapshot is invalid",
+            Self::BlobMissing => "backup active blob is missing",
+            Self::BlobReadFailed => "backup blob could not be read safely",
+            Self::WriteFailed => "backup package write failed",
+            Self::HashMismatch => "backup checksum validation failed",
+            Self::PackageValidationFailed => "backup package validation failed",
+            Self::PublishFailed => "backup package publish failed",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl Error for BackupExportError {}
+
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopProviderConfig {
@@ -1872,6 +1981,7 @@ struct MockApiState {
     http_client: reqwest::Client,
     provider_secret_transaction_mutex: Mutex<()>,
     file_blob_transaction_mutex: Mutex<()>,
+    backup_export_mutex: Mutex<()>,
     generation_transition_mutex: Mutex<()>,
     mutation_transaction_mutex: Mutex<()>,
     commit_barrier: RwLock<()>,
@@ -1885,6 +1995,7 @@ struct MockApiState {
     list_tx: broadcast::Sender<SsePayload>,
     seq: AtomicU64,
     generation_seq: AtomicU64,
+    backup_seq: AtomicU64,
     secret_seq: AtomicU64,
     id_seq: AtomicU64,
     revision: AtomicU64,
@@ -1933,6 +2044,7 @@ impl MockApiState {
                 .unwrap_or_else(|_| reqwest::Client::new()),
             provider_secret_transaction_mutex: Mutex::new(()),
             file_blob_transaction_mutex: Mutex::new(()),
+            backup_export_mutex: Mutex::new(()),
             generation_transition_mutex: Mutex::new(()),
             mutation_transaction_mutex: Mutex::new(()),
             commit_barrier: RwLock::new(()),
@@ -1946,6 +2058,7 @@ impl MockApiState {
             list_tx,
             seq: AtomicU64::new(1),
             generation_seq: AtomicU64::new(1),
+            backup_seq: AtomicU64::new(1),
             secret_seq: AtomicU64::new(1),
             id_seq: AtomicU64::new(initial_id_seq),
             revision: AtomicU64::new(0),
@@ -2240,6 +2353,658 @@ async fn persisted_snapshot_from_live(state: &MockApiState) -> PersistedMockStat
         providers,
         files,
     }
+}
+
+#[allow(dead_code)]
+async fn export_backup_package(
+    state: &Arc<MockApiState>,
+    destination_root: &FilePath,
+    mode: BackupExportMode,
+) -> Result<BackupExportPackage, BackupExportError> {
+    let _backup_guard = state.backup_export_mutex.lock().await;
+    let destination_root = destination_root.to_path_buf();
+    let sequence_start = state
+        .backup_seq
+        .fetch_add(BACKUP_CREATE_ATTEMPTS as u64, Ordering::Relaxed);
+
+    match mode {
+        BackupExportMode::ModeA => {
+            let snapshot = portable_backup_snapshot(state).await?;
+            tokio::task::spawn_blocking(move || {
+                build_and_publish_backup_package(
+                    &destination_root,
+                    mode,
+                    snapshot,
+                    None,
+                    sequence_start,
+                )
+            })
+            .await
+            .map_err(|_| BackupExportError::WriteFailed)?
+        }
+        BackupExportMode::ModeB => {
+            let _file_guard = state.file_blob_transaction_mutex.lock().await;
+            let snapshot = portable_backup_snapshot(state).await?;
+            let blob_root = state.blob_store.blobs_dir.clone();
+            tokio::task::spawn_blocking(move || {
+                build_and_publish_backup_package(
+                    &destination_root,
+                    mode,
+                    snapshot,
+                    Some(&blob_root),
+                    sequence_start,
+                )
+            })
+            .await
+            .map_err(|_| BackupExportError::WriteFailed)?
+        }
+    }
+}
+
+async fn portable_backup_snapshot(
+    state: &Arc<MockApiState>,
+) -> Result<PersistedMockState, BackupExportError> {
+    let snapshot = {
+        let _mutation_guard = state.mutation_transaction_mutex.lock().await;
+        persisted_snapshot_from_live(state).await
+    };
+    sanitize_and_validate_portable_backup_snapshot(snapshot)
+}
+
+fn sanitize_and_validate_portable_backup_snapshot(
+    mut snapshot: PersistedMockState,
+) -> Result<PersistedMockState, BackupExportError> {
+    if snapshot.schema_version != STATE_SCHEMA_VERSION {
+        return Err(BackupExportError::SnapshotInvalid);
+    }
+
+    for conversation in snapshot.conversations.values_mut() {
+        conversation.is_generating = false;
+        if conversation.messages.iter().any(|node| {
+            node.messages
+                .iter()
+                .any(|message| message.parts.iter().any(backup_part_is_unsafe))
+        }) {
+            return Err(BackupExportError::SnapshotInvalid);
+        }
+    }
+
+    let mut settings_secret_index = 0_u64;
+    sanitize_backup_secret_fields(&mut snapshot.settings, &mut settings_secret_index);
+    for (index, provider) in snapshot.providers.iter_mut().enumerate() {
+        provider.secret_ref =
+            format!("{PROVIDER_SECRET_REF_PREFIX}{BACKUP_SECRET_REF_MARKER}-{index}:api-key");
+    }
+    sync_settings_with_desktop_providers(&mut snapshot.settings, &snapshot.providers);
+
+    validate_persisted_state_for_transaction(&snapshot)
+        .map_err(|_| BackupExportError::SnapshotInvalid)?;
+    validate_provider_metadata_transaction(&snapshot)
+        .map_err(|_| BackupExportError::SnapshotInvalid)?;
+    validate_file_metadata_transaction(&snapshot)
+        .map_err(|_| BackupExportError::SnapshotInvalid)?;
+
+    Ok(snapshot)
+}
+
+fn sanitize_backup_secret_fields(value: &mut Value, sequence: &mut u64) {
+    match value {
+        Value::Object(object) => {
+            for (key, field) in object {
+                if key == "secretRef" {
+                    *field = json!(format!("{BACKUP_SECRET_REF_MARKER}-settings-{sequence}"));
+                    *sequence = sequence.saturating_add(1);
+                } else if key == "hasSecret" {
+                    *field = Value::Bool(false);
+                } else {
+                    sanitize_backup_secret_fields(field, sequence);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                sanitize_backup_secret_fields(item, sequence);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn backup_part_is_unsafe(part: &Value) -> bool {
+    let Some(object) = part.as_object() else {
+        return false;
+    };
+    let Some(part_type) = object.get("type").and_then(Value::as_str) else {
+        return false;
+    };
+    if !matches!(part_type, "image" | "video" | "audio" | "document") {
+        return false;
+    }
+    object
+        .get("url")
+        .and_then(Value::as_str)
+        .is_some_and(|url| {
+            let value = url.trim();
+            let lower = value.to_ascii_lowercase();
+            lower.starts_with("data:")
+                || lower.starts_with("file:")
+                || value.starts_with("\\\\")
+                || value.as_bytes().get(1) == Some(&b':')
+        })
+}
+
+fn build_and_publish_backup_package(
+    destination_root: &FilePath,
+    mode: BackupExportMode,
+    snapshot: PersistedMockState,
+    blob_root: Option<&FilePath>,
+    sequence_start: u64,
+) -> Result<BackupExportPackage, BackupExportError> {
+    let destination_root = validate_backup_destination_root(destination_root)?;
+
+    for attempt in 0..BACKUP_CREATE_ATTEMPTS {
+        let sequence = sequence_start + attempt as u64;
+        let timestamp = now_millis();
+        let temp_path = destination_root.join(format!(
+            "{BACKUP_TEMP_DIR_PREFIX}.{}.{}",
+            std::process::id(),
+            sequence
+        ));
+        let final_path =
+            destination_root.join(format!("{BACKUP_FINAL_DIR_PREFIX}-{timestamp}-{sequence}"));
+        if temp_path.exists() || final_path.exists() {
+            continue;
+        }
+        match std_fs::create_dir(&temp_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return Err(BackupExportError::WriteFailed),
+        }
+
+        let build_result = write_backup_package_contents(&temp_path, mode, &snapshot, blob_root)
+            .and_then(|manifest| {
+                validate_backup_package(&temp_path)?;
+                publish_backup_directory(&temp_path, &final_path)?;
+                Ok(BackupExportPackage {
+                    path: final_path.clone(),
+                    manifest,
+                })
+            });
+
+        if build_result.is_err() {
+            let _ = std_fs::remove_dir_all(&temp_path);
+        }
+        return build_result;
+    }
+
+    Err(BackupExportError::PublishFailed)
+}
+
+fn validate_backup_destination_root(
+    destination_root: &FilePath,
+) -> Result<PathBuf, BackupExportError> {
+    let metadata =
+        std_fs::symlink_metadata(destination_root).map_err(|_| BackupExportError::WriteFailed)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(BackupExportError::WriteFailed);
+    }
+    std_fs::canonicalize(destination_root).map_err(|_| BackupExportError::WriteFailed)
+}
+
+fn write_backup_package_contents(
+    package_root: &FilePath,
+    mode: BackupExportMode,
+    snapshot: &PersistedMockState,
+    blob_root: Option<&FilePath>,
+) -> Result<BackupManifest, BackupExportError> {
+    let mut state_bytes =
+        serde_json::to_vec_pretty(snapshot).map_err(|_| BackupExportError::SnapshotInvalid)?;
+    state_bytes.push(b'\n');
+    let state_path = package_root.join(BACKUP_STATE_FILE_NAME);
+    write_new_backup_file(&state_path, &state_bytes)?;
+    let (state_sha256, state_size) = sha256_file(&state_path)?;
+
+    let mut manifest_files = Vec::new();
+    if mode.includes_managed_blobs() {
+        let blob_root = blob_root.ok_or(BackupExportError::SnapshotInvalid)?;
+        let package_blob_root = package_root.join(BACKUP_BLOBS_DIR_NAME);
+        std_fs::create_dir(&package_blob_root).map_err(|_| BackupExportError::WriteFailed)?;
+
+        let mut active_files = snapshot
+            .files
+            .iter()
+            .filter(|file| file.deleted_at.is_none())
+            .cloned()
+            .collect::<Vec<_>>();
+        active_files.sort_by_key(|file| file.id);
+        if !active_files.is_empty() {
+            validate_backup_blob_root(blob_root)?;
+        }
+        for file in active_files {
+            let source = managed_blob_source_for_backup(blob_root, &file)?;
+            let package_path = format!("{BACKUP_BLOBS_DIR_NAME}/file-{}.blob", file.id);
+            let destination = package_root.join(&package_path);
+            let (sha256, size_bytes) = copy_backup_blob(&source, &destination)?;
+            if size_bytes != file.size_bytes
+                || file
+                    .sha256
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .is_some_and(|value| !value.eq_ignore_ascii_case(&sha256))
+            {
+                return Err(BackupExportError::HashMismatch);
+            }
+            manifest_files.push(BackupManifestFile {
+                file_id: file.id,
+                package_path,
+                mime: file.mime,
+                size_bytes,
+                sha256,
+            });
+        }
+    }
+
+    let manifest = BackupManifest {
+        format: BACKUP_FORMAT_NAME.to_string(),
+        format_version: BACKUP_FORMAT_VERSION,
+        mode: mode.manifest_mode(),
+        created_at: now_iso(),
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        state_schema_version: STATE_SCHEMA_VERSION,
+        provider_import_export_version: PROVIDER_IMPORT_EXPORT_VERSION,
+        secrets_included: false,
+        managed_blobs_included: mode.includes_managed_blobs(),
+        runtime_generations_included: false,
+        state: BackupManifestState {
+            path: BACKUP_STATE_FILE_NAME.to_string(),
+            sha256: state_sha256,
+            size_bytes: state_size,
+        },
+        files: manifest_files,
+    };
+    let mut manifest_bytes =
+        serde_json::to_vec_pretty(&manifest).map_err(|_| BackupExportError::WriteFailed)?;
+    manifest_bytes.push(b'\n');
+    let manifest_path = package_root.join(BACKUP_MANIFEST_FILE_NAME);
+    write_new_backup_file(&manifest_path, &manifest_bytes)?;
+    let (manifest_sha256, _) = sha256_file(&manifest_path)?;
+
+    let mut checksum_entries = vec![
+        (manifest_sha256, BACKUP_MANIFEST_FILE_NAME.to_string()),
+        (
+            manifest.state.sha256.clone(),
+            BACKUP_STATE_FILE_NAME.to_string(),
+        ),
+    ];
+    checksum_entries.extend(
+        manifest
+            .files
+            .iter()
+            .map(|file| (file.sha256.clone(), file.package_path.clone())),
+    );
+    checksum_entries.sort_by(|left, right| left.1.cmp(&right.1));
+    let checksums = checksum_entries
+        .into_iter()
+        .map(|(hash, path)| format!("{hash}  {path}\n"))
+        .collect::<String>();
+    write_new_backup_file(
+        &package_root.join(BACKUP_CHECKSUM_FILE_NAME),
+        checksums.as_bytes(),
+    )?;
+
+    Ok(manifest)
+}
+
+fn validate_backup_blob_root(blob_root: &FilePath) -> Result<PathBuf, BackupExportError> {
+    let metadata =
+        std_fs::symlink_metadata(blob_root).map_err(|_| BackupExportError::BlobMissing)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(BackupExportError::BlobReadFailed);
+    }
+    std_fs::canonicalize(blob_root).map_err(|_| BackupExportError::BlobReadFailed)
+}
+
+fn managed_blob_source_for_backup(
+    blob_root: &FilePath,
+    file: &ManagedFileMetadata,
+) -> Result<PathBuf, BackupExportError> {
+    if file.deleted_at.is_some()
+        || !is_safe_storage_key(&file.storage_key)
+        || file.relative_path
+            != format!(
+                "{FILES_DIR_NAME}/{FILE_BLOBS_DIR_NAME}/{}",
+                file.storage_key
+            )
+    {
+        return Err(BackupExportError::SnapshotInvalid);
+    }
+    let canonical_root = validate_backup_blob_root(blob_root)?;
+    let source = blob_root.join(&file.storage_key);
+    let metadata = match std_fs::symlink_metadata(&source) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(BackupExportError::BlobMissing)
+        }
+        Err(_) => return Err(BackupExportError::BlobReadFailed),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(BackupExportError::BlobReadFailed);
+    }
+    let canonical_source =
+        std_fs::canonicalize(&source).map_err(|_| BackupExportError::BlobReadFailed)?;
+    if canonical_source.parent() != Some(canonical_root.as_path()) {
+        return Err(BackupExportError::BlobReadFailed);
+    }
+    Ok(canonical_source)
+}
+
+fn copy_backup_blob(
+    source: &FilePath,
+    destination: &FilePath,
+) -> Result<(String, u64), BackupExportError> {
+    let mut source_file =
+        std_fs::File::open(source).map_err(|_| BackupExportError::BlobReadFailed)?;
+    let mut destination_file = std_fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .map_err(|_| BackupExportError::WriteFailed)?;
+    let copy_result = (|| {
+        io::copy(&mut source_file, &mut destination_file)
+            .map_err(|_| BackupExportError::BlobReadFailed)?;
+        destination_file
+            .flush()
+            .map_err(|_| BackupExportError::WriteFailed)?;
+        destination_file
+            .sync_all()
+            .map_err(|_| BackupExportError::WriteFailed)?;
+        Ok(())
+    })();
+    drop(destination_file);
+    if let Err(error) = copy_result {
+        let _ = std_fs::remove_file(destination);
+        return Err(error);
+    }
+    sha256_file(destination)
+}
+
+fn write_new_backup_file(path: &FilePath, bytes: &[u8]) -> Result<(), BackupExportError> {
+    let mut file = std_fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|_| BackupExportError::WriteFailed)?;
+    let result = (|| {
+        file.write_all(bytes)
+            .map_err(|_| BackupExportError::WriteFailed)?;
+        file.flush().map_err(|_| BackupExportError::WriteFailed)?;
+        file.sync_all()
+            .map_err(|_| BackupExportError::WriteFailed)?;
+        Ok(())
+    })();
+    drop(file);
+    if result.is_err() {
+        let _ = std_fs::remove_file(path);
+    }
+    result
+}
+
+fn sha256_file(path: &FilePath) -> Result<(String, u64), BackupExportError> {
+    let metadata = std_fs::symlink_metadata(path).map_err(|_| BackupExportError::HashMismatch)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(BackupExportError::HashMismatch);
+    }
+    let mut file = std_fs::File::open(path).map_err(|_| BackupExportError::HashMismatch)?;
+    let mut hasher = Sha256::new();
+    let mut size = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| BackupExportError::HashMismatch)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        size = size
+            .checked_add(read as u64)
+            .ok_or(BackupExportError::HashMismatch)?;
+    }
+    Ok((format!("{:x}", hasher.finalize()), size))
+}
+
+fn publish_backup_directory(
+    temp_path: &FilePath,
+    final_path: &FilePath,
+) -> Result<(), BackupExportError> {
+    if final_path.exists() {
+        return Err(BackupExportError::PublishFailed);
+    }
+    std_fs::rename(temp_path, final_path).map_err(|_| BackupExportError::PublishFailed)
+}
+
+fn validate_backup_package(package_root: &FilePath) -> Result<BackupManifest, BackupExportError> {
+    let root_metadata = std_fs::symlink_metadata(package_root)
+        .map_err(|_| BackupExportError::PackageValidationFailed)?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(BackupExportError::PackageValidationFailed);
+    }
+
+    let manifest_bytes = read_regular_backup_file(&package_root.join(BACKUP_MANIFEST_FILE_NAME))?;
+    let manifest: BackupManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|_| BackupExportError::PackageValidationFailed)?;
+    if manifest.format != BACKUP_FORMAT_NAME
+        || manifest.format_version != BACKUP_FORMAT_VERSION
+        || manifest.app_version != env!("CARGO_PKG_VERSION")
+        || manifest.state_schema_version != STATE_SCHEMA_VERSION
+        || manifest.provider_import_export_version != PROVIDER_IMPORT_EXPORT_VERSION
+        || manifest.secrets_included
+        || manifest.runtime_generations_included
+        || manifest.state.path != BACKUP_STATE_FILE_NAME
+        || !is_safe_backup_relative_path(&manifest.state.path)
+    {
+        return Err(BackupExportError::PackageValidationFailed);
+    }
+
+    let state_bytes = read_regular_backup_file(&package_root.join(&manifest.state.path))?;
+    let (state_hash, state_size) = sha256_file(&package_root.join(&manifest.state.path))?;
+    if state_hash != manifest.state.sha256 || state_size != manifest.state.size_bytes {
+        return Err(BackupExportError::HashMismatch);
+    }
+    let state: PersistedMockState = serde_json::from_slice(&state_bytes)
+        .map_err(|_| BackupExportError::PackageValidationFailed)?;
+    validate_persisted_state_for_transaction(&state)
+        .map_err(|_| BackupExportError::PackageValidationFailed)?;
+    validate_provider_metadata_transaction(&state)
+        .map_err(|_| BackupExportError::PackageValidationFailed)?;
+    validate_file_metadata_transaction(&state)
+        .map_err(|_| BackupExportError::PackageValidationFailed)?;
+    if state.schema_version != manifest.state_schema_version
+        || state
+            .conversations
+            .values()
+            .any(|conversation| conversation.is_generating)
+        || state.providers.iter().any(|provider| {
+            !provider.secret_ref.contains(BACKUP_SECRET_REF_MARKER)
+                || !is_controlled_provider_secret_ref(&provider.secret_ref)
+        })
+    {
+        return Err(BackupExportError::PackageValidationFailed);
+    }
+
+    let mut active_file_ids = state
+        .files
+        .iter()
+        .filter(|file| file.deleted_at.is_none())
+        .map(|file| file.id)
+        .collect::<Vec<_>>();
+    active_file_ids.sort_unstable();
+    let manifest_file_ids = manifest
+        .files
+        .iter()
+        .map(|file| file.file_id)
+        .collect::<Vec<_>>();
+    if !manifest_file_ids.windows(2).all(|ids| ids[0] < ids[1]) {
+        return Err(BackupExportError::PackageValidationFailed);
+    }
+
+    match manifest.mode {
+        BackupManifestMode::StateOnly => {
+            if manifest.managed_blobs_included
+                || !manifest.files.is_empty()
+                || package_root.join(BACKUP_BLOBS_DIR_NAME).exists()
+            {
+                return Err(BackupExportError::PackageValidationFailed);
+            }
+        }
+        BackupManifestMode::FullLocalData => {
+            if !manifest.managed_blobs_included || manifest_file_ids != active_file_ids {
+                return Err(BackupExportError::PackageValidationFailed);
+            }
+            validate_backup_blob_entries(package_root, &manifest.files)?;
+        }
+    }
+
+    let manifest_path = package_root.join(BACKUP_MANIFEST_FILE_NAME);
+    let (manifest_hash, _) = sha256_file(&manifest_path)?;
+    let checksum_bytes = read_regular_backup_file(&package_root.join(BACKUP_CHECKSUM_FILE_NAME))?;
+    let checksum_text = std::str::from_utf8(&checksum_bytes)
+        .map_err(|_| BackupExportError::PackageValidationFailed)?;
+    let checksums = parse_backup_checksums(checksum_text)?;
+    let mut expected_checksums = HashMap::from([
+        (BACKUP_MANIFEST_FILE_NAME.to_string(), manifest_hash),
+        (
+            BACKUP_STATE_FILE_NAME.to_string(),
+            manifest.state.sha256.clone(),
+        ),
+    ]);
+    for file in &manifest.files {
+        if !is_safe_backup_relative_path(&file.package_path)
+            || file.package_path != format!("{BACKUP_BLOBS_DIR_NAME}/file-{}.blob", file.file_id)
+            || expected_checksums
+                .insert(file.package_path.clone(), file.sha256.clone())
+                .is_some()
+        {
+            return Err(BackupExportError::PackageValidationFailed);
+        }
+    }
+    if checksums != expected_checksums {
+        return Err(BackupExportError::HashMismatch);
+    }
+
+    validate_backup_root_entries(package_root, manifest.managed_blobs_included)?;
+    Ok(manifest)
+}
+
+fn validate_backup_root_entries(
+    package_root: &FilePath,
+    includes_blobs: bool,
+) -> Result<(), BackupExportError> {
+    let mut expected = HashSet::from([
+        BACKUP_MANIFEST_FILE_NAME.to_string(),
+        BACKUP_STATE_FILE_NAME.to_string(),
+        BACKUP_CHECKSUM_FILE_NAME.to_string(),
+    ]);
+    if includes_blobs {
+        expected.insert(BACKUP_BLOBS_DIR_NAME.to_string());
+    }
+    let actual = backup_directory_entry_names(package_root)?;
+    if actual != expected {
+        return Err(BackupExportError::PackageValidationFailed);
+    }
+    Ok(())
+}
+
+fn validate_backup_blob_entries(
+    package_root: &FilePath,
+    files: &[BackupManifestFile],
+) -> Result<(), BackupExportError> {
+    let blob_root = package_root.join(BACKUP_BLOBS_DIR_NAME);
+    let metadata = std_fs::symlink_metadata(&blob_root)
+        .map_err(|_| BackupExportError::PackageValidationFailed)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(BackupExportError::PackageValidationFailed);
+    }
+    let expected = files
+        .iter()
+        .map(|file| format!("file-{}.blob", file.file_id))
+        .collect::<HashSet<_>>();
+    if backup_directory_entry_names(&blob_root)? != expected {
+        return Err(BackupExportError::PackageValidationFailed);
+    }
+    for file in files {
+        let path = package_root.join(&file.package_path);
+        let (hash, size) = sha256_file(&path)?;
+        if hash != file.sha256 || size != file.size_bytes {
+            return Err(BackupExportError::HashMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn backup_directory_entry_names(
+    directory: &FilePath,
+) -> Result<HashSet<String>, BackupExportError> {
+    let mut names = HashSet::new();
+    let entries =
+        std_fs::read_dir(directory).map_err(|_| BackupExportError::PackageValidationFailed)?;
+    for entry in entries {
+        let entry = entry.map_err(|_| BackupExportError::PackageValidationFailed)?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| BackupExportError::PackageValidationFailed)?;
+        if !names.insert(name) {
+            return Err(BackupExportError::PackageValidationFailed);
+        }
+    }
+    Ok(names)
+}
+
+fn read_regular_backup_file(path: &FilePath) -> Result<Vec<u8>, BackupExportError> {
+    let metadata =
+        std_fs::symlink_metadata(path).map_err(|_| BackupExportError::PackageValidationFailed)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(BackupExportError::PackageValidationFailed);
+    }
+    std_fs::read(path).map_err(|_| BackupExportError::PackageValidationFailed)
+}
+
+fn parse_backup_checksums(text: &str) -> Result<HashMap<String, String>, BackupExportError> {
+    let mut checksums = HashMap::new();
+    let mut previous_path: Option<&str> = None;
+    for line in text.lines() {
+        let (hash, path) = line
+            .split_once("  ")
+            .ok_or(BackupExportError::PackageValidationFailed)?;
+        if hash.len() != 64
+            || !hash
+                .chars()
+                .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase())
+            || !is_safe_backup_relative_path(path)
+            || path == BACKUP_CHECKSUM_FILE_NAME
+            || previous_path.is_some_and(|previous| previous >= path)
+            || checksums
+                .insert(path.to_string(), hash.to_string())
+                .is_some()
+        {
+            return Err(BackupExportError::PackageValidationFailed);
+        }
+        previous_path = Some(path);
+    }
+    if checksums.is_empty() {
+        return Err(BackupExportError::PackageValidationFailed);
+    }
+    Ok(checksums)
+}
+
+fn is_safe_backup_relative_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.contains('\\')
+        && !FilePath::new(path).is_absolute()
+        && FilePath::new(path)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
 }
 
 #[cfg(test)]
@@ -8070,6 +8835,26 @@ mod tests {
         }
     }
 
+    struct PanicOnAccessSecretStore;
+
+    impl SecretStore for PanicOnAccessSecretStore {
+        fn set_secret(&self, _secret_ref: &str, _value: &str) -> SecretStoreResult<()> {
+            panic!("backup export must not access SecretStore")
+        }
+
+        fn get_secret(&self, _secret_ref: &str) -> SecretStoreResult<Option<String>> {
+            panic!("backup export must not access SecretStore")
+        }
+
+        fn delete_secret(&self, _secret_ref: &str) -> SecretStoreResult<()> {
+            panic!("backup export must not access SecretStore")
+        }
+
+        fn secret_exists(&self, _secret_ref: &str) -> SecretStoreResult<bool> {
+            panic!("backup export must not access SecretStore")
+        }
+    }
+
     #[derive(Default)]
     struct FaultingManagedBlobFileOps {
         write_failure_at: Option<u64>,
@@ -8555,6 +9340,84 @@ mod tests {
             .filter_map(selected_message)
             .filter_map(|message| text_from_parts(&message.parts))
             .collect()
+    }
+
+    fn backup_destination(temp: &SyntheticTempDir, label: &str) -> PathBuf {
+        let destination = temp.path.join(format!("backup-destination-{label}"));
+        std_fs::create_dir_all(&destination)
+            .expect("synthetic backup destination should be created");
+        destination
+    }
+
+    async fn backup_test_state(
+        temp: &SyntheticTempDir,
+        uploads: Vec<ValidatedFileUpload>,
+    ) -> Arc<MockApiState> {
+        let state = transaction_test_state_with_secret_store(
+            temp,
+            default_persisted_state(),
+            None,
+            Arc::new(PanicOnAccessSecretStore),
+        )
+        .await;
+        if !uploads.is_empty() {
+            commit_file_upload_batch(&state, uploads)
+                .await
+                .expect("synthetic managed files should upload");
+        }
+        state
+    }
+
+    fn read_backup_manifest(package_root: &FilePath) -> BackupManifest {
+        serde_json::from_slice(
+            &std_fs::read(package_root.join(BACKUP_MANIFEST_FILE_NAME))
+                .expect("synthetic backup manifest should be readable"),
+        )
+        .expect("synthetic backup manifest should be valid")
+    }
+
+    fn read_backup_state(package_root: &FilePath) -> PersistedMockState {
+        serde_json::from_slice(
+            &std_fs::read(package_root.join(BACKUP_STATE_FILE_NAME))
+                .expect("synthetic backup state should be readable"),
+        )
+        .expect("synthetic backup state should be valid")
+    }
+
+    async fn active_blob_path(state: &Arc<MockApiState>, index: usize) -> PathBuf {
+        let storage_key = state.files.read().await[index].storage_key.clone();
+        state
+            .blob_store
+            .final_path(&storage_key)
+            .expect("synthetic storage key should resolve")
+    }
+
+    async fn tombstone_synthetic_file(state: &Arc<MockApiState>, file_id: u64) {
+        transact_persisted_state(state, PureStateMutationScope::FileMetadata, move |staged| {
+            staged
+                .files
+                .iter_mut()
+                .find(|file| file.id == file_id)
+                .expect("synthetic managed file should exist")
+                .deleted_at = Some("2026-01-01T00:00:00Z".to_string());
+            Ok(())
+        })
+        .await
+        .expect("synthetic tombstone should persist");
+    }
+
+    fn create_unpublished_backup_package(
+        temp: &SyntheticTempDir,
+        label: &str,
+        mode: BackupExportMode,
+        snapshot: &PersistedMockState,
+        blob_root: Option<&FilePath>,
+    ) -> PathBuf {
+        let package = temp.path.join(format!("unpublished-backup-{label}"));
+        std_fs::create_dir(&package).expect("synthetic unpublished package should be created");
+        write_backup_package_contents(&package, mode, snapshot, blob_root)
+            .expect("synthetic package contents should be written");
+        package
     }
 
     fn synthetic_desktop_provider() -> DesktopProviderConfig {
@@ -12767,5 +13630,780 @@ mod tests {
             live_conversation(&state, id).await.title,
             "synthetic title during network"
         );
+    }
+
+    #[tokio::test]
+    async fn backup_mode_a_export_success() {
+        let temp = SyntheticTempDir::new("backup-mode-a-success");
+        let state = backup_test_state(&temp, vec![synthetic_png_upload("synthetic.png")]).await;
+        let destination = backup_destination(&temp, "mode-a-success");
+
+        let package = export_backup_package(&state, &destination, BackupExportMode::ModeA)
+            .await
+            .expect("Mode A export should succeed");
+
+        assert!(package.path.is_dir());
+        assert!(package.path.join(BACKUP_MANIFEST_FILE_NAME).is_file());
+        assert!(package.path.join(BACKUP_STATE_FILE_NAME).is_file());
+        assert!(package.path.join(BACKUP_CHECKSUM_FILE_NAME).is_file());
+        assert!(!package.path.join(BACKUP_BLOBS_DIR_NAME).exists());
+        assert_eq!(package.manifest.mode, BackupManifestMode::StateOnly);
+        validate_backup_package(&package.path).expect("Mode A package should self-validate");
+    }
+
+    #[tokio::test]
+    async fn backup_mode_a_does_not_read_blobs() {
+        let temp = SyntheticTempDir::new("backup-mode-a-no-blob-read");
+        let state = backup_test_state(&temp, vec![synthetic_png_upload("synthetic.png")]).await;
+        std_fs::remove_dir_all(&state.blob_store.blobs_dir)
+            .expect("synthetic blob root should be removable");
+        let destination = backup_destination(&temp, "mode-a-no-blob-read");
+
+        let package = export_backup_package(&state, &destination, BackupExportMode::ModeA)
+            .await
+            .expect("Mode A should not require managed blobs");
+
+        assert!(package.path.is_dir());
+        assert!(!package.path.join(BACKUP_BLOBS_DIR_NAME).exists());
+    }
+
+    #[tokio::test]
+    async fn backup_mode_a_state_point_in_time() {
+        let temp = SyntheticTempDir::new("backup-mode-a-point-in-time");
+        let state = backup_test_state(&temp, Vec::new()).await;
+        let snapshot = portable_backup_snapshot(&state)
+            .await
+            .expect("synthetic snapshot should succeed");
+        let response = update_conversation_title(
+            State(state.clone()),
+            Path(MOCK_WELCOME_CONVERSATION_ID.to_string()),
+            Json(UpdateConversationTitleRequest {
+                title: "synthetic title after snapshot".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let destination = backup_destination(&temp, "mode-a-point-in-time");
+        let package = build_and_publish_backup_package(
+            &destination,
+            BackupExportMode::ModeA,
+            snapshot,
+            None,
+            1,
+        )
+        .expect("snapshot package should publish");
+
+        assert_ne!(
+            read_backup_state(&package.path).conversations[MOCK_WELCOME_CONVERSATION_ID].title,
+            "synthetic title after snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn backup_mode_a_contains_no_blob_bytes() {
+        let temp = SyntheticTempDir::new("backup-mode-a-no-blob-bytes");
+        let state = backup_test_state(&temp, vec![synthetic_text_upload("synthetic.txt")]).await;
+        let destination = backup_destination(&temp, "mode-a-no-blob-bytes");
+        let package = export_backup_package(&state, &destination, BackupExportMode::ModeA)
+            .await
+            .expect("Mode A export should succeed");
+        let package_bytes = std_fs::read(package.path.join(BACKUP_STATE_FILE_NAME)).unwrap();
+
+        assert!(!String::from_utf8_lossy(&package_bytes).contains("synthetic managed file text"));
+        assert!(!package.path.join(BACKUP_BLOBS_DIR_NAME).exists());
+    }
+
+    #[tokio::test]
+    async fn backup_mode_a_sanitizes_provider_secret_references() {
+        let temp = SyntheticTempDir::new("backup-mode-a-secret-ref");
+        let persisted = synthetic_provider_state();
+        let source_ref = persisted.providers[0].secret_ref.clone();
+        let state = transaction_test_state_with_secret_store(
+            &temp,
+            persisted,
+            None,
+            Arc::new(PanicOnAccessSecretStore),
+        )
+        .await;
+        let destination = backup_destination(&temp, "mode-a-secret-ref");
+        let package = export_backup_package(&state, &destination, BackupExportMode::ModeA)
+            .await
+            .expect("Mode A export should not access secrets");
+        let backup_state = read_backup_state(&package.path);
+
+        assert_ne!(backup_state.providers[0].secret_ref, source_ref);
+        assert!(backup_state.providers[0]
+            .secret_ref
+            .contains(BACKUP_SECRET_REF_MARKER));
+        assert!(!serde_json::to_string(&backup_state)
+            .unwrap()
+            .contains(&source_ref));
+    }
+
+    #[tokio::test]
+    async fn backup_mode_b_export_success() {
+        let temp = SyntheticTempDir::new("backup-mode-b-success");
+        let state = backup_test_state(
+            &temp,
+            vec![
+                synthetic_png_upload("synthetic.png"),
+                synthetic_text_upload("synthetic.txt"),
+            ],
+        )
+        .await;
+        let destination = backup_destination(&temp, "mode-b-success");
+
+        let package = export_backup_package(&state, &destination, BackupExportMode::ModeB)
+            .await
+            .expect("Mode B export should succeed");
+
+        assert_eq!(package.manifest.mode, BackupManifestMode::FullLocalData);
+        assert_eq!(package.manifest.files.len(), 2);
+        assert!(package.path.join(BACKUP_BLOBS_DIR_NAME).is_dir());
+        validate_backup_package(&package.path).expect("Mode B package should self-validate");
+    }
+
+    #[tokio::test]
+    async fn backup_mode_b_tombstoned_blob_excluded() {
+        let temp = SyntheticTempDir::new("backup-mode-b-tombstone");
+        let state = backup_test_state(&temp, vec![synthetic_png_upload("synthetic.png")]).await;
+        let file_id = state.files.read().await[0].id;
+        tombstone_synthetic_file(&state, file_id).await;
+        let destination = backup_destination(&temp, "mode-b-tombstone");
+
+        let package = export_backup_package(&state, &destination, BackupExportMode::ModeB)
+            .await
+            .expect("tombstoned blob should be excluded");
+
+        assert!(package.manifest.files.is_empty());
+        assert!(read_backup_state(&package.path).files[0]
+            .deleted_at
+            .is_some());
+        assert!(
+            backup_directory_entry_names(&package.path.join(BACKUP_BLOBS_DIR_NAME))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn backup_mode_b_orphan_blob_excluded() {
+        let temp = SyntheticTempDir::new("backup-mode-b-orphan");
+        let state = backup_test_state(&temp, vec![synthetic_png_upload("synthetic.png")]).await;
+        std_fs::write(
+            state.blob_store.blobs_dir.join("orphan-synthetic-blob"),
+            b"synthetic orphan bytes",
+        )
+        .expect("synthetic orphan should be created");
+        let destination = backup_destination(&temp, "mode-b-orphan");
+
+        let package = export_backup_package(&state, &destination, BackupExportMode::ModeB)
+            .await
+            .expect("orphan should not block export");
+
+        assert_eq!(package.manifest.files.len(), 1);
+        assert!(!package
+            .path
+            .join(BACKUP_BLOBS_DIR_NAME)
+            .join("orphan-synthetic-blob")
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn backup_mode_b_unreferenced_active_blob_included() {
+        let temp = SyntheticTempDir::new("backup-mode-b-unreferenced");
+        let state = backup_test_state(&temp, vec![synthetic_png_upload("synthetic.png")]).await;
+        let destination = backup_destination(&temp, "mode-b-unreferenced");
+
+        let package = export_backup_package(&state, &destination, BackupExportMode::ModeB)
+            .await
+            .expect("active managed blob should be included");
+
+        assert_eq!(package.manifest.files.len(), 1);
+        let conversations = state.conversations.read().await;
+        assert!(!is_managed_file_referenced(
+            &conversations,
+            package.manifest.files[0].file_id,
+        ));
+    }
+
+    #[tokio::test]
+    async fn backup_mode_b_missing_active_blob_fails() {
+        let temp = SyntheticTempDir::new("backup-mode-b-missing");
+        let state = backup_test_state(&temp, vec![synthetic_png_upload("synthetic.png")]).await;
+        std_fs::remove_file(active_blob_path(&state, 0).await)
+            .expect("synthetic active blob should be removed");
+        let destination = backup_destination(&temp, "mode-b-missing");
+
+        let result = export_backup_package(&state, &destination, BackupExportMode::ModeB).await;
+
+        assert!(matches!(result, Err(BackupExportError::BlobMissing)));
+        assert!(backup_directory_entry_names(&destination)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn backup_mode_b_blob_copy_failure_has_no_final_package() {
+        let temp = SyntheticTempDir::new("backup-mode-b-copy-failure");
+        let state = backup_test_state(&temp, vec![synthetic_png_upload("synthetic.png")]).await;
+        let source = active_blob_path(&state, 0).await;
+        std_fs::remove_file(&source).unwrap();
+        std_fs::create_dir(&source).unwrap();
+        let destination = backup_destination(&temp, "mode-b-copy-failure");
+
+        let result = export_backup_package(&state, &destination, BackupExportMode::ModeB).await;
+
+        assert!(matches!(result, Err(BackupExportError::BlobReadFailed)));
+        assert!(backup_directory_entry_names(&destination)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn backup_mode_b_invalid_storage_key_fails_closed() {
+        let temp = SyntheticTempDir::new("backup-mode-b-invalid-key");
+        let mut persisted = default_persisted_state();
+        persisted.files.push(ManagedFileMetadata {
+            id: 900,
+            storage_key: "../synthetic-escape".to_string(),
+            display_name: "synthetic.bin".to_string(),
+            mime: "application/octet-stream".to_string(),
+            size_bytes: 1,
+            sha256: None,
+            kind: "document".to_string(),
+            relative_path: "files/blobs/../synthetic-escape".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            source: "upload".to_string(),
+            deleted_at: None,
+        });
+        let state = transaction_test_state(&temp, persisted, None).await;
+        let destination = backup_destination(&temp, "mode-b-invalid-key");
+
+        let result = export_backup_package(&state, &destination, BackupExportMode::ModeB).await;
+
+        assert!(matches!(result, Err(BackupExportError::SnapshotInvalid)));
+        assert!(backup_directory_entry_names(&destination)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn backup_mode_b_symlink_or_escape_source_rejected() {
+        let temp = SyntheticTempDir::new("backup-mode-b-symlink");
+        let state = backup_test_state(&temp, vec![synthetic_png_upload("synthetic.png")]).await;
+        let source = active_blob_path(&state, 0).await;
+        let outside = temp.path.join("synthetic-outside-file");
+        std_fs::write(&outside, b"synthetic outside bytes").unwrap();
+        std_fs::remove_file(&source).unwrap();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&outside, &source).is_ok();
+        #[cfg(not(windows))]
+        let linked = std::os::unix::fs::symlink(&outside, &source).is_ok();
+        if !linked {
+            std_fs::create_dir(&source).unwrap();
+        }
+        let destination = backup_destination(&temp, "mode-b-symlink");
+
+        let result = export_backup_package(&state, &destination, BackupExportMode::ModeB).await;
+
+        assert!(matches!(result, Err(BackupExportError::BlobReadFailed)));
+        assert!(backup_directory_entry_names(&destination)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn backup_manifest_mode_b_files_are_sorted_by_file_id() {
+        let temp = SyntheticTempDir::new("backup-manifest-sorted");
+        let state = backup_test_state(
+            &temp,
+            vec![
+                synthetic_png_upload("synthetic-a.png"),
+                synthetic_text_upload("synthetic-b.txt"),
+            ],
+        )
+        .await;
+        let destination = backup_destination(&temp, "manifest-sorted");
+        let package = export_backup_package(&state, &destination, BackupExportMode::ModeB)
+            .await
+            .expect("Mode B export should succeed");
+
+        assert!(package
+            .manifest
+            .files
+            .windows(2)
+            .all(|files| files[0].file_id < files[1].file_id));
+    }
+
+    #[tokio::test]
+    async fn backup_mode_b_zero_active_files_has_empty_blob_directory() {
+        let temp = SyntheticTempDir::new("backup-mode-b-empty");
+        let state = backup_test_state(&temp, Vec::new()).await;
+        let destination = backup_destination(&temp, "mode-b-empty");
+
+        let package = export_backup_package(&state, &destination, BackupExportMode::ModeB)
+            .await
+            .expect("empty Mode B export should succeed");
+
+        assert!(package.manifest.files.is_empty());
+        assert!(package.path.join(BACKUP_BLOBS_DIR_NAME).is_dir());
+    }
+
+    #[tokio::test]
+    async fn backup_checksum_metadata_hash_mismatch_fails_export() {
+        let temp = SyntheticTempDir::new("backup-metadata-hash-mismatch");
+        let state = backup_test_state(&temp, vec![synthetic_png_upload("synthetic.png")]).await;
+        transact_persisted_state(&state, PureStateMutationScope::FileMetadata, |staged| {
+            staged.files[0].sha256 = Some("0".repeat(64));
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let destination = backup_destination(&temp, "metadata-hash-mismatch");
+
+        let result = export_backup_package(&state, &destination, BackupExportMode::ModeB).await;
+
+        assert!(matches!(result, Err(BackupExportError::HashMismatch)));
+        assert!(backup_directory_entry_names(&destination)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn backup_concurrency_category_a_export_is_complete_snapshot() {
+        let temp = SyntheticTempDir::new("backup-category-a-concurrency");
+        let state = backup_test_state(&temp, Vec::new()).await;
+        let destination = backup_destination(&temp, "category-a-concurrency");
+        let export_state = state.clone();
+        let export_destination = destination.clone();
+        let export = tokio::spawn(async move {
+            export_backup_package(&export_state, &export_destination, BackupExportMode::ModeA).await
+        });
+        let response = update_conversation_title(
+            State(state.clone()),
+            Path(MOCK_WELCOME_CONVERSATION_ID.to_string()),
+            Json(UpdateConversationTitleRequest {
+                title: "synthetic concurrent backup title".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let package = export.await.unwrap().unwrap();
+        let backup_state = read_backup_state(&package.path);
+        let conversation = &backup_state.conversations[MOCK_WELCOME_CONVERSATION_ID];
+
+        assert!(matches!(
+            conversation.title.as_str(),
+            "RikkaDesk Mock Welcome" | "synthetic concurrent backup title"
+        ));
+        assert_eq!(conversation.messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn backup_concurrency_mode_b_lock_blocks_file_delete() {
+        let temp = SyntheticTempDir::new("backup-block-delete");
+        let state = backup_test_state(&temp, vec![synthetic_png_upload("synthetic.png")]).await;
+        let file_id = state.files.read().await[0].id;
+        let file_guard = state.file_blob_transaction_mutex.lock().await;
+        let delete_state = state.clone();
+        let delete = tokio::spawn(async move {
+            delete_file(State(delete_state), Path(file_id))
+                .await
+                .into_response()
+                .status()
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!delete.is_finished());
+        drop(file_guard);
+
+        assert_eq!(delete.await.unwrap(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn backup_concurrency_mode_b_lock_blocks_upload_publish() {
+        let temp = SyntheticTempDir::new("backup-block-upload");
+        let state = backup_test_state(&temp, Vec::new()).await;
+        let file_guard = state.file_blob_transaction_mutex.lock().await;
+        let upload_state = state.clone();
+        let upload = tokio::spawn(async move {
+            commit_file_upload_batch(
+                &upload_state,
+                vec![synthetic_png_upload("synthetic-new.png")],
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!upload.is_finished());
+        drop(file_guard);
+
+        assert_eq!(upload.await.unwrap().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn backup_concurrency_provider_transaction_is_old_or_new_snapshot() {
+        let temp = SyntheticTempDir::new("backup-provider-concurrency");
+        let state = transaction_test_state_with_secret_store(
+            &temp,
+            synthetic_provider_state(),
+            None,
+            Arc::new(PanicOnAccessSecretStore),
+        )
+        .await;
+        let snapshot = portable_backup_snapshot(&state).await.unwrap();
+        transact_persisted_state(&state, PureStateMutationScope::ProviderMetadata, |staged| {
+            staged.providers[0].name = "Synthetic Provider After Snapshot".to_string();
+            sync_settings_with_desktop_providers(&mut staged.settings, &staged.providers);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let destination = backup_destination(&temp, "provider-concurrency");
+        let package = build_and_publish_backup_package(
+            &destination,
+            BackupExportMode::ModeA,
+            snapshot,
+            None,
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_backup_state(&package.path).providers[0].name,
+            "Synthetic Provider"
+        );
+        assert_eq!(
+            state.providers.read().await[0].name,
+            "Synthetic Provider After Snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn backup_concurrency_active_generation_is_excluded() {
+        let temp = SyntheticTempDir::new("backup-active-generation");
+        let state = backup_test_state(&temp, Vec::new()).await;
+        let id = "backup-active-generation";
+        let (handle, plan) =
+            start_synthetic_generation(&state, id, GenerationOperation::Send).await;
+        broadcast_generation_delta(
+            &state,
+            id,
+            &handle,
+            &plan,
+            MOCK_MODEL_ID,
+            "synthetic transient backup delta",
+            "synthetic transient backup delta",
+        )
+        .await;
+        let destination = backup_destination(&temp, "active-generation");
+        let package = export_backup_package(&state, &destination, BackupExportMode::ModeA)
+            .await
+            .expect("active generation should not block durable backup");
+        let backup_state = read_backup_state(&package.path);
+        let backup_conversation = &backup_state.conversations[id];
+
+        assert!(!backup_conversation.is_generating);
+        assert_eq!(backup_conversation.messages.len(), 1);
+        assert!(!serde_json::to_string(backup_conversation)
+            .unwrap()
+            .contains("synthetic transient backup delta"));
+        assert!(remove_generation_if_current(&state, id, &handle).await);
+    }
+
+    #[tokio::test]
+    async fn backup_concurrency_exports_serialize_and_use_unique_names() {
+        let temp = SyntheticTempDir::new("backup-concurrent-exports");
+        let state = backup_test_state(&temp, Vec::new()).await;
+        let destination = backup_destination(&temp, "concurrent-exports");
+        let first_state = state.clone();
+        let first_destination = destination.clone();
+        let first = tokio::spawn(async move {
+            export_backup_package(&first_state, &first_destination, BackupExportMode::ModeA).await
+        });
+        let second_state = state.clone();
+        let second_destination = destination.clone();
+        let second = tokio::spawn(async move {
+            export_backup_package(&second_state, &second_destination, BackupExportMode::ModeA).await
+        });
+        let first_package = first.await.unwrap().unwrap();
+        let second_package = second.await.unwrap().unwrap();
+
+        assert_ne!(first_package.path, second_package.path);
+        validate_backup_package(&first_package.path).unwrap();
+        validate_backup_package(&second_package.path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn backup_export_package_write_failure_does_not_publish() {
+        let temp = SyntheticTempDir::new("backup-write-failure");
+        let state = backup_test_state(&temp, Vec::new()).await;
+        let snapshot = portable_backup_snapshot(&state).await.unwrap();
+        let package = temp.path.join("synthetic-write-failure-package");
+        std_fs::create_dir(&package).unwrap();
+        std_fs::write(package.join(BACKUP_STATE_FILE_NAME), b"occupied").unwrap();
+
+        let result =
+            write_backup_package_contents(&package, BackupExportMode::ModeA, &snapshot, None);
+
+        assert!(matches!(result, Err(BackupExportError::WriteFailed)));
+        assert!(!package.join(BACKUP_CHECKSUM_FILE_NAME).exists());
+    }
+
+    #[tokio::test]
+    async fn backup_export_manifest_write_failure_does_not_validate() {
+        let temp = SyntheticTempDir::new("backup-manifest-write-failure");
+        let state = backup_test_state(&temp, Vec::new()).await;
+        let snapshot = portable_backup_snapshot(&state).await.unwrap();
+        let package = temp.path.join("synthetic-manifest-write-failure-package");
+        std_fs::create_dir(&package).unwrap();
+        std_fs::write(package.join(BACKUP_MANIFEST_FILE_NAME), b"occupied").unwrap();
+
+        let result =
+            write_backup_package_contents(&package, BackupExportMode::ModeA, &snapshot, None);
+
+        assert!(matches!(result, Err(BackupExportError::WriteFailed)));
+        assert!(!package.join(BACKUP_CHECKSUM_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn backup_export_publish_failure_preserves_existing_directory() {
+        let temp = SyntheticTempDir::new("backup-publish-failure");
+        let unpublished = temp.path.join("synthetic-unpublished");
+        let existing = temp.path.join("synthetic-existing");
+        std_fs::create_dir(&unpublished).unwrap();
+        std_fs::create_dir(&existing).unwrap();
+        std_fs::write(existing.join("marker"), b"synthetic existing backup").unwrap();
+
+        let result = publish_backup_directory(&unpublished, &existing);
+
+        assert!(matches!(result, Err(BackupExportError::PublishFailed)));
+        assert_eq!(
+            std_fs::read(existing.join("marker")).unwrap(),
+            b"synthetic existing backup"
+        );
+        assert!(unpublished.exists());
+    }
+
+    #[tokio::test]
+    async fn backup_export_name_collision_uses_new_unique_directory() {
+        let temp = SyntheticTempDir::new("backup-name-collision");
+        let state = backup_test_state(&temp, Vec::new()).await;
+        let destination = backup_destination(&temp, "name-collision");
+        let collision =
+            destination.join(format!("{BACKUP_TEMP_DIR_PREFIX}.{}.1", std::process::id()));
+        std_fs::create_dir(&collision).unwrap();
+        std_fs::write(collision.join("marker"), b"synthetic unrelated temp").unwrap();
+
+        let package = export_backup_package(&state, &destination, BackupExportMode::ModeA)
+            .await
+            .expect("collision should use another unique name");
+
+        assert!(package.path.is_dir());
+        assert!(collision.join("marker").is_file());
+        assert_ne!(package.path, collision);
+    }
+
+    #[tokio::test]
+    async fn backup_export_failure_cleans_only_current_temp_directory() {
+        let temp = SyntheticTempDir::new("backup-temp-cleanup");
+        let state = backup_test_state(&temp, vec![synthetic_png_upload("synthetic.png")]).await;
+        std_fs::remove_file(active_blob_path(&state, 0).await).unwrap();
+        let destination = backup_destination(&temp, "temp-cleanup");
+        let unrelated = destination.join("unrelated-backup");
+        std_fs::create_dir(&unrelated).unwrap();
+        std_fs::write(unrelated.join("marker"), b"synthetic unrelated backup").unwrap();
+
+        let result = export_backup_package(&state, &destination, BackupExportMode::ModeB).await;
+
+        assert!(matches!(result, Err(BackupExportError::BlobMissing)));
+        assert!(unrelated.join("marker").is_file());
+        assert!(backup_directory_entry_names(&destination)
+            .unwrap()
+            .iter()
+            .all(|name| !name.starts_with(BACKUP_TEMP_DIR_PREFIX)));
+    }
+
+    #[tokio::test]
+    async fn backup_checksum_file_matches_all_entries() {
+        let temp = SyntheticTempDir::new("backup-checksum-entries");
+        let state = backup_test_state(&temp, vec![synthetic_png_upload("synthetic.png")]).await;
+        let destination = backup_destination(&temp, "checksum-entries");
+        let package = export_backup_package(&state, &destination, BackupExportMode::ModeB)
+            .await
+            .unwrap();
+        let checksum_text =
+            std_fs::read_to_string(package.path.join(BACKUP_CHECKSUM_FILE_NAME)).unwrap();
+        let checksums = parse_backup_checksums(&checksum_text).unwrap();
+
+        assert_eq!(checksums.len(), 3);
+        for (path, expected_hash) in checksums {
+            assert_eq!(
+                sha256_file(&package.path.join(path)).unwrap().0,
+                expected_hash
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn backup_manifest_hashes_match_package_copies() {
+        let temp = SyntheticTempDir::new("backup-manifest-hashes");
+        let state = backup_test_state(&temp, vec![synthetic_png_upload("synthetic.png")]).await;
+        let destination = backup_destination(&temp, "manifest-hashes");
+        let package = export_backup_package(&state, &destination, BackupExportMode::ModeB)
+            .await
+            .unwrap();
+        let manifest = read_backup_manifest(&package.path);
+
+        assert_eq!(
+            sha256_file(&package.path.join(BACKUP_STATE_FILE_NAME))
+                .unwrap()
+                .0,
+            manifest.state.sha256
+        );
+        for file in manifest.files {
+            let (hash, size) = sha256_file(&package.path.join(file.package_path)).unwrap();
+            assert_eq!(hash, file.sha256);
+            assert_eq!(size, file.size_bytes);
+        }
+    }
+
+    #[tokio::test]
+    async fn backup_checksum_tampered_temp_package_rejected_before_publish() {
+        let temp = SyntheticTempDir::new("backup-tampered-temp");
+        let state = backup_test_state(&temp, Vec::new()).await;
+        let snapshot = portable_backup_snapshot(&state).await.unwrap();
+        let package = create_unpublished_backup_package(
+            &temp,
+            "tampered-temp",
+            BackupExportMode::ModeA,
+            &snapshot,
+            None,
+        );
+        std_fs::write(
+            package.join(BACKUP_STATE_FILE_NAME),
+            b"synthetic tampered state",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            validate_backup_package(&package),
+            Err(BackupExportError::HashMismatch)
+        ));
+    }
+
+    #[tokio::test]
+    async fn backup_manifest_and_sums_contain_only_relative_paths() {
+        let temp = SyntheticTempDir::new("backup-relative-paths");
+        let state = backup_test_state(&temp, vec![synthetic_png_upload("synthetic.png")]).await;
+        let destination = backup_destination(&temp, "relative-paths");
+        let package = export_backup_package(&state, &destination, BackupExportMode::ModeB)
+            .await
+            .unwrap();
+        let manifest = read_backup_manifest(&package.path);
+        let sums = std_fs::read_to_string(package.path.join(BACKUP_CHECKSUM_FILE_NAME)).unwrap();
+
+        assert!(is_safe_backup_relative_path(&manifest.state.path));
+        assert!(manifest
+            .files
+            .iter()
+            .all(|file| is_safe_backup_relative_path(&file.package_path)));
+        assert!(!sums.contains(":\\"));
+        assert!(!sums.contains("\\\\"));
+        assert!(!sums.contains("../"));
+    }
+
+    #[tokio::test]
+    async fn backup_manifest_unknown_blob_entry_is_rejected() {
+        let temp = SyntheticTempDir::new("backup-unknown-blob");
+        let state = backup_test_state(&temp, vec![synthetic_png_upload("synthetic.png")]).await;
+        let snapshot = portable_backup_snapshot(&state).await.unwrap();
+        let package = create_unpublished_backup_package(
+            &temp,
+            "unknown-blob",
+            BackupExportMode::ModeB,
+            &snapshot,
+            Some(&state.blob_store.blobs_dir),
+        );
+        std_fs::write(
+            package.join(BACKUP_BLOBS_DIR_NAME).join("unknown.blob"),
+            b"synthetic unknown blob",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            validate_backup_package(&package),
+            Err(BackupExportError::PackageValidationFailed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn backup_export_package_contains_no_secrets_directory() {
+        let temp = SyntheticTempDir::new("backup-no-secrets-directory");
+        let state = backup_test_state(&temp, vec![synthetic_png_upload("synthetic.png")]).await;
+        let destination = backup_destination(&temp, "no-secrets-directory");
+        let mode_a = export_backup_package(&state, &destination, BackupExportMode::ModeA)
+            .await
+            .unwrap();
+        let mode_b = export_backup_package(&state, &destination, BackupExportMode::ModeB)
+            .await
+            .unwrap();
+
+        assert!(!mode_a.path.join(SECRETS_DIR_NAME).exists());
+        assert!(!mode_b.path.join(SECRETS_DIR_NAME).exists());
+        assert!(!read_backup_manifest(&mode_b.path).secrets_included);
+    }
+
+    #[tokio::test]
+    async fn backup_export_secret_store_access_count_is_zero() {
+        let temp = SyntheticTempDir::new("backup-secret-store-zero");
+        let state = backup_test_state(&temp, vec![synthetic_png_upload("synthetic.png")]).await;
+        let destination = backup_destination(&temp, "secret-store-zero");
+
+        export_backup_package(&state, &destination, BackupExportMode::ModeA)
+            .await
+            .expect("Mode A must not access panic SecretStore");
+        export_backup_package(&state, &destination, BackupExportMode::ModeB)
+            .await
+            .expect("Mode B must not access panic SecretStore");
+    }
+
+    #[tokio::test]
+    async fn backup_export_safe_errors_hide_paths_and_user_metadata() {
+        let temp = SyntheticTempDir::new("backup-safe-errors");
+        let file_name = "synthetic-private-name.png";
+        let state = backup_test_state(&temp, vec![synthetic_png_upload(file_name)]).await;
+        let storage_key = state.files.read().await[0].storage_key.clone();
+        std_fs::remove_file(active_blob_path(&state, 0).await).unwrap();
+        let destination = backup_destination(&temp, "safe-errors");
+
+        let error = export_backup_package(&state, &destination, BackupExportMode::ModeB)
+            .await
+            .expect_err("missing active blob should fail");
+        let message = error.to_string();
+
+        assert!(!message.contains(file_name));
+        assert!(!message.contains(&storage_key));
+        assert!(!message.contains(temp.path.to_string_lossy().as_ref()));
+        assert!(!message.contains(PROVIDER_SECRET_REF_PREFIX));
+    }
+
+    #[tokio::test]
+    async fn backup_export_uses_synthetic_destination_only() {
+        let temp = SyntheticTempDir::new("backup-synthetic-root");
+        let state = backup_test_state(&temp, Vec::new()).await;
+        let destination = backup_destination(&temp, "synthetic-root");
+
+        let package = export_backup_package(&state, &destination, BackupExportMode::ModeA)
+            .await
+            .unwrap();
+
+        let canonical_package = std_fs::canonicalize(&package.path).unwrap();
+        let canonical_temp = std_fs::canonicalize(&temp.path).unwrap();
+        let canonical_destination = std_fs::canonicalize(&destination).unwrap();
+        assert!(canonical_package.starts_with(canonical_temp));
+        assert!(canonical_package.starts_with(canonical_destination));
     }
 }
