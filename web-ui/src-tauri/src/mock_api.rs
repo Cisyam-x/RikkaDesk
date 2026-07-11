@@ -15,7 +15,10 @@ use std::{
 };
 
 #[cfg(windows)]
-use std::{ffi::OsStr, os::windows::ffi::OsStrExt};
+use std::{
+    ffi::OsStr,
+    os::windows::{ffi::OsStrExt, fs::MetadataExt},
+};
 
 use async_stream::stream;
 use axum::{
@@ -63,6 +66,12 @@ const BACKUP_BLOBS_DIR_NAME: &str = "blobs";
 const BACKUP_TEMP_DIR_PREFIX: &str = ".rikkadesk-backup.tmp";
 const BACKUP_FINAL_DIR_PREFIX: &str = "RikkaDesk-backup-v1";
 const BACKUP_SECRET_REF_MARKER: &str = "backup-unavailable";
+const RESTORE_MANIFEST_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const RESTORE_CHECKSUM_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const RESTORE_STATE_MAX_BYTES: u64 = 128 * 1024 * 1024;
+const RESTORE_MANIFEST_MAX_FILES: usize = 100_000;
+const RESTORE_PLANNED_SECRET_REF_MARKER: &str = "restore-planned";
+const RESTORE_PLANNED_STORAGE_KEY_PREFIX: &str = "restore-file";
 const STATE_SCHEMA_VERSION: u32 = 6;
 const FILE_METADATA_STATE_SCHEMA_VERSION: u32 = 5;
 const CUSTOM_REQUEST_CONFIG_STATE_SCHEMA_VERSION: u32 = 4;
@@ -1052,7 +1061,7 @@ impl BackupExportMode {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct BackupManifestState {
     path: String,
     sha256: String,
@@ -1060,7 +1069,7 @@ struct BackupManifestState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct BackupManifestFile {
     file_id: u64,
     package_path: String,
@@ -1070,7 +1079,7 @@ struct BackupManifestFile {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct BackupManifest {
     format: String,
     format_version: u32,
@@ -1120,6 +1129,117 @@ impl fmt::Display for BackupExportError {
 }
 
 impl Error for BackupExportError {}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PlannedBlobRestore {
+    file_id: u64,
+    package_path: String,
+    planned_storage_key: String,
+    expected_size_bytes: u64,
+    expected_sha256: String,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PlannedProviderSecret {
+    provider_index: usize,
+    planned_secret_ref: String,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestoreWarning {
+    ProviderApiKeysMustBeReentered,
+    AttachmentsMayBeUnavailableAfterStateOnlyRestore,
+    FullReplacementOnly,
+    ActualRestoreMustRevalidate,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestoreStrategy {
+    FullReplacement,
+}
+
+#[allow(dead_code)]
+#[derive(Clone)]
+struct ValidatedRestorePackage {
+    mode: BackupManifestMode,
+    manifest: BackupManifest,
+    staged_state: PersistedMockState,
+    blob_restore_plan: Vec<PlannedBlobRestore>,
+    provider_secret_plan: Vec<PlannedProviderSecret>,
+    warnings: Vec<RestoreWarning>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RestoreDryRunReport {
+    format_version: u32,
+    mode: BackupManifestMode,
+    state_schema_version: u32,
+    provider_count: usize,
+    providers_requiring_api_key: usize,
+    conversation_count: usize,
+    message_count: usize,
+    attachment_reference_count: usize,
+    active_file_count: usize,
+    tombstoned_file_count: usize,
+    restorable_blob_count: usize,
+    unavailable_attachment_count: usize,
+    provider_secret_refs_replaced: usize,
+    file_storage_keys_replaced: usize,
+    secrets_restored: bool,
+    runtime_generations_restored: bool,
+    restore_strategy: RestoreStrategy,
+    merge_restore_supported: bool,
+    warnings: Vec<RestoreWarning>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestoreValidationError {
+    PackageNotFound,
+    ManifestInvalid,
+    FormatUnsupported,
+    SchemaUnsupported,
+    SecretsIncluded,
+    RuntimeStateIncluded,
+    PathUnsafe,
+    SymlinkRejected,
+    ChecksumInvalid,
+    SizeMismatch,
+    StateInvalid,
+    BlobMissing,
+    BlobUnexpected,
+    ModeMismatch,
+    DryRunValidationFailed,
+}
+
+impl fmt::Display for RestoreValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::PackageNotFound => "restore package was not found",
+            Self::ManifestInvalid => "restore manifest validation failed",
+            Self::FormatUnsupported => "restore backup format is unsupported",
+            Self::SchemaUnsupported => "restore backup schema is unsupported",
+            Self::SecretsIncluded => "restore package unexpectedly includes secrets",
+            Self::RuntimeStateIncluded => "restore package unexpectedly includes runtime state",
+            Self::PathUnsafe => "restore package path validation failed",
+            Self::SymlinkRejected => "restore package contains a link or reparse point",
+            Self::ChecksumInvalid => "restore package checksum validation failed",
+            Self::SizeMismatch => "restore package size validation failed",
+            Self::StateInvalid => "restore state validation failed",
+            Self::BlobMissing => "restore package blob is missing",
+            Self::BlobUnexpected => "restore package contains an unexpected blob",
+            Self::ModeMismatch => "restore package mode validation failed",
+            Self::DryRunValidationFailed => "restore dry-run validation failed",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl Error for RestoreValidationError {}
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -3005,6 +3125,902 @@ fn is_safe_backup_relative_path(path: &str) -> bool {
         && FilePath::new(path)
             .components()
             .all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
+#[allow(dead_code)]
+fn restore_package_dry_run(
+    package_root: &FilePath,
+) -> Result<RestoreDryRunReport, RestoreValidationError> {
+    let validated = validate_restore_package(package_root)?;
+    Ok(restore_dry_run_report(&validated))
+}
+
+fn validate_restore_package(
+    package_root: &FilePath,
+) -> Result<ValidatedRestorePackage, RestoreValidationError> {
+    let package_root = validate_restore_package_root(package_root)?;
+    let manifest_bytes = read_bounded_restore_file(
+        &package_root,
+        BACKUP_MANIFEST_FILE_NAME,
+        RESTORE_MANIFEST_MAX_BYTES,
+        RestoreValidationError::ManifestInvalid,
+    )?;
+    let manifest = parse_restore_manifest(&manifest_bytes)?;
+    validate_restore_manifest(&manifest)?;
+    validate_restore_package_tree(&package_root, &manifest)?;
+
+    let state_bytes = read_bounded_restore_file(
+        &package_root,
+        &manifest.state.path,
+        RESTORE_STATE_MAX_BYTES,
+        RestoreValidationError::StateInvalid,
+    )?;
+    let state_size = state_bytes.len() as u64;
+    if state_size != manifest.state.size_bytes {
+        return Err(RestoreValidationError::SizeMismatch);
+    }
+    let state_hash = sha256_bytes(&state_bytes);
+    if state_hash != normalize_sha256(&manifest.state.sha256)? {
+        return Err(RestoreValidationError::ChecksumInvalid);
+    }
+    let state = parse_and_validate_restore_state(&state_bytes, manifest.state_schema_version)?;
+
+    let checksum_bytes = read_bounded_restore_file(
+        &package_root,
+        BACKUP_CHECKSUM_FILE_NAME,
+        RESTORE_CHECKSUM_MAX_BYTES,
+        RestoreValidationError::ChecksumInvalid,
+    )?;
+    let checksum_text = std::str::from_utf8(&checksum_bytes)
+        .map_err(|_| RestoreValidationError::ChecksumInvalid)?;
+    let checksums = parse_restore_checksums(checksum_text)?;
+    let mut expected_checksums = HashMap::from([
+        (
+            BACKUP_MANIFEST_FILE_NAME.to_string(),
+            sha256_bytes(&manifest_bytes),
+        ),
+        (manifest.state.path.clone(), state_hash),
+    ]);
+    for file in &manifest.files {
+        if expected_checksums
+            .insert(file.package_path.clone(), normalize_sha256(&file.sha256)?)
+            .is_some()
+        {
+            return Err(RestoreValidationError::ManifestInvalid);
+        }
+    }
+    if checksums != expected_checksums {
+        return Err(RestoreValidationError::ChecksumInvalid);
+    }
+
+    validate_restore_blob_hashes(&package_root, &manifest)?;
+    validate_restore_mode_against_state(&manifest, &state)?;
+    build_validated_restore_package(manifest, state)
+}
+
+fn parse_restore_manifest(bytes: &[u8]) -> Result<BackupManifest, RestoreValidationError> {
+    let value: Value =
+        serde_json::from_slice(bytes).map_err(|_| RestoreValidationError::ManifestInvalid)?;
+    let object = value
+        .as_object()
+        .ok_or(RestoreValidationError::ManifestInvalid)?;
+    if object.get("format").and_then(Value::as_str) != Some(BACKUP_FORMAT_NAME) {
+        return Err(RestoreValidationError::FormatUnsupported);
+    }
+    let format_version = object
+        .get("formatVersion")
+        .and_then(Value::as_u64)
+        .ok_or(RestoreValidationError::ManifestInvalid)?;
+    if format_version != u64::from(BACKUP_FORMAT_VERSION) {
+        return Err(RestoreValidationError::FormatUnsupported);
+    }
+    let schema_version = object
+        .get("stateSchemaVersion")
+        .and_then(Value::as_u64)
+        .ok_or(RestoreValidationError::ManifestInvalid)?;
+    if schema_version != u64::from(STATE_SCHEMA_VERSION) {
+        return Err(RestoreValidationError::SchemaUnsupported);
+    }
+    if object.get("secretsIncluded").and_then(Value::as_bool) == Some(true) {
+        return Err(RestoreValidationError::SecretsIncluded);
+    }
+    if object
+        .get("runtimeGenerationsIncluded")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return Err(RestoreValidationError::RuntimeStateIncluded);
+    }
+    serde_json::from_value(value).map_err(|_| RestoreValidationError::ManifestInvalid)
+}
+
+fn validate_restore_manifest(manifest: &BackupManifest) -> Result<(), RestoreValidationError> {
+    if manifest.format != BACKUP_FORMAT_NAME
+        || manifest.format_version != BACKUP_FORMAT_VERSION
+        || manifest.state_schema_version != STATE_SCHEMA_VERSION
+        || manifest.provider_import_export_version != PROVIDER_IMPORT_EXPORT_VERSION
+        || manifest.secrets_included
+        || manifest.runtime_generations_included
+        || manifest.state.path != BACKUP_STATE_FILE_NAME
+        || manifest.app_version.trim().is_empty()
+        || manifest.created_at.trim().is_empty()
+        || manifest.files.len() > RESTORE_MANIFEST_MAX_FILES
+    {
+        return Err(RestoreValidationError::ManifestInvalid);
+    }
+    normalize_sha256(&manifest.state.sha256)?;
+
+    let mut file_ids = HashSet::new();
+    let mut paths = HashSet::new();
+    let mut folded_paths = HashSet::new();
+    for file in &manifest.files {
+        let expected_path = format!("{BACKUP_BLOBS_DIR_NAME}/file-{}.blob", file.file_id);
+        if file.file_id == 0
+            || !file_ids.insert(file.file_id)
+            || file.package_path != expected_path
+            || !is_safe_restore_relative_path(&file.package_path)
+            || !paths.insert(file.package_path.as_str())
+            || !folded_paths.insert(file.package_path.to_ascii_lowercase())
+            || file.mime.trim().is_empty()
+        {
+            return Err(RestoreValidationError::PathUnsafe);
+        }
+        normalize_sha256(&file.sha256)?;
+    }
+
+    match manifest.mode {
+        BackupManifestMode::StateOnly => {
+            if manifest.managed_blobs_included || !manifest.files.is_empty() {
+                return Err(RestoreValidationError::ModeMismatch);
+            }
+        }
+        BackupManifestMode::FullLocalData => {
+            if !manifest.managed_blobs_included {
+                return Err(RestoreValidationError::ModeMismatch);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_restore_package_root(
+    package_root: &FilePath,
+) -> Result<PathBuf, RestoreValidationError> {
+    let metadata = match std_fs::symlink_metadata(package_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(RestoreValidationError::PackageNotFound)
+        }
+        Err(_) => return Err(RestoreValidationError::DryRunValidationFailed),
+    };
+    if metadata_is_link_or_reparse(&metadata) {
+        return Err(RestoreValidationError::SymlinkRejected);
+    }
+    if !metadata.is_dir() {
+        return Err(RestoreValidationError::PathUnsafe);
+    }
+    std_fs::canonicalize(package_root).map_err(|_| RestoreValidationError::PathUnsafe)
+}
+
+fn validate_restore_package_tree(
+    package_root: &FilePath,
+    manifest: &BackupManifest,
+) -> Result<(), RestoreValidationError> {
+    let mut top_names = HashSet::new();
+    let mut folded_top_names = HashSet::new();
+    for entry in std_fs::read_dir(package_root)
+        .map_err(|_| RestoreValidationError::DryRunValidationFailed)?
+    {
+        let entry = entry.map_err(|_| RestoreValidationError::DryRunValidationFailed)?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| RestoreValidationError::PathUnsafe)?;
+        if !top_names.insert(name.clone()) || !folded_top_names.insert(name.to_ascii_lowercase()) {
+            return Err(RestoreValidationError::PathUnsafe);
+        }
+        let metadata = std_fs::symlink_metadata(entry.path())
+            .map_err(|_| RestoreValidationError::DryRunValidationFailed)?;
+        if metadata_is_link_or_reparse(&metadata) {
+            return Err(RestoreValidationError::SymlinkRejected);
+        }
+        match name.as_str() {
+            BACKUP_MANIFEST_FILE_NAME | BACKUP_STATE_FILE_NAME | BACKUP_CHECKSUM_FILE_NAME => {
+                if !metadata.is_file() {
+                    return Err(RestoreValidationError::PathUnsafe);
+                }
+            }
+            BACKUP_BLOBS_DIR_NAME => {
+                if !metadata.is_dir() {
+                    return Err(RestoreValidationError::PathUnsafe);
+                }
+            }
+            _ => return Err(RestoreValidationError::PathUnsafe),
+        }
+    }
+
+    for required in [
+        BACKUP_MANIFEST_FILE_NAME,
+        BACKUP_STATE_FILE_NAME,
+        BACKUP_CHECKSUM_FILE_NAME,
+    ] {
+        if !top_names.contains(required) {
+            return Err(RestoreValidationError::PathUnsafe);
+        }
+    }
+
+    let blob_root = package_root.join(BACKUP_BLOBS_DIR_NAME);
+    match manifest.mode {
+        BackupManifestMode::StateOnly => {
+            if blob_root.exists() {
+                validate_restore_blob_directory(&blob_root, &HashSet::new())?;
+            }
+        }
+        BackupManifestMode::FullLocalData => {
+            if !blob_root.exists() {
+                return Err(RestoreValidationError::BlobMissing);
+            }
+            let expected = manifest
+                .files
+                .iter()
+                .map(|file| format!("file-{}.blob", file.file_id))
+                .collect::<HashSet<_>>();
+            validate_restore_blob_directory(&blob_root, &expected)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_restore_blob_directory(
+    blob_root: &FilePath,
+    expected: &HashSet<String>,
+) -> Result<(), RestoreValidationError> {
+    let metadata =
+        std_fs::symlink_metadata(blob_root).map_err(|_| RestoreValidationError::BlobMissing)?;
+    if metadata_is_link_or_reparse(&metadata) {
+        return Err(RestoreValidationError::SymlinkRejected);
+    }
+    if !metadata.is_dir() {
+        return Err(RestoreValidationError::PathUnsafe);
+    }
+    let mut actual = HashSet::new();
+    let mut folded = HashSet::new();
+    for entry in std_fs::read_dir(blob_root).map_err(|_| RestoreValidationError::BlobMissing)? {
+        let entry = entry.map_err(|_| RestoreValidationError::BlobMissing)?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| RestoreValidationError::PathUnsafe)?;
+        if !actual.insert(name.clone()) || !folded.insert(name.to_ascii_lowercase()) {
+            return Err(RestoreValidationError::PathUnsafe);
+        }
+        let metadata = std_fs::symlink_metadata(entry.path())
+            .map_err(|_| RestoreValidationError::BlobMissing)?;
+        if metadata_is_link_or_reparse(&metadata) {
+            return Err(RestoreValidationError::SymlinkRejected);
+        }
+        if !metadata.is_file() {
+            return Err(RestoreValidationError::BlobUnexpected);
+        }
+    }
+    if actual.iter().any(|name| !expected.contains(name)) {
+        return Err(RestoreValidationError::BlobUnexpected);
+    }
+    if expected.iter().any(|name| !actual.contains(name)) {
+        return Err(RestoreValidationError::BlobMissing);
+    }
+    Ok(())
+}
+
+fn read_bounded_restore_file(
+    package_root: &FilePath,
+    relative_path: &str,
+    max_bytes: u64,
+    missing_error: RestoreValidationError,
+) -> Result<Vec<u8>, RestoreValidationError> {
+    if !is_safe_restore_relative_path(relative_path) {
+        return Err(RestoreValidationError::PathUnsafe);
+    }
+    let path = package_root.join(relative_path);
+    let metadata = match std_fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(missing_error),
+        Err(_) => return Err(missing_error),
+    };
+    if metadata_is_link_or_reparse(&metadata) {
+        return Err(RestoreValidationError::SymlinkRejected);
+    }
+    if !metadata.is_file() {
+        return Err(RestoreValidationError::PathUnsafe);
+    }
+    if metadata.len() > max_bytes {
+        return Err(RestoreValidationError::SizeMismatch);
+    }
+    let canonical = std_fs::canonicalize(&path).map_err(|_| RestoreValidationError::PathUnsafe)?;
+    if !canonical.starts_with(package_root) {
+        return Err(RestoreValidationError::PathUnsafe);
+    }
+    let mut file = std_fs::File::open(&canonical).map_err(|_| missing_error)?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    Read::by_ref(&mut file)
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|_| missing_error)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(RestoreValidationError::SizeMismatch);
+    }
+    Ok(bytes)
+}
+
+fn parse_restore_checksums(text: &str) -> Result<HashMap<String, String>, RestoreValidationError> {
+    let mut checksums = HashMap::new();
+    let mut folded_paths = HashSet::new();
+    for line in text.lines() {
+        let bytes = line.as_bytes();
+        if bytes.len() <= 66
+            || bytes[64] != b' '
+            || bytes[65] != b' '
+            || !bytes[..64].iter().all(u8::is_ascii_hexdigit)
+        {
+            return Err(RestoreValidationError::ChecksumInvalid);
+        }
+        let hash = line[..64].to_ascii_lowercase();
+        let path = &line[66..];
+        if !is_safe_restore_relative_path(path)
+            || path == BACKUP_CHECKSUM_FILE_NAME
+            || !folded_paths.insert(path.to_ascii_lowercase())
+            || checksums.insert(path.to_string(), hash).is_some()
+        {
+            return Err(RestoreValidationError::ChecksumInvalid);
+        }
+    }
+    if checksums.is_empty() {
+        return Err(RestoreValidationError::ChecksumInvalid);
+    }
+    Ok(checksums)
+}
+
+fn validate_restore_blob_hashes(
+    package_root: &FilePath,
+    manifest: &BackupManifest,
+) -> Result<(), RestoreValidationError> {
+    if manifest.mode == BackupManifestMode::StateOnly {
+        return Ok(());
+    }
+    let blob_root = package_root.join(BACKUP_BLOBS_DIR_NAME);
+    let canonical_blob_root =
+        std_fs::canonicalize(&blob_root).map_err(|_| RestoreValidationError::BlobMissing)?;
+    for file in &manifest.files {
+        let path = package_root.join(&file.package_path);
+        let (hash, size) = hash_restore_blob(&path, &canonical_blob_root, file.size_bytes)?;
+        if size != file.size_bytes {
+            return Err(RestoreValidationError::SizeMismatch);
+        }
+        if hash != normalize_sha256(&file.sha256)? {
+            return Err(RestoreValidationError::ChecksumInvalid);
+        }
+    }
+    Ok(())
+}
+
+fn hash_restore_blob(
+    path: &FilePath,
+    canonical_blob_root: &FilePath,
+    expected_size: u64,
+) -> Result<(String, u64), RestoreValidationError> {
+    let metadata = match std_fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(RestoreValidationError::BlobMissing)
+        }
+        Err(_) => return Err(RestoreValidationError::BlobMissing),
+    };
+    if metadata_is_link_or_reparse(&metadata) {
+        return Err(RestoreValidationError::SymlinkRejected);
+    }
+    if !metadata.is_file() {
+        return Err(RestoreValidationError::BlobUnexpected);
+    }
+    if metadata.len() != expected_size {
+        return Err(RestoreValidationError::SizeMismatch);
+    }
+    let canonical = std_fs::canonicalize(path).map_err(|_| RestoreValidationError::PathUnsafe)?;
+    if canonical.parent() != Some(canonical_blob_root) {
+        return Err(RestoreValidationError::PathUnsafe);
+    }
+    let mut file =
+        std_fs::File::open(canonical).map_err(|_| RestoreValidationError::BlobMissing)?;
+    let mut hasher = Sha256::new();
+    let mut size = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| RestoreValidationError::BlobMissing)?;
+        if read == 0 {
+            break;
+        }
+        size = size
+            .checked_add(read as u64)
+            .ok_or(RestoreValidationError::SizeMismatch)?;
+        if size > expected_size {
+            return Err(RestoreValidationError::SizeMismatch);
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok((format!("{:x}", hasher.finalize()), size))
+}
+
+fn parse_and_validate_restore_state(
+    bytes: &[u8],
+    manifest_schema_version: u32,
+) -> Result<PersistedMockState, RestoreValidationError> {
+    let value: Value =
+        serde_json::from_slice(bytes).map_err(|_| RestoreValidationError::StateInvalid)?;
+    let schema_version = value
+        .get("schemaVersion")
+        .and_then(Value::as_u64)
+        .ok_or(RestoreValidationError::StateInvalid)?;
+    if schema_version != u64::from(STATE_SCHEMA_VERSION)
+        || schema_version != u64::from(manifest_schema_version)
+    {
+        return Err(RestoreValidationError::SchemaUnsupported);
+    }
+    validate_restore_state_shape(&value)?;
+    let state: PersistedMockState =
+        serde_json::from_value(value).map_err(|_| RestoreValidationError::StateInvalid)?;
+    validate_restore_state_invariants(&state)?;
+    Ok(state)
+}
+
+fn validate_restore_state_shape(value: &Value) -> Result<(), RestoreValidationError> {
+    let state = value
+        .as_object()
+        .ok_or(RestoreValidationError::StateInvalid)?;
+    require_only_restore_keys(
+        state,
+        &[
+            "schemaVersion",
+            "savedAt",
+            "idSeq",
+            "settings",
+            "conversations",
+            "providers",
+            "files",
+        ],
+    )?;
+    let conversations = state
+        .get("conversations")
+        .and_then(Value::as_object)
+        .ok_or(RestoreValidationError::StateInvalid)?;
+    for conversation in conversations.values() {
+        let conversation = conversation
+            .as_object()
+            .ok_or(RestoreValidationError::StateInvalid)?;
+        require_only_restore_keys(
+            conversation,
+            &[
+                "id",
+                "assistantId",
+                "title",
+                "messages",
+                "truncateIndex",
+                "chatSuggestions",
+                "isPinned",
+                "customSystemPrompt",
+                "modeInjectionIds",
+                "lorebookIds",
+                "createAt",
+                "updateAt",
+                "isGenerating",
+            ],
+        )?;
+        let nodes = conversation
+            .get("messages")
+            .and_then(Value::as_array)
+            .ok_or(RestoreValidationError::StateInvalid)?;
+        for node in nodes {
+            let node = node
+                .as_object()
+                .ok_or(RestoreValidationError::StateInvalid)?;
+            require_only_restore_keys(node, &["id", "messages", "selectIndex"])?;
+            let messages = node
+                .get("messages")
+                .and_then(Value::as_array)
+                .ok_or(RestoreValidationError::StateInvalid)?;
+            for message in messages {
+                let message = message
+                    .as_object()
+                    .ok_or(RestoreValidationError::StateInvalid)?;
+                require_only_restore_keys(
+                    message,
+                    &[
+                        "id",
+                        "role",
+                        "parts",
+                        "annotations",
+                        "createdAt",
+                        "finishedAt",
+                        "modelId",
+                        "usage",
+                        "translation",
+                    ],
+                )?;
+            }
+        }
+    }
+
+    let providers = state
+        .get("providers")
+        .and_then(Value::as_array)
+        .ok_or(RestoreValidationError::StateInvalid)?;
+    for provider in providers {
+        let provider = provider
+            .as_object()
+            .ok_or(RestoreValidationError::StateInvalid)?;
+        require_only_restore_keys(
+            provider,
+            &[
+                "id",
+                "type",
+                "enabled",
+                "name",
+                "baseUrl",
+                "models",
+                "model",
+                "secretRef",
+                "customHeaders",
+                "customBody",
+            ],
+        )?;
+        if let Some(models) = provider.get("models").and_then(Value::as_array) {
+            for model in models {
+                require_only_restore_keys(
+                    model
+                        .as_object()
+                        .ok_or(RestoreValidationError::StateInvalid)?,
+                    &[
+                        "id",
+                        "modelId",
+                        "displayName",
+                        "inputModalities",
+                        "outputModalities",
+                    ],
+                )?;
+            }
+        }
+        if let Some(headers) = provider.get("customHeaders").and_then(Value::as_array) {
+            for header in headers {
+                require_only_restore_keys(
+                    header
+                        .as_object()
+                        .ok_or(RestoreValidationError::StateInvalid)?,
+                    &["name", "value"],
+                )?;
+            }
+        }
+    }
+
+    let files = state
+        .get("files")
+        .and_then(Value::as_array)
+        .ok_or(RestoreValidationError::StateInvalid)?;
+    for file in files {
+        require_only_restore_keys(
+            file.as_object()
+                .ok_or(RestoreValidationError::StateInvalid)?,
+            &[
+                "id",
+                "storageKey",
+                "displayName",
+                "mime",
+                "sizeBytes",
+                "sha256",
+                "kind",
+                "relativePath",
+                "createdAt",
+                "updatedAt",
+                "source",
+                "deletedAt",
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn require_only_restore_keys(
+    object: &Map<String, Value>,
+    allowed: &[&str],
+) -> Result<(), RestoreValidationError> {
+    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return Err(RestoreValidationError::StateInvalid);
+    }
+    Ok(())
+}
+
+fn validate_restore_state_invariants(
+    state: &PersistedMockState,
+) -> Result<(), RestoreValidationError> {
+    validate_persisted_state_for_transaction(state)
+        .map_err(|_| RestoreValidationError::StateInvalid)?;
+    validate_provider_metadata_transaction(state)
+        .map_err(|_| RestoreValidationError::StateInvalid)?;
+    validate_file_metadata_transaction(state).map_err(|_| RestoreValidationError::StateInvalid)?;
+    if state.id_seq < restore_state_id_high_water(state)
+        || state
+            .conversations
+            .values()
+            .any(|conversation| conversation.is_generating)
+        || state.conversations.values().any(|conversation| {
+            conversation.messages.iter().any(|node| {
+                node.messages.is_empty()
+                    || node.select_index >= node.messages.len()
+                    || node
+                        .messages
+                        .iter()
+                        .any(|message| message.parts.iter().any(backup_part_is_unsafe))
+            })
+        })
+        || state.providers.len() > PROVIDER_IMPORT_MAX_ITEMS
+    {
+        return Err(RestoreValidationError::StateInvalid);
+    }
+    for provider in &state.providers {
+        if provider.models.is_empty()
+            || provider.models.len() > PROVIDER_MODEL_MAX_ITEMS
+            || validate_custom_headers(&provider.custom_headers).is_err()
+            || provider
+                .custom_body
+                .as_ref()
+                .is_some_and(|body| validate_custom_body_value(body).is_err())
+        {
+            return Err(RestoreValidationError::StateInvalid);
+        }
+        for model in &provider.models {
+            if normalize_input_modalities(Some(&model.input_modalities)).as_ref()
+                != Ok(&model.input_modalities)
+                || normalize_output_modalities(Some(&model.output_modalities)).as_ref()
+                    != Ok(&model.output_modalities)
+            {
+                return Err(RestoreValidationError::StateInvalid);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn restore_state_id_high_water(state: &PersistedMockState) -> u64 {
+    let mut high_water =
+        max_persisted_id_seq(&state.conversations).max(max_persisted_file_id(&state.files));
+    for provider in &state.providers {
+        if let Some(id) = numeric_suffix(&provider.id) {
+            high_water = high_water.max(id);
+        }
+        for model in &provider.models {
+            if let Some(id) = numeric_suffix(&model.id) {
+                high_water = high_water.max(id);
+            }
+        }
+    }
+    high_water
+}
+
+fn validate_restore_mode_against_state(
+    manifest: &BackupManifest,
+    state: &PersistedMockState,
+) -> Result<(), RestoreValidationError> {
+    let active_files = state
+        .files
+        .iter()
+        .filter(|file| file.deleted_at.is_none())
+        .map(|file| (file.id, file))
+        .collect::<HashMap<_, _>>();
+    match manifest.mode {
+        BackupManifestMode::StateOnly => {
+            if manifest.managed_blobs_included || !manifest.files.is_empty() {
+                return Err(RestoreValidationError::ModeMismatch);
+            }
+        }
+        BackupManifestMode::FullLocalData => {
+            if !manifest.managed_blobs_included || manifest.files.len() != active_files.len() {
+                return Err(RestoreValidationError::ModeMismatch);
+            }
+            for manifest_file in &manifest.files {
+                let state_file = active_files
+                    .get(&manifest_file.file_id)
+                    .ok_or(RestoreValidationError::BlobUnexpected)?;
+                if state_file.mime != manifest_file.mime
+                    || state_file.size_bytes != manifest_file.size_bytes
+                    || state_file
+                        .sha256
+                        .as_deref()
+                        .filter(|value| !value.is_empty())
+                        .is_some_and(|value| {
+                            normalize_sha256(value).ok().as_deref()
+                                != normalize_sha256(&manifest_file.sha256).ok().as_deref()
+                        })
+                {
+                    return Err(RestoreValidationError::ModeMismatch);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn build_validated_restore_package(
+    manifest: BackupManifest,
+    mut state: PersistedMockState,
+) -> Result<ValidatedRestorePackage, RestoreValidationError> {
+    let mut settings_secret_index = 0_u64;
+    sanitize_backup_secret_fields(&mut state.settings, &mut settings_secret_index);
+    let mut provider_secret_plan = Vec::with_capacity(state.providers.len());
+    for (index, provider) in state.providers.iter_mut().enumerate() {
+        let planned_secret_ref = format!(
+            "{PROVIDER_SECRET_REF_PREFIX}{RESTORE_PLANNED_SECRET_REF_MARKER}-{index}:api-key"
+        );
+        provider.secret_ref = planned_secret_ref.clone();
+        provider_secret_plan.push(PlannedProviderSecret {
+            provider_index: index,
+            planned_secret_ref,
+        });
+    }
+    sync_settings_with_desktop_providers(&mut state.settings, &state.providers);
+
+    for file in &mut state.files {
+        let planned_storage_key =
+            format!("{RESTORE_PLANNED_STORAGE_KEY_PREFIX}-{}-planned", file.id);
+        file.storage_key = planned_storage_key.clone();
+        file.relative_path =
+            format!("{FILES_DIR_NAME}/{FILE_BLOBS_DIR_NAME}/{planned_storage_key}");
+    }
+
+    validate_restore_state_invariants(&state)?;
+    let manifest_by_id = manifest
+        .files
+        .iter()
+        .map(|file| (file.file_id, file))
+        .collect::<HashMap<_, _>>();
+    let blob_restore_plan = if manifest.mode == BackupManifestMode::FullLocalData {
+        let mut plan = state
+            .files
+            .iter()
+            .filter(|file| file.deleted_at.is_none())
+            .map(|file| {
+                let manifest_file = manifest_by_id
+                    .get(&file.id)
+                    .ok_or(RestoreValidationError::BlobMissing)?;
+                Ok(PlannedBlobRestore {
+                    file_id: file.id,
+                    package_path: manifest_file.package_path.clone(),
+                    planned_storage_key: file.storage_key.clone(),
+                    expected_size_bytes: manifest_file.size_bytes,
+                    expected_sha256: normalize_sha256(&manifest_file.sha256)?,
+                })
+            })
+            .collect::<Result<Vec<_>, RestoreValidationError>>()?;
+        plan.sort_by_key(|item| item.file_id);
+        plan
+    } else {
+        Vec::new()
+    };
+
+    let mut warnings = vec![
+        RestoreWarning::FullReplacementOnly,
+        RestoreWarning::ActualRestoreMustRevalidate,
+    ];
+    if !state.providers.is_empty() {
+        warnings.push(RestoreWarning::ProviderApiKeysMustBeReentered);
+    }
+    if manifest.mode == BackupManifestMode::StateOnly
+        && state.files.iter().any(|file| file.deleted_at.is_none())
+    {
+        warnings.push(RestoreWarning::AttachmentsMayBeUnavailableAfterStateOnlyRestore);
+    }
+
+    Ok(ValidatedRestorePackage {
+        mode: manifest.mode,
+        manifest,
+        staged_state: state,
+        blob_restore_plan,
+        provider_secret_plan,
+        warnings,
+    })
+}
+
+fn restore_dry_run_report(validated: &ValidatedRestorePackage) -> RestoreDryRunReport {
+    let state = &validated.staged_state;
+    let active_file_count = state
+        .files
+        .iter()
+        .filter(|file| file.deleted_at.is_none())
+        .count();
+    let tombstoned_file_count = state.files.len().saturating_sub(active_file_count);
+    let message_count = state
+        .conversations
+        .values()
+        .flat_map(|conversation| &conversation.messages)
+        .map(|node| node.messages.len())
+        .sum();
+    let attachment_reference_count = state
+        .conversations
+        .values()
+        .flat_map(|conversation| &conversation.messages)
+        .flat_map(|node| &node.messages)
+        .flat_map(|message| &message.parts)
+        .filter(|part| {
+            part.get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|part_type| {
+                    matches!(part_type, "image" | "video" | "audio" | "document")
+                })
+        })
+        .count();
+    RestoreDryRunReport {
+        format_version: validated.manifest.format_version,
+        mode: validated.mode,
+        state_schema_version: validated.manifest.state_schema_version,
+        provider_count: state.providers.len(),
+        providers_requiring_api_key: state.providers.len(),
+        conversation_count: state.conversations.len(),
+        message_count,
+        attachment_reference_count,
+        active_file_count,
+        tombstoned_file_count,
+        restorable_blob_count: validated.blob_restore_plan.len(),
+        unavailable_attachment_count: if validated.mode == BackupManifestMode::StateOnly {
+            active_file_count
+        } else {
+            0
+        },
+        provider_secret_refs_replaced: validated.provider_secret_plan.len(),
+        file_storage_keys_replaced: state.files.len(),
+        secrets_restored: false,
+        runtime_generations_restored: false,
+        restore_strategy: RestoreStrategy::FullReplacement,
+        merge_restore_supported: false,
+        warnings: validated.warnings.clone(),
+    }
+}
+
+fn normalize_sha256(value: &str) -> Result<String, RestoreValidationError> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(RestoreValidationError::ChecksumInvalid);
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+fn is_safe_restore_relative_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.contains('\\')
+        && !path.starts_with('/')
+        && path.as_bytes().get(1) != Some(&b':')
+        && path
+            .split('/')
+            .all(|component| !component.is_empty() && component != "." && component != "..")
+        && FilePath::new(path)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
+fn metadata_is_link_or_reparse(metadata: &std_fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -9420,6 +10436,220 @@ mod tests {
         package
     }
 
+    struct SyntheticRestorePackage {
+        path: PathBuf,
+        source_blob_root: PathBuf,
+    }
+
+    fn synthetic_restore_package(
+        temp: &SyntheticTempDir,
+        label: &str,
+        mode: BackupExportMode,
+        active_files: usize,
+        tombstoned_files: usize,
+        include_provider: bool,
+        include_attachment_reference: bool,
+    ) -> SyntheticRestorePackage {
+        let mut state = if include_provider {
+            synthetic_provider_state()
+        } else {
+            default_persisted_state()
+        };
+        state.id_seq = 10_000;
+        let source_blob_root = temp.path.join(format!("restore-source-blobs-{label}"));
+        std_fs::create_dir(&source_blob_root)
+            .expect("synthetic restore blob root should be created");
+
+        for index in 0..active_files + tombstoned_files {
+            let id = 100 + index as u64;
+            let storage_key = format!("file-{id}-synthetic");
+            let content = format!("synthetic restore blob {id}").into_bytes();
+            let sha256 = sha256_bytes(&content);
+            let deleted_at = (index >= active_files).then(|| "2026-01-01T00:00:00Z".to_string());
+            if deleted_at.is_none() {
+                std_fs::write(source_blob_root.join(&storage_key), &content)
+                    .expect("synthetic restore blob should be written");
+            }
+            state.files.push(ManagedFileMetadata {
+                id,
+                storage_key: storage_key.clone(),
+                display_name: format!("synthetic-{id}.png"),
+                mime: "image/png".to_string(),
+                size_bytes: content.len() as u64,
+                sha256: Some(sha256),
+                kind: "image".to_string(),
+                relative_path: format!("{FILES_DIR_NAME}/{FILE_BLOBS_DIR_NAME}/{storage_key}"),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+                source: "upload".to_string(),
+                deleted_at,
+            });
+        }
+
+        let mut conversation = synthetic_text_conversation(
+            "restore-conversation-500",
+            "synthetic restore user text",
+            "synthetic restore assistant text",
+        );
+        if include_attachment_reference && active_files > 0 {
+            let file = &state.files[0];
+            conversation.messages[0].messages[0].parts.push(json!({
+                "type": "image",
+                "url": format!("/api/files/path/{}", file.id),
+                "metadata": {
+                    "fileId": file.id,
+                    "mime": file.mime,
+                    "sizeBytes": file.size_bytes
+                }
+            }));
+        }
+        state
+            .conversations
+            .insert(conversation.id.clone(), conversation);
+        let state = sanitize_and_validate_portable_backup_snapshot(state)
+            .expect("synthetic restore state should be portable");
+        let path = create_unpublished_backup_package(
+            temp,
+            label,
+            mode,
+            &state,
+            (mode == BackupExportMode::ModeB).then_some(source_blob_root.as_path()),
+        );
+        SyntheticRestorePackage {
+            path,
+            source_blob_root,
+        }
+    }
+
+    fn read_restore_json(path: &FilePath) -> Value {
+        serde_json::from_slice(&std_fs::read(path).expect("synthetic JSON should be readable"))
+            .expect("synthetic JSON should be valid")
+    }
+
+    fn write_restore_json(path: &FilePath, value: &Value) {
+        let mut bytes = serde_json::to_vec_pretty(value).expect("synthetic JSON should serialize");
+        bytes.push(b'\n');
+        std_fs::write(path, bytes).expect("synthetic JSON should be written");
+    }
+
+    fn refresh_restore_checksums(package: &FilePath) {
+        let manifest_path = package.join(BACKUP_MANIFEST_FILE_NAME);
+        let manifest = read_restore_json(&manifest_path);
+        let mut entries = vec![
+            (
+                BACKUP_MANIFEST_FILE_NAME.to_string(),
+                sha256_bytes(&std_fs::read(&manifest_path).unwrap()),
+            ),
+            (
+                BACKUP_STATE_FILE_NAME.to_string(),
+                sha256_bytes(&std_fs::read(package.join(BACKUP_STATE_FILE_NAME)).unwrap()),
+            ),
+        ];
+        if let Some(files) = manifest.get("files").and_then(Value::as_array) {
+            for file in files {
+                let Some(path) = file.get("packagePath").and_then(Value::as_str) else {
+                    continue;
+                };
+                let file_path = package.join(path);
+                if file_path.is_file() {
+                    entries.push((
+                        path.to_string(),
+                        sha256_bytes(&std_fs::read(file_path).unwrap()),
+                    ));
+                }
+            }
+        }
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        let text = entries
+            .into_iter()
+            .map(|(path, hash)| format!("{hash}  {path}\n"))
+            .collect::<String>();
+        std_fs::write(package.join(BACKUP_CHECKSUM_FILE_NAME), text)
+            .expect("synthetic checksums should be written");
+    }
+
+    fn mutate_restore_manifest<F>(package: &FilePath, mutation: F)
+    where
+        F: FnOnce(&mut Value),
+    {
+        let path = package.join(BACKUP_MANIFEST_FILE_NAME);
+        let mut value = read_restore_json(&path);
+        mutation(&mut value);
+        write_restore_json(&path, &value);
+        refresh_restore_checksums(package);
+    }
+
+    fn mutate_restore_state<F>(package: &FilePath, mutation: F)
+    where
+        F: FnOnce(&mut Value),
+    {
+        let state_path = package.join(BACKUP_STATE_FILE_NAME);
+        let mut state = read_restore_json(&state_path);
+        mutation(&mut state);
+        write_restore_json(&state_path, &state);
+        let state_bytes = std_fs::read(&state_path).unwrap();
+        let manifest_path = package.join(BACKUP_MANIFEST_FILE_NAME);
+        let mut manifest = read_restore_json(&manifest_path);
+        manifest["state"]["sha256"] = json!(sha256_bytes(&state_bytes));
+        manifest["state"]["sizeBytes"] = json!(state_bytes.len() as u64);
+        write_restore_json(&manifest_path, &manifest);
+        refresh_restore_checksums(package);
+    }
+
+    fn restore_package_fingerprint(package: &FilePath) -> HashMap<String, String> {
+        fn collect(root: &FilePath, current: &FilePath, output: &mut HashMap<String, String>) {
+            for entry in std_fs::read_dir(current).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if path.is_dir() {
+                    collect(root, &path, output);
+                } else {
+                    let relative = path
+                        .strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    output.insert(relative, sha256_bytes(&std_fs::read(path).unwrap()));
+                }
+            }
+        }
+        let mut output = HashMap::new();
+        collect(package, package, &mut output);
+        output
+    }
+
+    fn try_create_restore_file_symlink(target: &FilePath, link: &FilePath) -> bool {
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(target, link).is_ok()
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(not(any(windows, unix)))]
+        {
+            let _ = (target, link);
+            false
+        }
+    }
+
+    fn try_create_restore_directory_symlink(target: &FilePath, link: &FilePath) -> bool {
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_dir(target, link).is_ok()
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(not(any(windows, unix)))]
+        {
+            let _ = (target, link);
+            false
+        }
+    }
+
     fn synthetic_desktop_provider() -> DesktopProviderConfig {
         let id = "synthetic-provider".to_string();
         DesktopProviderConfig {
@@ -14405,5 +15635,1724 @@ mod tests {
         let canonical_destination = std_fs::canonicalize(&destination).unwrap();
         assert!(canonical_package.starts_with(canonical_temp));
         assert!(canonical_package.starts_with(canonical_destination));
+    }
+
+    #[test]
+    fn restore_dry_run_mode_a_success() {
+        let temp = SyntheticTempDir::new("restore-mode-a-success");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "mode-a-success",
+            BackupExportMode::ModeA,
+            1,
+            1,
+            true,
+            true,
+        );
+
+        let report = restore_package_dry_run(&fixture.path).unwrap();
+
+        assert_eq!(report.mode, BackupManifestMode::StateOnly);
+        assert_eq!(report.provider_count, 1);
+        assert_eq!(report.providers_requiring_api_key, 1);
+        assert_eq!(report.active_file_count, 1);
+        assert_eq!(report.tombstoned_file_count, 1);
+        assert_eq!(report.unavailable_attachment_count, 1);
+        assert_eq!(report.restorable_blob_count, 0);
+        assert!(!report.secrets_restored);
+        assert!(!report.runtime_generations_restored);
+        assert!(report
+            .warnings
+            .contains(&RestoreWarning::AttachmentsMayBeUnavailableAfterStateOnlyRestore));
+    }
+
+    #[test]
+    fn restore_dry_run_mode_b_success() {
+        let temp = SyntheticTempDir::new("restore-mode-b-success");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "mode-b-success",
+            BackupExportMode::ModeB,
+            2,
+            1,
+            true,
+            true,
+        );
+
+        let report = restore_package_dry_run(&fixture.path).unwrap();
+
+        assert_eq!(report.mode, BackupManifestMode::FullLocalData);
+        assert_eq!(report.restorable_blob_count, 2);
+        assert_eq!(report.unavailable_attachment_count, 0);
+        assert_eq!(report.providers_requiring_api_key, 1);
+        assert_eq!(report.file_storage_keys_replaced, 3);
+    }
+
+    #[test]
+    fn restore_dry_run_is_deterministic() {
+        let temp = SyntheticTempDir::new("restore-deterministic");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "deterministic",
+            BackupExportMode::ModeB,
+            1,
+            0,
+            true,
+            true,
+        );
+
+        let first = restore_package_dry_run(&fixture.path).unwrap();
+        let second = restore_package_dry_run(&fixture.path).unwrap();
+
+        assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn restore_dry_run_does_not_modify_live_state() {
+        let temp = SyntheticTempDir::new("restore-no-live-write");
+        let state = transaction_test_state_with_secret_store(
+            &temp,
+            synthetic_provider_state(),
+            None,
+            Arc::new(PanicOnAccessSecretStore),
+        )
+        .await;
+        let fixture = synthetic_restore_package(
+            &temp,
+            "no-live-write",
+            BackupExportMode::ModeA,
+            1,
+            0,
+            true,
+            true,
+        );
+        let before = persisted_snapshot_from_live(&state).await;
+
+        restore_package_dry_run(&fixture.path).unwrap();
+
+        let after = persisted_snapshot_from_live(&state).await;
+        assert_eq!(after.id_seq, before.id_seq);
+        assert_eq!(after.settings, before.settings);
+        assert!(after.conversations == before.conversations);
+        assert!(after.providers == before.providers);
+        assert!(after.files == before.files);
+        assert!(state.active_generations.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn restore_dry_run_does_not_modify_disk_state() {
+        let temp = SyntheticTempDir::new("restore-no-disk-write");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let before = std_fs::read(&state.persistence.state_path).unwrap();
+        let fixture = synthetic_restore_package(
+            &temp,
+            "no-disk-write",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+
+        restore_package_dry_run(&fixture.path).unwrap();
+
+        assert_eq!(std_fs::read(&state.persistence.state_path).unwrap(), before);
+    }
+
+    #[test]
+    fn restore_dry_run_does_not_touch_secret_store() {
+        let temp = SyntheticTempDir::new("restore-no-secret-access");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "no-secret-access",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            true,
+            false,
+        );
+
+        let report = restore_package_dry_run(&fixture.path).unwrap();
+
+        assert_eq!(report.providers_requiring_api_key, 1);
+        assert!(!report.secrets_restored);
+    }
+
+    #[test]
+    fn restore_dry_run_does_not_write_blobs() {
+        let temp = SyntheticTempDir::new("restore-no-blob-write");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "no-blob-write",
+            BackupExportMode::ModeB,
+            1,
+            0,
+            false,
+            true,
+        );
+        let package_before = restore_package_fingerprint(&fixture.path);
+        let source_before = restore_package_fingerprint(&fixture.source_blob_root);
+
+        restore_package_dry_run(&fixture.path).unwrap();
+
+        assert_eq!(restore_package_fingerprint(&fixture.path), package_before);
+        assert_eq!(
+            restore_package_fingerprint(&fixture.source_blob_root),
+            source_before
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_dry_run_does_not_emit_sse() {
+        let temp = SyntheticTempDir::new("restore-no-sse");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let mut receiver = state.settings_tx.subscribe();
+        let fixture =
+            synthetic_restore_package(&temp, "no-sse", BackupExportMode::ModeA, 0, 0, false, false);
+
+        restore_package_dry_run(&fixture.path).unwrap();
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn restore_dry_run_does_not_change_revision_or_id_seq() {
+        let temp = SyntheticTempDir::new("restore-no-revision");
+        let state = transaction_test_state(&temp, default_persisted_state(), None).await;
+        let revision = state.revision.load(Ordering::Acquire);
+        let id_seq = state.id_seq.load(Ordering::Acquire);
+        let fixture = synthetic_restore_package(
+            &temp,
+            "no-revision",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+
+        restore_package_dry_run(&fixture.path).unwrap();
+
+        assert_eq!(state.revision.load(Ordering::Acquire), revision);
+        assert_eq!(state.id_seq.load(Ordering::Acquire), id_seq);
+    }
+
+    #[test]
+    fn restore_validation_invalid_format() {
+        let temp = SyntheticTempDir::new("restore-invalid-format");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "invalid-format",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        mutate_restore_manifest(&fixture.path, |manifest| {
+            manifest["format"] = json!("synthetic-unknown-format");
+        });
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::FormatUnsupported)
+        );
+    }
+
+    #[test]
+    fn restore_validation_future_format_version() {
+        let temp = SyntheticTempDir::new("restore-future-format");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "future-format",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        mutate_restore_manifest(&fixture.path, |manifest| {
+            manifest["formatVersion"] = json!(BACKUP_FORMAT_VERSION + 1);
+        });
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::FormatUnsupported)
+        );
+    }
+
+    #[test]
+    fn restore_validation_unsupported_old_format() {
+        let temp = SyntheticTempDir::new("restore-old-format");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "old-format",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        mutate_restore_manifest(&fixture.path, |manifest| {
+            manifest["formatVersion"] = json!(0);
+        });
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::FormatUnsupported)
+        );
+    }
+
+    #[test]
+    fn restore_validation_unknown_mode() {
+        let temp = SyntheticTempDir::new("restore-unknown-mode");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "unknown-mode",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        mutate_restore_manifest(&fixture.path, |manifest| {
+            manifest["mode"] = json!("synthetic-unknown-mode");
+        });
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::ManifestInvalid)
+        );
+    }
+
+    #[test]
+    fn restore_validation_secrets_included_true() {
+        let temp = SyntheticTempDir::new("restore-secrets-flag");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "secrets-flag",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        mutate_restore_manifest(&fixture.path, |manifest| {
+            manifest["secretsIncluded"] = json!(true);
+        });
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::SecretsIncluded)
+        );
+    }
+
+    #[test]
+    fn restore_validation_runtime_generations_included_true() {
+        let temp = SyntheticTempDir::new("restore-runtime-flag");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "runtime-flag",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        mutate_restore_manifest(&fixture.path, |manifest| {
+            manifest["runtimeGenerationsIncluded"] = json!(true);
+        });
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::RuntimeStateIncluded)
+        );
+    }
+
+    #[test]
+    fn restore_validation_state_schema_newer_than_supported() {
+        let temp = SyntheticTempDir::new("restore-newer-schema");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "newer-schema",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        mutate_restore_state(&fixture.path, |state| {
+            state["schemaVersion"] = json!(STATE_SCHEMA_VERSION + 1);
+        });
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::SchemaUnsupported)
+        );
+    }
+
+    #[test]
+    fn restore_validation_state_schema_older_than_supported() {
+        let temp = SyntheticTempDir::new("restore-older-schema");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "older-schema",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        mutate_restore_state(&fixture.path, |state| {
+            state["schemaVersion"] = json!(STATE_SCHEMA_VERSION - 1);
+        });
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::SchemaUnsupported)
+        );
+    }
+
+    #[test]
+    fn restore_validation_manifest_state_schema_mismatch() {
+        let temp = SyntheticTempDir::new("restore-schema-mismatch");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "schema-mismatch",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        mutate_restore_state(&fixture.path, |state| {
+            state["schemaVersion"] = json!(STATE_SCHEMA_VERSION - 1);
+        });
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::SchemaUnsupported)
+        );
+    }
+
+    #[test]
+    fn restore_validation_malformed_manifest() {
+        let temp = SyntheticTempDir::new("restore-malformed-manifest");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "malformed-manifest",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        std_fs::write(fixture.path.join(BACKUP_MANIFEST_FILE_NAME), b"{").unwrap();
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::ManifestInvalid)
+        );
+    }
+
+    #[test]
+    fn restore_validation_malformed_state() {
+        let temp = SyntheticTempDir::new("restore-malformed-state");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "malformed-state",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        let state_bytes = b"{";
+        std_fs::write(fixture.path.join(BACKUP_STATE_FILE_NAME), state_bytes).unwrap();
+        let manifest_path = fixture.path.join(BACKUP_MANIFEST_FILE_NAME);
+        let mut manifest = read_restore_json(&manifest_path);
+        manifest["state"]["sha256"] = json!(sha256_bytes(state_bytes));
+        manifest["state"]["sizeBytes"] = json!(state_bytes.len() as u64);
+        write_restore_json(&manifest_path, &manifest);
+        refresh_restore_checksums(&fixture.path);
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::StateInvalid)
+        );
+    }
+
+    #[test]
+    fn restore_validation_unknown_manifest_field() {
+        let temp = SyntheticTempDir::new("restore-unknown-manifest-field");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "unknown-manifest-field",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        mutate_restore_manifest(&fixture.path, |manifest| {
+            manifest["syntheticUnknown"] = json!(true);
+        });
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::ManifestInvalid)
+        );
+    }
+
+    #[test]
+    fn restore_checksum_state_mismatch() {
+        let temp = SyntheticTempDir::new("restore-state-checksum");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "state-checksum",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        let path = fixture.path.join(BACKUP_STATE_FILE_NAME);
+        let mut bytes = std_fs::read(&path).unwrap();
+        let index = bytes.iter().position(|byte| *byte == b' ').unwrap();
+        bytes[index] = b'\t';
+        std_fs::write(path, bytes).unwrap();
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::ChecksumInvalid)
+        );
+    }
+
+    #[test]
+    fn restore_checksum_manifest_mismatch() {
+        let temp = SyntheticTempDir::new("restore-manifest-checksum");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "manifest-checksum",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        let path = fixture.path.join(BACKUP_MANIFEST_FILE_NAME);
+        let mut bytes = std_fs::read(&path).unwrap();
+        let index = bytes.iter().position(|byte| *byte == b' ').unwrap();
+        bytes[index] = b'\t';
+        std_fs::write(path, bytes).unwrap();
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::ChecksumInvalid)
+        );
+    }
+
+    #[test]
+    fn restore_checksum_blob_mismatch() {
+        let temp = SyntheticTempDir::new("restore-blob-checksum");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "blob-checksum",
+            BackupExportMode::ModeB,
+            1,
+            0,
+            false,
+            false,
+        );
+        let blob = fixture.path.join("blobs/file-100.blob");
+        let mut bytes = std_fs::read(&blob).unwrap();
+        bytes[0] ^= 1;
+        std_fs::write(blob, bytes).unwrap();
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::ChecksumInvalid)
+        );
+    }
+
+    #[test]
+    fn restore_checksum_size_mismatch() {
+        let temp = SyntheticTempDir::new("restore-size-mismatch");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "size-mismatch",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        mutate_restore_manifest(&fixture.path, |manifest| {
+            let size = manifest["state"]["sizeBytes"].as_u64().unwrap();
+            manifest["state"]["sizeBytes"] = json!(size + 1);
+        });
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::SizeMismatch)
+        );
+    }
+
+    #[test]
+    fn restore_checksum_missing_entry() {
+        let temp = SyntheticTempDir::new("restore-missing-checksum");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "missing-checksum",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        let path = fixture.path.join(BACKUP_CHECKSUM_FILE_NAME);
+        let text = std_fs::read_to_string(&path).unwrap();
+        let filtered = text
+            .lines()
+            .filter(|line| !line.ends_with(BACKUP_STATE_FILE_NAME))
+            .map(|line| format!("{line}\n"))
+            .collect::<String>();
+        std_fs::write(path, filtered).unwrap();
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::ChecksumInvalid)
+        );
+    }
+
+    #[test]
+    fn restore_checksum_extra_entry() {
+        let temp = SyntheticTempDir::new("restore-extra-checksum");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "extra-checksum",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        let path = fixture.path.join(BACKUP_CHECKSUM_FILE_NAME);
+        let mut text = std_fs::read_to_string(&path).unwrap();
+        text.push_str(&format!("{}  unexpected.txt\n", "0".repeat(64)));
+        std_fs::write(path, text).unwrap();
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::ChecksumInvalid)
+        );
+    }
+
+    #[test]
+    fn restore_checksum_duplicate_path() {
+        let temp = SyntheticTempDir::new("restore-duplicate-checksum");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "duplicate-checksum",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        let path = fixture.path.join(BACKUP_CHECKSUM_FILE_NAME);
+        let mut text = std_fs::read_to_string(&path).unwrap();
+        let first = text.lines().next().unwrap().to_string();
+        text.push_str(&format!("{first}\n"));
+        std_fs::write(path, text).unwrap();
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::ChecksumInvalid)
+        );
+    }
+
+    #[test]
+    fn restore_checksum_malformed_line() {
+        let temp = SyntheticTempDir::new("restore-malformed-checksum");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "malformed-checksum",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        std_fs::write(
+            fixture.path.join(BACKUP_CHECKSUM_FILE_NAME),
+            "synthetic malformed checksum\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::ChecksumInvalid)
+        );
+    }
+
+    #[test]
+    fn restore_checksum_contains_itself() {
+        let temp = SyntheticTempDir::new("restore-self-checksum");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "self-checksum",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        let path = fixture.path.join(BACKUP_CHECKSUM_FILE_NAME);
+        let mut text = std_fs::read_to_string(&path).unwrap();
+        text.push_str(&format!(
+            "{}  {BACKUP_CHECKSUM_FILE_NAME}\n",
+            "0".repeat(64)
+        ));
+        std_fs::write(path, text).unwrap();
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::ChecksumInvalid)
+        );
+    }
+
+    #[test]
+    fn restore_checksum_uppercase_hex_is_accepted() {
+        let temp = SyntheticTempDir::new("restore-uppercase-checksum");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "uppercase-checksum",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        let path = fixture.path.join(BACKUP_CHECKSUM_FILE_NAME);
+        let text = std_fs::read_to_string(&path).unwrap();
+        std_fs::write(
+            path,
+            text.to_ascii_uppercase()
+                .replace("MANIFEST.JSON", "manifest.json")
+                .replace("STATE.JSON", "state.json"),
+        )
+        .unwrap();
+
+        assert!(restore_package_dry_run(&fixture.path).is_ok());
+    }
+
+    #[test]
+    fn restore_path_absolute_package_path() {
+        let temp = SyntheticTempDir::new("restore-absolute-path");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "absolute-path",
+            BackupExportMode::ModeB,
+            1,
+            0,
+            false,
+            false,
+        );
+        mutate_restore_manifest(&fixture.path, |manifest| {
+            manifest["files"][0]["packagePath"] = json!("C:/synthetic/file-100.blob");
+        });
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::PathUnsafe)
+        );
+    }
+
+    #[test]
+    fn restore_path_traversal_rejected() {
+        let temp = SyntheticTempDir::new("restore-traversal");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "traversal",
+            BackupExportMode::ModeB,
+            1,
+            0,
+            false,
+            false,
+        );
+        mutate_restore_manifest(&fixture.path, |manifest| {
+            manifest["files"][0]["packagePath"] = json!("blobs/../state.json");
+        });
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::PathUnsafe)
+        );
+    }
+
+    #[test]
+    fn restore_path_backslash_rejected() {
+        let temp = SyntheticTempDir::new("restore-backslash");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "backslash",
+            BackupExportMode::ModeB,
+            1,
+            0,
+            false,
+            false,
+        );
+        mutate_restore_manifest(&fixture.path, |manifest| {
+            manifest["files"][0]["packagePath"] = json!("blobs\\file-100.blob");
+        });
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::PathUnsafe)
+        );
+    }
+
+    #[test]
+    fn restore_path_case_insensitive_collision() {
+        let temp = SyntheticTempDir::new("restore-case-collision");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "case-collision",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        let path = fixture.path.join(BACKUP_CHECKSUM_FILE_NAME);
+        let mut text = std_fs::read_to_string(&path).unwrap();
+        let hash = text.lines().next().unwrap()[..64].to_string();
+        text.push_str(&format!("{hash}  Manifest.json\n"));
+        std_fs::write(path, text).unwrap();
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::ChecksumInvalid)
+        );
+    }
+
+    #[test]
+    fn restore_path_symlink_file_rejected() {
+        let temp = SyntheticTempDir::new("restore-file-symlink");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "file-symlink",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        let target = temp.path.join("synthetic-symlink-target");
+        std_fs::write(&target, b"synthetic target").unwrap();
+        let link = fixture.path.join(BACKUP_STATE_FILE_NAME);
+        std_fs::remove_file(&link).unwrap();
+        if !try_create_restore_file_symlink(&target, &link) {
+            return;
+        }
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::SymlinkRejected)
+        );
+    }
+
+    #[test]
+    fn restore_path_symlink_directory_rejected() {
+        let temp = SyntheticTempDir::new("restore-directory-symlink");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "directory-symlink",
+            BackupExportMode::ModeB,
+            1,
+            0,
+            false,
+            false,
+        );
+        let target = temp.path.join("synthetic-directory-target");
+        std_fs::create_dir(&target).unwrap();
+        let link = fixture.path.join(BACKUP_BLOBS_DIR_NAME);
+        std_fs::remove_dir_all(&link).unwrap();
+        if !try_create_restore_directory_symlink(&target, &link) {
+            return;
+        }
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::SymlinkRejected)
+        );
+    }
+
+    #[test]
+    fn restore_path_unknown_top_level_file() {
+        let temp = SyntheticTempDir::new("restore-unknown-top");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "unknown-top",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        std_fs::write(fixture.path.join("synthetic-unknown.txt"), b"synthetic").unwrap();
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::PathUnsafe)
+        );
+    }
+
+    #[test]
+    fn restore_path_secrets_directory_rejected() {
+        let temp = SyntheticTempDir::new("restore-secrets-directory");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "secrets-directory",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        std_fs::create_dir(fixture.path.join(SECRETS_DIR_NAME)).unwrap();
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::PathUnsafe)
+        );
+    }
+
+    #[test]
+    fn restore_path_nested_unknown_directory_rejected() {
+        let temp = SyntheticTempDir::new("restore-nested-directory");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "nested-directory",
+            BackupExportMode::ModeB,
+            1,
+            0,
+            false,
+            false,
+        );
+        std_fs::create_dir(fixture.path.join("blobs/nested")).unwrap();
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::BlobUnexpected)
+        );
+    }
+
+    #[test]
+    fn restore_path_package_not_found() {
+        let temp = SyntheticTempDir::new("restore-package-missing");
+
+        assert_eq!(
+            restore_package_dry_run(&temp.path.join("missing-package")),
+            Err(RestoreValidationError::PackageNotFound)
+        );
+    }
+
+    #[test]
+    fn restore_mode_a_nonempty_blobs_rejected() {
+        let temp = SyntheticTempDir::new("restore-mode-a-nonempty-blobs");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "mode-a-nonempty-blobs",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        let blobs = fixture.path.join(BACKUP_BLOBS_DIR_NAME);
+        std_fs::create_dir(&blobs).unwrap();
+        std_fs::write(blobs.join("file-1.blob"), b"synthetic").unwrap();
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::BlobUnexpected)
+        );
+    }
+
+    #[test]
+    fn restore_mode_a_manifest_files_rejected() {
+        let temp = SyntheticTempDir::new("restore-mode-a-manifest-file");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "mode-a-manifest-file",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        mutate_restore_manifest(&fixture.path, |manifest| {
+            manifest["files"] = json!([{
+                "fileId": 1,
+                "packagePath": "blobs/file-1.blob",
+                "mime": "image/png",
+                "sizeBytes": 1,
+                "sha256": "0".repeat(64)
+            }]);
+        });
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::ModeMismatch)
+        );
+    }
+
+    #[test]
+    fn restore_mode_a_reports_active_files_unavailable() {
+        let temp = SyntheticTempDir::new("restore-mode-a-unavailable");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "mode-a-unavailable",
+            BackupExportMode::ModeA,
+            2,
+            1,
+            false,
+            true,
+        );
+
+        let report = restore_package_dry_run(&fixture.path).unwrap();
+
+        assert_eq!(report.unavailable_attachment_count, 2);
+        assert_eq!(report.restorable_blob_count, 0);
+    }
+
+    #[test]
+    fn restore_mode_a_does_not_require_blob_root() {
+        let temp = SyntheticTempDir::new("restore-mode-a-no-blob-root");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "mode-a-no-blob-root",
+            BackupExportMode::ModeA,
+            1,
+            0,
+            false,
+            true,
+        );
+        std_fs::remove_dir_all(&fixture.source_blob_root).unwrap();
+
+        assert!(restore_package_dry_run(&fixture.path).is_ok());
+    }
+
+    #[test]
+    fn restore_mode_a_empty_blob_directory_is_allowed() {
+        let temp = SyntheticTempDir::new("restore-mode-a-empty-blobs");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "mode-a-empty-blobs",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        std_fs::create_dir(fixture.path.join(BACKUP_BLOBS_DIR_NAME)).unwrap();
+
+        assert!(restore_package_dry_run(&fixture.path).is_ok());
+    }
+
+    #[test]
+    fn restore_mode_b_active_blob_missing() {
+        let temp = SyntheticTempDir::new("restore-mode-b-missing");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "mode-b-missing",
+            BackupExportMode::ModeB,
+            1,
+            0,
+            false,
+            false,
+        );
+        std_fs::remove_file(fixture.path.join("blobs/file-100.blob")).unwrap();
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::BlobMissing)
+        );
+    }
+
+    #[test]
+    fn restore_mode_b_unexpected_orphan_blob() {
+        let temp = SyntheticTempDir::new("restore-mode-b-orphan");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "mode-b-orphan",
+            BackupExportMode::ModeB,
+            1,
+            0,
+            false,
+            false,
+        );
+        std_fs::write(fixture.path.join("blobs/file-999.blob"), b"synthetic").unwrap();
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::BlobUnexpected)
+        );
+    }
+
+    #[test]
+    fn restore_mode_b_tombstoned_blob_included() {
+        let temp = SyntheticTempDir::new("restore-mode-b-tombstone-blob");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "mode-b-tombstone-blob",
+            BackupExportMode::ModeB,
+            1,
+            1,
+            false,
+            false,
+        );
+        std_fs::write(fixture.path.join("blobs/file-101.blob"), b"synthetic").unwrap();
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::BlobUnexpected)
+        );
+    }
+
+    #[test]
+    fn restore_mode_b_duplicate_manifest_file_id() {
+        let temp = SyntheticTempDir::new("restore-mode-b-duplicate-id");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "mode-b-duplicate-id",
+            BackupExportMode::ModeB,
+            2,
+            0,
+            false,
+            false,
+        );
+        mutate_restore_manifest(&fixture.path, |manifest| {
+            manifest["files"][1]["fileId"] = manifest["files"][0]["fileId"].clone();
+        });
+
+        assert!(matches!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::PathUnsafe | RestoreValidationError::ManifestInvalid)
+        ));
+    }
+
+    #[test]
+    fn restore_mode_b_duplicate_package_path() {
+        let temp = SyntheticTempDir::new("restore-mode-b-duplicate-path");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "mode-b-duplicate-path",
+            BackupExportMode::ModeB,
+            2,
+            0,
+            false,
+            false,
+        );
+        mutate_restore_manifest(&fixture.path, |manifest| {
+            manifest["files"][1]["packagePath"] = manifest["files"][0]["packagePath"].clone();
+        });
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::PathUnsafe)
+        );
+    }
+
+    #[test]
+    fn restore_mode_b_manifest_mime_mismatch() {
+        let temp = SyntheticTempDir::new("restore-mode-b-mime");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "mode-b-mime",
+            BackupExportMode::ModeB,
+            1,
+            0,
+            false,
+            false,
+        );
+        mutate_restore_manifest(&fixture.path, |manifest| {
+            manifest["files"][0]["mime"] = json!("image/jpeg");
+        });
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::ModeMismatch)
+        );
+    }
+
+    #[test]
+    fn restore_mode_b_manifest_size_mismatch() {
+        let temp = SyntheticTempDir::new("restore-mode-b-size");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "mode-b-size",
+            BackupExportMode::ModeB,
+            1,
+            0,
+            false,
+            false,
+        );
+        mutate_restore_manifest(&fixture.path, |manifest| {
+            let size = manifest["files"][0]["sizeBytes"].as_u64().unwrap();
+            manifest["files"][0]["sizeBytes"] = json!(size + 1);
+        });
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::SizeMismatch)
+        );
+    }
+
+    #[test]
+    fn restore_mode_b_active_unreferenced_blob_accepted() {
+        let temp = SyntheticTempDir::new("restore-mode-b-unreferenced");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "mode-b-unreferenced",
+            BackupExportMode::ModeB,
+            1,
+            0,
+            false,
+            false,
+        );
+
+        let report = restore_package_dry_run(&fixture.path).unwrap();
+
+        assert_eq!(report.attachment_reference_count, 0);
+        assert_eq!(report.restorable_blob_count, 1);
+    }
+
+    #[test]
+    fn restore_mode_b_exact_active_set_validated() {
+        let temp = SyntheticTempDir::new("restore-mode-b-exact-set");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "mode-b-exact-set",
+            BackupExportMode::ModeB,
+            3,
+            2,
+            false,
+            true,
+        );
+
+        let validated = validate_restore_package(&fixture.path).unwrap();
+
+        assert_eq!(validated.blob_restore_plan.len(), 3);
+        assert_eq!(validated.staged_state.files.len(), 5);
+    }
+
+    #[test]
+    fn restore_mode_b_managed_blobs_flag_required() {
+        let temp = SyntheticTempDir::new("restore-mode-b-flag");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "mode-b-flag",
+            BackupExportMode::ModeB,
+            1,
+            0,
+            false,
+            false,
+        );
+        mutate_restore_manifest(&fixture.path, |manifest| {
+            manifest["managedBlobsIncluded"] = json!(false);
+        });
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::ModeMismatch)
+        );
+    }
+
+    #[test]
+    fn restore_validation_duplicate_conversation_ids_rejected() {
+        let temp = SyntheticTempDir::new("restore-duplicate-conversation");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "duplicate-conversation",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        mutate_restore_state(&fixture.path, |state| {
+            let conversation = state["conversations"]["restore-conversation-500"].clone();
+            state["conversations"]["restore-conversation-copy"] = conversation;
+        });
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::StateInvalid)
+        );
+    }
+
+    #[test]
+    fn restore_validation_duplicate_message_ids_rejected() {
+        let temp = SyntheticTempDir::new("restore-duplicate-message");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "duplicate-message",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        mutate_restore_state(&fixture.path, |state| {
+            let message = state["conversations"]["restore-conversation-500"]["messages"][0]
+                ["messages"][0]
+                .clone();
+            state["conversations"]["restore-conversation-500"]["messages"][1]["messages"]
+                .as_array_mut()
+                .unwrap()
+                .push(message);
+        });
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::StateInvalid)
+        );
+    }
+
+    #[test]
+    fn restore_validation_duplicate_file_ids_rejected() {
+        let temp = SyntheticTempDir::new("restore-duplicate-file");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "duplicate-file",
+            BackupExportMode::ModeA,
+            1,
+            0,
+            false,
+            false,
+        );
+        mutate_restore_state(&fixture.path, |state| {
+            let file = state["files"][0].clone();
+            state["files"].as_array_mut().unwrap().push(file);
+        });
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::StateInvalid)
+        );
+    }
+
+    #[test]
+    fn restore_validation_invalid_id_seq_rejected() {
+        let temp = SyntheticTempDir::new("restore-invalid-id-seq");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "invalid-id-seq",
+            BackupExportMode::ModeA,
+            1,
+            0,
+            false,
+            false,
+        );
+        mutate_restore_state(&fixture.path, |state| {
+            state["idSeq"] = json!(1);
+        });
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::StateInvalid)
+        );
+    }
+
+    #[test]
+    fn restore_validation_provider_source_secret_ref_not_trusted() {
+        let temp = SyntheticTempDir::new("restore-source-secret-ref");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "source-secret-ref",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            true,
+            false,
+        );
+        let package_state = read_backup_state(&fixture.path);
+        let source_ref = package_state.providers[0].secret_ref.clone();
+
+        let validated = validate_restore_package(&fixture.path).unwrap();
+
+        assert_ne!(validated.staged_state.providers[0].secret_ref, source_ref);
+        assert!(validated.staged_state.providers[0]
+            .secret_ref
+            .contains(RESTORE_PLANNED_SECRET_REF_MARKER));
+    }
+
+    #[test]
+    fn restore_validation_all_providers_planned_without_secret() {
+        let temp = SyntheticTempDir::new("restore-provider-no-secret");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "provider-no-secret",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            true,
+            false,
+        );
+
+        let validated = validate_restore_package(&fixture.path).unwrap();
+        let serialized = serde_json::to_string(&validated.staged_state.settings).unwrap();
+
+        assert!(!serialized.contains("\"hasSecret\":true"));
+        assert_eq!(validated.provider_secret_plan.len(), 1);
+        assert!(validated
+            .warnings
+            .contains(&RestoreWarning::ProviderApiKeysMustBeReentered));
+    }
+
+    #[test]
+    fn restore_validation_planned_secret_refs_not_persisted() {
+        let temp = SyntheticTempDir::new("restore-secret-plan-memory-only");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "secret-plan-memory-only",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            true,
+            false,
+        );
+        let before = std_fs::read(fixture.path.join(BACKUP_STATE_FILE_NAME)).unwrap();
+
+        let validated = validate_restore_package(&fixture.path).unwrap();
+
+        let after = std_fs::read(fixture.path.join(BACKUP_STATE_FILE_NAME)).unwrap();
+        assert_eq!(after, before);
+        assert!(!String::from_utf8_lossy(&after).contains(RESTORE_PLANNED_SECRET_REF_MARKER));
+        assert_eq!(validated.provider_secret_plan.len(), 1);
+    }
+
+    #[test]
+    fn restore_validation_planned_storage_keys_not_written() {
+        let temp = SyntheticTempDir::new("restore-storage-plan-memory-only");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "storage-plan-memory-only",
+            BackupExportMode::ModeB,
+            1,
+            0,
+            false,
+            false,
+        );
+        let before = restore_package_fingerprint(&fixture.path);
+
+        let validated = validate_restore_package(&fixture.path).unwrap();
+
+        assert_eq!(restore_package_fingerprint(&fixture.path), before);
+        assert!(validated.staged_state.files[0]
+            .storage_key
+            .starts_with(RESTORE_PLANNED_STORAGE_KEY_PREFIX));
+        assert!(!fixture
+            .path
+            .join(BACKUP_BLOBS_DIR_NAME)
+            .join(&validated.staged_state.files[0].storage_key)
+            .exists());
+    }
+
+    #[test]
+    fn restore_validation_conversation_security_keywords_are_allowed() {
+        let temp = SyntheticTempDir::new("restore-conversation-keywords");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "conversation-keywords",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        mutate_restore_state(&fixture.path, |state| {
+            state["conversations"]["restore-conversation-500"]["messages"][0]["messages"][0]
+                ["parts"][0]["text"] =
+                json!("Synthetic discussion of Authorization, token, secretRef, and request body");
+        });
+
+        assert!(restore_package_dry_run(&fixture.path).is_ok());
+    }
+
+    #[test]
+    fn restore_validation_runtime_generation_fields_absent() {
+        let temp = SyntheticTempDir::new("restore-runtime-field");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "runtime-field",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        mutate_restore_state(&fixture.path, |state| {
+            state["activeGenerations"] = json!([]);
+        });
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::StateInvalid)
+        );
+    }
+
+    #[test]
+    fn restore_validation_unsafe_custom_header_rejected() {
+        let temp = SyntheticTempDir::new("restore-unsafe-custom-header");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "unsafe-custom-header",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            true,
+            false,
+        );
+        mutate_restore_state(&fixture.path, |state| {
+            state["providers"][0]["customHeaders"] = json!([{
+                "name": "Authorization",
+                "value": "synthetic forbidden value"
+            }]);
+        });
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::StateInvalid)
+        );
+    }
+
+    #[test]
+    fn restore_validation_unsafe_custom_body_rejected() {
+        let temp = SyntheticTempDir::new("restore-unsafe-custom-body");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "unsafe-custom-body",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            true,
+            false,
+        );
+        mutate_restore_state(&fixture.path, |state| {
+            state["providers"][0]["customBody"] = json!({"messages": []});
+        });
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::StateInvalid)
+        );
+    }
+
+    #[test]
+    fn restore_validation_absolute_file_metadata_path_rejected() {
+        let temp = SyntheticTempDir::new("restore-absolute-file-metadata");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "absolute-file-metadata",
+            BackupExportMode::ModeA,
+            1,
+            0,
+            false,
+            false,
+        );
+        mutate_restore_state(&fixture.path, |state| {
+            state["files"][0]["relativePath"] = json!("C:/synthetic/file.png");
+        });
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::StateInvalid)
+        );
+    }
+
+    #[test]
+    fn restore_validation_manifest_size_limit() {
+        let temp = SyntheticTempDir::new("restore-manifest-limit");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "manifest-limit",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        std_fs::write(
+            fixture.path.join(BACKUP_MANIFEST_FILE_NAME),
+            vec![b' '; RESTORE_MANIFEST_MAX_BYTES as usize + 1],
+        )
+        .unwrap();
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::SizeMismatch)
+        );
+    }
+
+    #[test]
+    fn restore_validation_checksum_size_limit() {
+        let temp = SyntheticTempDir::new("restore-checksum-limit");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "checksum-limit",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        std_fs::write(
+            fixture.path.join(BACKUP_CHECKSUM_FILE_NAME),
+            vec![b'0'; RESTORE_CHECKSUM_MAX_BYTES as usize + 1],
+        )
+        .unwrap();
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::SizeMismatch)
+        );
+    }
+
+    #[test]
+    fn restore_validation_tampered_after_first_dry_run_fails_second() {
+        let temp = SyntheticTempDir::new("restore-toctou-tamper");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "toctou-tamper",
+            BackupExportMode::ModeB,
+            1,
+            0,
+            false,
+            false,
+        );
+        assert!(restore_package_dry_run(&fixture.path).is_ok());
+        let blob = fixture.path.join("blobs/file-100.blob");
+        let mut bytes = std_fs::read(&blob).unwrap();
+        bytes[0] ^= 1;
+        std_fs::write(blob, bytes).unwrap();
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::ChecksumInvalid)
+        );
+    }
+
+    #[test]
+    fn restore_validation_result_is_not_reused_as_cache() {
+        let temp = SyntheticTempDir::new("restore-no-validation-cache");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "no-validation-cache",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+        let first = restore_package_dry_run(&fixture.path).unwrap();
+        std_fs::write(fixture.path.join("unexpected-after-dry-run"), b"synthetic").unwrap();
+
+        assert_eq!(
+            restore_package_dry_run(&fixture.path),
+            Err(RestoreValidationError::PathUnsafe)
+        );
+        assert_eq!(first.restore_strategy, RestoreStrategy::FullReplacement);
+    }
+
+    #[test]
+    fn restore_validation_safe_errors_hide_path_content_and_refs() {
+        let temp = SyntheticTempDir::new("restore-safe-error");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "safe-error",
+            BackupExportMode::ModeB,
+            1,
+            0,
+            true,
+            false,
+        );
+        let package_state = read_backup_state(&fixture.path);
+        let source_ref = package_state.providers[0].secret_ref.clone();
+        let source_key = package_state.files[0].storage_key.clone();
+        std_fs::remove_file(fixture.path.join("blobs/file-100.blob")).unwrap();
+
+        let message = restore_package_dry_run(&fixture.path)
+            .unwrap_err()
+            .to_string();
+
+        assert!(!message.contains(temp.path.to_string_lossy().as_ref()));
+        assert!(!message.contains(&source_ref));
+        assert!(!message.contains(&source_key));
+        assert!(!message.contains("synthetic restore"));
+    }
+
+    #[test]
+    fn restore_validation_uses_synthetic_package_only() {
+        let temp = SyntheticTempDir::new("restore-synthetic-only");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "synthetic-only",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            false,
+            false,
+        );
+
+        restore_package_dry_run(&fixture.path).unwrap();
+
+        let package = std_fs::canonicalize(&fixture.path).unwrap();
+        let root = std_fs::canonicalize(&temp.path).unwrap();
+        assert!(package.starts_with(root));
+    }
+
+    #[test]
+    fn restore_validation_no_real_secrets_access() {
+        let temp = SyntheticTempDir::new("restore-no-real-secrets");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "no-real-secrets",
+            BackupExportMode::ModeA,
+            0,
+            0,
+            true,
+            false,
+        );
+
+        let report = restore_package_dry_run(&fixture.path).unwrap();
+
+        assert_eq!(report.providers_requiring_api_key, report.provider_count);
+        assert!(!fixture.path.join(SECRETS_DIR_NAME).exists());
+    }
+
+    #[test]
+    fn restore_validation_package_bytes_unchanged() {
+        let temp = SyntheticTempDir::new("restore-package-unchanged");
+        let fixture = synthetic_restore_package(
+            &temp,
+            "package-unchanged",
+            BackupExportMode::ModeB,
+            2,
+            1,
+            true,
+            true,
+        );
+        let before = restore_package_fingerprint(&fixture.path);
+
+        restore_package_dry_run(&fixture.path).unwrap();
+
+        assert_eq!(restore_package_fingerprint(&fixture.path), before);
     }
 }

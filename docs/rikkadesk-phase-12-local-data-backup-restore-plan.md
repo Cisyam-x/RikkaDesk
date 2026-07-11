@@ -835,6 +835,23 @@ The complete format is defined in `docs/rikkadesk-phase-12-backup-package-format
 
 P2-A does not implement restore validation/dry-run, restore commit/rollback, UI, ZIP, Mode C, orphan scan/cleanup, cross-resource crash atomicity, or complete power-loss protection.
 
+## P2-B Implementation Status
+
+Phase 12 P2-B implements internal restore package validation and a no-write dry-run report for backup format v1. It supports only state schema 6 and the existing format modes `state-only` and `full-local-data`.
+
+- Manifest parsing rejects unknown fields and distinguishes unsupported format/schema from malformed packages.
+- Control files are bounded; blobs are stream-hashed. Manifest, state, checksum, size, directory tree, and blob sets must agree exactly.
+- Package enumeration rejects symlink/reparse entries, traversal, absolute/UNC/drive paths, backslashes, nested unknown directories, hidden secrets directories, and case-folded collisions.
+- State validation is structural and reuses current staged-state, Provider, file, custom request, and modality invariants. Conversation text is never keyword-scanned.
+- Package Provider secret references and managed-file storage keys are never trusted. Dry-run creates memory-only planned replacements, reports every Provider as requiring a new API key, and never calls SecretStore.
+- Mode A retains attachment metadata/parts and reports active files as potentially unavailable. Mode B requires exactly one verified blob for every active file, including unreferenced active files.
+- The restore strategy is full replacement only. Merge restore, schema migration, Mode C, and stream resume are unsupported.
+- Dry-run accepts no live-state handle and performs no state/blob/secret/SSE writes. It does not create a pre-restore backup.
+- Every invocation re-reads the package. A successful dry-run result cannot be reused to skip P2-C validation.
+- P2-B adds 77 synthetic restore tests; no real app data, secret, user backup, user file, API key, or provider is used.
+
+P2-C must revalidate the selected package, create a mandatory pre-restore backup, and then implement an atomic staged restore/rollback transaction. None of those write paths exists in P2-B.
+
 ### P2-A: Portable Metadata/Full Backup Export Package (Completed)
 
 Goal:
@@ -857,7 +874,7 @@ Acceptance:
 
 Implemented with backend-only primitives and synthetic tests. Restore remains unavailable.
 
-### P2-B: Restore Validation And Dry Run
+### P2-B: Restore Validation And Dry Run (Completed)
 
 Goal:
 
@@ -870,6 +887,8 @@ Required behavior:
 - Normalize all Providers to `hasSecret: false` in the proposed restore state.
 - Produce a dry-run report only; do not replace state or blobs.
 - Keep Mode C and secret restoration deferred.
+
+Implemented as an internal full-replacement preview with fixed safe counts/warnings and zero writes. Actual restore remains unavailable.
 
 ### P3: Managed File Blob Backup/Restore
 

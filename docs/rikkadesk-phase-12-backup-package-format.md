@@ -196,6 +196,31 @@ The final directory must not exist and is never overwritten. Failure best-effort
 
 Export errors use fixed categories: invalid snapshot, missing blob, blob read failure, write failure, hash mismatch, validation failure, and publish failure. Errors and logs must not contain state/user/provider content, display name, `storageKey`, source/destination path, source `secretRef`, API key, request body, or blob bytes.
 
+## P2-B Restore Validation And Dry Run
+
+P2-B adds an internal, no-write validator for format v1 directory packages. It exposes no HTTP API, UI, native folder picker, or restore command. The source package path is accepted only from a trusted future internal caller; tests use synthetic temp directories exclusively.
+
+Compatibility is fail-closed:
+
+- `format` must be `rikkadesk-backup` and `formatVersion` must be `1`.
+- Mode A is `state-only`; Mode B is the existing format v1 value `full-local-data`.
+- Both manifest and state schema must be exactly `6`; schema 1-5 migration and newer schema support are deferred.
+- Provider import/export metadata must be version `4`.
+- `secretsIncluded` and `runtimeGenerationsIncluded` must be `false`.
+- Unknown manifest fields, modes, paths, files, directories, and blob entries are rejected.
+
+The dry run reads `manifest.json` and `state.json` once each and hashes the same bytes it parses. Manifest reads are limited to 4 MiB, checksum reads to 8 MiB, state reads to 128 MiB, and manifest file records to 100,000. Blobs are hashed as streams and must match both manifest and state metadata. `SHA256SUMS.txt` accepts hexadecimal case but requires exactly two spaces, controlled relative paths, no duplicate/case-folded collisions, no self-entry, and exact package coverage.
+
+Directory enumeration rejects absolute paths, drive/UNC paths, `..`, `.`, empty components, backslashes, symlinks, Windows reparse points, nested unknown directories, and case-insensitive path collisions. Mode A may omit `blobs/` or contain an empty `blobs/`; any blob bytes are rejected. Mode B requires an exact one-to-one match between active file metadata and `blobs/file-<file-id>.blob`. Tombstoned and orphan blob entries are rejected, while active unreferenced files remain restorable.
+
+State validation reuses current staged-state, Provider, managed-file, custom-header, custom-body, and modality invariants. It additionally verifies ID high-water marks, branch selection, no active generation marker, no unsafe attachment URL, and the current structured state shape. Validation is structural: ordinary conversation text may contain words such as `Authorization` without being rejected.
+
+The in-memory restore plan never trusts package `secretRef` or `storageKey` values. Every Provider is planned with a fresh controlled placeholder and `hasSecret: false`; every managed file receives a new planned storage key. These values are not persisted, returned in the public-safe report, or used to create files/secrets. API keys must be entered again after a future restore.
+
+Dry-run reports only versions, mode, safe counts, fixed warnings, and normalization counts. Restore strategy is full replacement only; merge restore is unsupported. Mode A reports active files as potentially unavailable and does not remove attachment parts. Mode B reports the exact restorable blob count.
+
+The validator takes no `MockApiState` or SecretStore handle. It cannot modify live state, disk state, revision, IDs, SSE, active generations, the formal blob root, or encrypted secret blobs. It does not create a pre-restore backup or temp restore directory. A successful dry run is not an authorization token or validation cache: P2-C must completely re-read and revalidate the package immediately before any restore transaction.
+
 ## Deferred Work
 
-P2-B will design package validation and restore dry-run reporting without writing app data. Restore commit/rollback, backup UI/commands, ZIP packaging, Mode C, automatic orphan reconciliation, active-stream recovery, and cross-resource crash atomicity remain unimplemented.
+P2-C actual restore must add mandatory pre-restore backup, fresh validation, staged blob/state installation, rollback, and crash-boundary policy. Restore UI/commands, ZIP packaging, Mode C, merge restore, automatic orphan reconciliation, active-stream recovery, and cross-resource crash atomicity remain unimplemented.

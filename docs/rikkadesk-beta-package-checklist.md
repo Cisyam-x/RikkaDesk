@@ -261,6 +261,24 @@ P2-A verification must cover:
 
 P2-A does not expose backup UI/API, create ZIP files, implement restore, include Mode C, clean orphans, restore active streams, or make state/blob resources crash-atomic. The next step is P2-B restore package validation and dry-run reporting without writes.
 
+Phase 12 P2-B adds internal validation and a no-write restore dry run for format v1 packages. It supports only state schema 6, Provider import/export version 4, and the existing `state-only` / `full-local-data` modes. Restore is full replacement only; merge restore and actual write-back remain unsupported.
+
+P2-B verification must cover:
+
+- Mode A reports every active managed file as potentially unavailable, retains attachment metadata/parts, and accepts only an absent or empty `blobs/` directory.
+- Mode B requires an exact one-to-one active metadata/manifest/blob set; missing, extra, tombstoned, duplicate, MIME/size/hash-mismatched, symlink, reparse, or escaped blobs fail closed.
+- Manifest format/version/schema/mode/exclusion flags and unknown fields are validated strictly. Schema 1-5 and future schemas are unsupported rather than migrated.
+- `SHA256SUMS.txt` requires 64 hex characters, exactly two spaces, controlled relative paths, no duplicates/case collisions/self-entry, and exact manifest/state/blob coverage.
+- Manifest/state are parsed and hashed from the same bounded read. Blobs are stream-hashed. Control-file and entry-count limits are enforced.
+- State IDs, map keys, branch selection, ID high-water marks, Provider/model/file metadata, custom headers/body, modality metadata, runtime flags, and attachment URLs are structurally validated.
+- Conversation text containing security terms remains valid; do not use whole-JSON keyword rejection.
+- All Providers are planned as `hasSecret: false` with memory-only replacement references. All file storage keys are replaced in memory. No planned reference/key is logged or persisted.
+- No live state, disk state, revision, ID, active generation, SSE channel, blob root, package bytes, or SecretStore value changes during dry-run.
+- A second dry-run must detect package tampering after the first. P2-C must revalidate and cannot treat a successful report as cached authorization.
+- Run `restore_dry_run`, `restore_validation`, `restore_checksum`, `restore_path`, `restore_mode_a`, `restore_mode_b`, `backup_`, and the complete Rust suite. P2-B adds 77 synthetic tests.
+
+P2-B does not create a pre-restore backup, install blobs, replace state, rollback, expose an API/UI, migrate schemas, restore API keys, support Mode C/ZIP/merge, or resume streaming. P2-C must add mandatory pre-restore backup and complete revalidation before any actual restore transaction.
+
 It may contain:
 
 - settings
