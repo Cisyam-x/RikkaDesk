@@ -238,6 +238,8 @@ P2-C2 implements an internal offline journaled directory commit and handled-fail
 
 P2-C3 now reconciles the retained journal and direct-child directory topology before ordinary state loading or any default/migration/write path. Valid provisional current data is revalidated, loaded through an exact-schema no-write loader, and marked `completed` before listener readiness. Invalid provisional data is preserved and the old current is restored when unambiguous. `rollback-completed` allows the validated old current to start; rollback failure, malformed/future journal data, operation mismatch, and topology ambiguity block startup. Completed journals and rollback snapshots remain retained.
 
+The Phase 12 backend safety acceptance is recorded in `docs/rikkadesk-phase-12-backend-acceptance-report.md`. It accepts the internal Mode A/B export, validation, staging, commit, rollback, and startup-reconciliation chain. It does not make restore user-facing or change the format, secret, retention, or portability boundaries in this document.
+
 ## Deferred Work
 
 P2-C1 staging, P2-C2 journaled commit/rollback, and P2-C3 startup reconciliation are implemented as internal backend safety primitives. Restore UI/commands and user orchestration remain unavailable. ZIP packaging, Mode C, merge restore, automatic artifact/orphan cleanup, active-stream recovery, portable-secret restoration, and complete power-loss atomicity remain unimplemented.

@@ -367,10 +367,10 @@ The implementation accepts only a package root and trusted app-data parent. It h
 - `commit-new-moved` and `startup-validation` re-run the strict candidate validator. A valid candidate advances/retains `startup-validation` and yields an unforgeable operation token. Invalid or ambiguous provisional data is preserved as failed-new where possible and the rollback snapshot is restored and read-only validated.
 - Provisional state loading uses an exact-schema, no-default, no-migration, no-corrupt-backup path. After state and managed-storage ownership exists, the matching token compare-checks journal operation/mode/phase and atomically writes `completed` before router/listener readiness.
 - Provisional load failure transitions to rollback, preserves the rejected current, restores and validates the old current, records `rollback-completed`, and returns a safe startup failure without same-process retry/default initialization.
-- `rollback-completed` is an independent safe old-current terminal state. `rollback-failed`, malformed journals, operation mismatch, topology conflicts, and failed recovery block startup and retain evidence.
+- `rollback-completed` is an independent safe old-current terminal state. No residual, one controlled stage residual, or one controlled failed-new residual is allowed; stage plus failed-new is ambiguous and fails closed. `rollback-failed`, malformed journals, operation mismatch, topology conflicts, and failed recovery block startup and retain evidence.
 - `completed` uses normal P1-B loading and may retain its rollback snapshot and populated local secrets; later ordinary state/listener failures do not automatically roll back a completed restore.
 - Journal and rollback/failed/stage artifacts are retained. No cleanup, portable-secret restoration, API/UI, Mode C, ZIP, merge, schema restore migration, orphan GC, or stream resume is implemented.
-- Seventy-four dedicated synthetic P2-C3 tests cover journal parsing, topology/phase crash states, token ownership, guarded loading, completion ordering, rollback faults, concurrency, normal first-run behavior, and secret opacity.
+- Eighty-two dedicated synthetic P2-C3 tests cover journal parsing, topology/phase crash states, Mode B blob tamper, rollback residual topology, token ownership, completion races, guarded loading, rollback faults, concurrency, normal first-run behavior, and secret opacity.
 
 ### P5: User Orchestration
 
@@ -416,4 +416,4 @@ Every test uses synthetic temp directories, state, package bytes, and opaque non
 - Journal and startup validation prevent ambiguous state from launching.
 - P2-C does not support merge restore, Mode C, ZIP, schema auto-migration, or stream resume.
 
-P2-C1 through P2-C3 now complete the internal backend safety chain from validated staging through journaled commit and startup reconciliation. The recommended next step is a Phase 12 total acceptance pass before any P5 user orchestration; restore must remain unexposed until that acceptance confirms the full synthetic chain and documented residual risks.
+P2-C1 through P2-C3 complete the internal backend safety chain from validated staging through journaled commit and startup reconciliation. The Phase 12 backend acceptance is recorded in `docs/rikkadesk-phase-12-backend-acceptance-report.md`: backend safety chain accepted; user-facing restore unavailable. Any P5 orchestration remains a separate future design and implementation scope.

@@ -320,11 +320,14 @@ Phase 12 P2-C3 adds pre-load restore reconciliation and guarded provisional star
 - Confirm provisional load is exact schema 6 and produces no default state, migration, corrupt backup, pre-migration backup, state write, or same-process retry on failure.
 - Confirm a matching private token writes `completed` only after state/storage ownership and before listener readiness; stale token, phase change, or completion write failure blocks readiness.
 - Confirm provisional load failure preserves failed-new, restores/revalidates rollback, writes `rollback-completed`, and returns safe startup failure.
-- Confirm `rollback-completed` starts the old current, `rollback-failed` always blocks, and `completed` retains journal/rollback without automatic rollback on later ordinary errors.
+- Confirm `rollback-completed` allows no residual, one stage residual, or one failed-new residual, but rejects stage plus failed-new, temp-stage, or a retained rollback as topology conflicts.
+- Confirm `rollback-failed` always blocks and `completed` retains journal/rollback without automatic rollback on later ordinary errors.
 - Confirm recovery never accesses SecretStore or opens/hashes/decrypts opaque secret blobs, and all errors remain free of paths, operation IDs, state/content, storage keys, and secret references.
-- Run `restore_recovery`, `restore_startup`, `restore_reconciliation`, `restore_crash`, all P2-C2 filters, and the complete Rust suite. P2-C3 adds 74 dedicated synthetic tests.
+- Run `restore_recovery`, `restore_startup`, `restore_reconciliation`, `restore_crash`, all P2-C2 filters, and the complete Rust suite. P2-C3 adds 82 dedicated synthetic tests.
 
-P2-C3 does not add restore API/UI, native folder picker, package selection, confirmation, shutdown/restart orchestration, progress reporting, artifact cleanup, Mode C, ZIP, merge, schema restore migration, portable-secret restoration, orphan GC, or stream resume. Run a complete Phase 12 acceptance pass before any P5 user orchestration.
+P2-C3 does not add restore API/UI, native folder picker, package selection, confirmation, shutdown/restart orchestration, progress reporting, artifact cleanup, Mode C, ZIP, merge, schema restore migration, portable-secret restoration, orphan GC, or stream resume.
+
+Phase 12 backend acceptance is recorded in `docs/rikkadesk-phase-12-backend-acceptance-report.md`. Required release wording: **Backend safety chain accepted. User-facing restore unavailable.** Do not describe backup/restore as fully released.
 
 It may contain:
 

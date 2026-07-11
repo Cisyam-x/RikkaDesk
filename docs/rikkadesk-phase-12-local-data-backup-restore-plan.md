@@ -823,9 +823,19 @@ P2-C3 integrates the retained restore transaction into the earliest mock API sta
 - Provisional load failure preserves the rejected current as failed-new, restores and validates rollback, records `rollback-completed`, returns a safe failure, and never retries with default state in the same process.
 - `rollback-failed` and ambiguous recovery block startup. `completed` is not automatically rolled back for later ordinary state or listener errors.
 - Reconciliation/rollback never accesses SecretStore or opens encrypted secret files. Opaque synthetic fixtures demonstrate rename preservation and zero-open current validation.
-- Seventy-four P2-C3 synthetic tests cover the crash matrix, guarded loading, startup ordering, journal/token faults, concurrency, normal first-run behavior, and secret opacity.
+- Eighty-two P2-C3 synthetic tests cover the crash matrix, Mode B blob tamper, rollback residual topology, guarded loading, startup ordering, journal/token faults, completion races, concurrency, normal first-run behavior, and secret opacity.
 
 P2-C3 retains completed journals, rollback snapshots, failed-new directories, and unused stages for later policy. The backend safety chain is complete, but package selection, confirmation, app shutdown/restart, status UI, and cleanup remain unavailable.
+
+## Phase 12 Backend Acceptance Status
+
+The final backend acceptance is recorded in `docs/rikkadesk-phase-12-backend-acceptance-report.md`.
+
+- Backend safety chain accepted.
+- User-facing restore unavailable.
+- The accepted scope is persistence, handled-failure transactions, Mode A/B backup packages, strict restore validation/staging, journaled commit/rollback, and startup reconciliation.
+- P5 package selection, confirmation, shutdown/restart orchestration, progress UI, and artifact-retention policy remain future work.
+- Acceptance does not claim complete power-loss atomicity, cross-resource state/DPAPI or state/blob atomicity, stream recovery, artifact cleanup, Mode C, ZIP, merge restore, or portable API-key recovery.
 
 ### P2-A: Portable Metadata/Full Backup Export Package (Completed)
 
@@ -952,4 +962,4 @@ Current P1-A/P1-B/P1-C1/P1-C2/P1-C3/P1-C4 status:
 - DPAPI secret blobs are portable across machines/users: No.
 - A formal Mode A/B backup package exists: Yes, format v1 export, P2-B strict validation/dry-run, P2-C1 independently validated staging, P2-C2 journaled commit/handled rollback, and P2-C3 startup reconciliation. A user-consumable restore still does not exist because orchestration and UI are absent.
 
-Recommended next step: run a Phase 12 total acceptance pass across P1/P2 before planning P5 user orchestration. Do not expose actual restore until the end-to-end synthetic workflow, residual retention policy, safe shutdown/restart ownership, and user confirmation design are approved.
+Recommended next step: prepare a separately approved P5 user-orchestration design. Do not expose actual restore until package selection, confirmation, safe shutdown/restart ownership, progress reporting, and residual artifact handling are designed and accepted.
